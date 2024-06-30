@@ -4,6 +4,7 @@ const fmt = @import("std").fmt;
 const panic = @import("std").debug.panic;
 const StaticStringMap = @import("std").StaticStringMapWithEql;
 const eqlLenIgnoreCase = @import("std").static_string_map.eqlAsciiIgnoreCase;
+const eql = @import("std").mem.eql;
 
 // (arrayPointer: i32, length: i32)
 extern fn print(ptr: [*]const u8, len: usize) void;
@@ -60,6 +61,22 @@ const SQLiteBtHeader = extern struct {
     metadata: [8]u8,
     // // Doesn't exist on leaf pages (0x0D and 0x0A page_type)
     right_child_page: u32,
+
+    pub fn from(buffer: []u8) *SQLiteBtHeader {
+        return @alignCast(@ptrCast(buffer[0..sqlite_bt_header_size]));
+    }
+
+    pub fn get_header_size(self: *SQLiteBtHeader) u8 {
+        const page_type = self.get_page_type();
+        switch (page_type) {
+            0x0D, 0x0A => {
+                return 8;
+            },
+            else => {
+                return 12;
+            },
+        }
+    }
 
     pub fn get_page_type(self: *SQLiteBtHeader) u8 {
         return self.metadata[0];
@@ -348,7 +365,7 @@ const Expr = struct {
 
 const SelectStmt = struct {
     columns: u64,
-    table: u32,
+    table: DbTable,
     where: *Expr,
 };
 
@@ -387,13 +404,319 @@ const Vm = struct {
     pc: u32,
     registers: [100]Register,
     insts: [100]Inst,
-    stmt: SelectStmt,
+    stmt: ?SelectStmt,
 }; // 100 instructions, 100 stack, 100 instructions
 
-const ASTBuilder = struct {
+const DbTable = struct {
+    page: u32,
+};
+
+const SQLiteColumnValue = struct {
+    type: SQLiteColumnType,
+    value: union {
+        int: i64,
+        float: f64,
+        slice: []u8,
+    },
+
+    fn valFromPtr(comptime T: type, val: []u8) T {
+        const result: *T = @alignCast(@ptrCast(val[0..@sizeOf(T)]));
+        return result.*;
+    }
+
+    pub fn from(col_type: SQLiteColumnType, val: []u8) SQLiteColumnValue {
+        switch (col_type) {
+            .empty, .value_0, .value_1 => {
+                return .{ .type = col_type, .value = .{ .int = 0 } };
+            },
+            .i8 => {
+                return .{ .type = col_type, .value = .{ .int = @intCast(val[0]) } };
+            },
+            .i16 => {
+                return .{
+                    .type = col_type,
+                    .value = .{ .int = @byteSwap(SQLiteColumnValue.valFromPtr(i16, val)) },
+                };
+            },
+            .i24 => {
+                return .{
+                    .type = col_type,
+                    .value = .{ .int = @byteSwap(SQLiteColumnValue.valFromPtr(i24, val)) },
+                };
+            },
+            .i32 => {
+                return .{
+                    .type = col_type,
+                    .value = .{ .int = @byteSwap(SQLiteColumnValue.valFromPtr(i32, val)) },
+                };
+            },
+            .i48 => {
+                return .{
+                    .type = col_type,
+                    .value = .{ .int = @byteSwap(SQLiteColumnValue.valFromPtr(i48, val)) },
+                };
+            },
+            .i64 => {
+                return .{
+                    .type = col_type,
+                    .value = .{ .int = @byteSwap(SQLiteColumnValue.valFromPtr(i64, val)) },
+                };
+            },
+            .f64 => {
+                const result = SQLiteColumnValue.valFromPtr(u64, val);
+                return .{
+                    .type = col_type,
+                    .value = .{ .float = @floatFromInt(@byteSwap(result)) },
+                };
+            },
+            .blob, .text => {
+                return .{
+                    .type = col_type,
+                    .value = .{ .slice = val },
+                };
+            },
+            .invalid => {
+                return .{ .type = .invalid, .value = .{ .int = 0 } };
+            },
+        }
+    }
+};
+
+const SQLiteRecord = struct {
+    buffer: []u8,
+    size: u32,
+    header_size: u32,
+    cursor: u32,
+    header_cursor: u32,
+
+    // header comes first with column data types. Header starts with size of header varint.
+    // values come after, size of ea determined by respective header
+
+    pub fn from(buffer: []u8) SQLiteRecord {
+        var cell_size: u64 = 0;
+        var cell_header_size: u64 = 0;
+        var cursor: u32 = 0;
+        var cell_header_int: u32 = 0;
+        var row_id: u64 = 0; // TODO: use this?
+
+        // TODO: this only supports 0x0d pages. Support the other pages
+        cursor += get_varint(buffer.ptr, &cell_size);
+        cursor += get_varint(buffer.ptr + cursor, &row_id);
+        cell_header_int += get_varint(buffer.ptr + cursor, &cell_header_size);
+
+        cell_header_size -= cell_header_int;
+        cell_size -= cell_header_int;
+        cursor += cell_header_int;
+
+        // TODO: extra validation to make sure its 32 bit size?
+        return SQLiteRecord{
+            .buffer = buffer[cursor..],
+            .size = @intCast(cell_size),
+            .header_size = @intCast(cell_header_size),
+            .cursor = @intCast(cell_header_size),
+            .header_cursor = 0,
+        };
+    }
+
+    pub fn reset(self: *SQLiteRecord) void {
+        self.cursor = self.header_size;
+        self.header_cursor = 0;
+    }
+
+    pub fn next(self: *SQLiteRecord) ?SQLiteColumnValue {
+        if (self.cursor >= self.size) return null;
+        if (self.header_cursor >= self.header_size) {
+            self.header_cursor = 0;
+        }
+        var header_val: u64 = 0;
+        self.header_cursor += get_varint(self.buffer.ptr + self.header_cursor, &header_val);
+
+        const size: u32 = @truncate(SQLiteColumnType.size(header_val));
+
+        const col_type = SQLiteColumnType.from(header_val);
+        debug("next() size: {d} col_type: {}", .{ size, col_type });
+
+        if (size == 0) {
+            return SQLiteColumnValue.from(col_type, self.buffer);
+        }
+
+        const result = SQLiteColumnValue.from(
+            col_type,
+            self.buffer[self.cursor .. self.cursor + size],
+        );
+
+        self.cursor += size;
+        return result;
+    }
+
+    pub fn consume(self: *SQLiteRecord) void {
+        if (self.cursor >= self.size) return;
+        if (self.header_cursor >= self.header_size) {
+            self.header_cursor = 0;
+        }
+        var header_val: u64 = 0;
+        self.header_cursor += get_varint(self.buffer.ptr + self.header_cursor, &header_val);
+
+        // for debugging
+        // const size: u32 = @truncate(SQLiteColumnType.size(header_val));
+        // const col_type = SQLiteColumnType.from(header_val);
+        // debug("next() size: {d} col_type: {}", .{ size, col_type });
+
+        self.cursor += @truncate(SQLiteColumnType.size(header_val));
+    }
+};
+
+const SQLiteColumnType = enum {
+    empty,
+    i8,
+    i16,
+    i24,
+    i32,
+    i48,
+    i64,
+    f64,
+    value_0,
+    value_1,
+    invalid,
+    blob,
+    text,
+
+    pub fn from(val: u64) SQLiteColumnType {
+        switch (val) {
+            0 => return .empty,
+            1 => return .i8,
+            2 => return .i16,
+            3 => return .i24,
+            4 => return .i32,
+            5 => return .i48,
+            6 => return .i64,
+            7 => return .f64,
+            8 => return .value_0,
+            9 => return .value_1,
+            10, 11 => return .invalid,
+            else => {
+                if (val % 2 == 0) {
+                    return .blob;
+                }
+                return .text;
+            },
+        }
+    }
+
+    pub fn isInt(self: SQLiteColumnType) bool {
+        switch (self) {
+            .i8, .i16, .i24, .i32, .i48, .i64 => return true,
+            else => return false,
+        }
+    }
+
+    pub fn size(val: u64) u64 {
+        switch (val) {
+            0, 8, 9, 10, 11 => return 0,
+            1 => return 1,
+            2 => return 2,
+            3 => return 3,
+            4 => return 4,
+            5 => return 6,
+            6, 7 => return 8,
+            else => {
+                if (val % 2 == 0) {
+                    // Divide by 2 (>> 1). Compiler should be smart enough to optimize /, but I'm smart too
+                    return (val - 12) / 2;
+                }
+                return (val - 13) / 2;
+            },
+        }
+    }
+};
+
+pub const Error = error{InvalidBinary};
+
+const Db = struct {
+    cursor: usize,
+    buffer: []u8,
+    page_size: u16,
+
+    pub fn from(buffer: []u8) Error!Db {
+        if (buffer.len < @sizeOf(SQLiteDbHeader)) {
+            debug("buffer too small.", .{});
+            return error.InvalidBinary;
+        }
+        const header: *SQLiteDbHeader = @alignCast(@ptrCast(buffer[0..sqlite_header_size]));
+        const page_size = header.get_page_size();
+        debug("page_size: {d}", .{page_size});
+        return Db{
+            .cursor = 0,
+            .buffer = buffer,
+            .page_size = page_size,
+        };
+    }
+
+    // Table schema:
+    // CREATE TABLE sqlite_schema(
+    //   type text,
+    //   name text,
+    //   tbl_name text,
+    //   rootpage integer,
+    //   sql text
+    // );
+
+    pub fn getTable(self: *Db, table_name: []u8) Error!DbTable {
+        // the first page contains the buffer (first 100 bytes), so we have a 0 offset to allocate the first page
+        // TODO: buffer management
+        readBuffer(self.buffer.ptr, 0, self.page_size);
+        const new_slice = self.buffer.ptr[0..self.page_size]; // first page
+        self.buffer = new_slice;
+        const bt_header = SQLiteBtHeader.from(new_slice[sqlite_header_size..]);
+        const cell_count = bt_header.get_cell_count();
+        debug("cell_count: {d}", .{cell_count});
+        const bt_header_size = bt_header.get_header_size();
+
+        const cell_ptr: *u16 = @alignCast(@ptrCast(new_slice[sqlite_header_size + bt_header_size .. sqlite_header_size + bt_header_size + 2]));
+        const cell_adr: u16 = @byteSwap(cell_ptr.*);
+        debug("first cell: {d}", .{cell_adr});
+        const cell_start = new_slice[cell_adr..];
+
+        var record = SQLiteRecord.from(cell_start);
+
+        // TODO: this could probably be refactored with comptime
+        debug("record..  created: {}", .{record});
+        while (true) {
+            record.consume();
+            record.consume();
+
+            if (record.next()) |name_col| {
+                if (name_col.type != SQLiteColumnType.text) return Error.InvalidBinary;
+                if (eql(u8, table_name, name_col.value.slice)) {
+                    if (record.next()) |index_col| {
+                        if (index_col.type.isInt()) {
+                            debug("int: {d}", .{index_col.value.int});
+                            return .{
+                                .page = @intCast(index_col.value.int),
+                            };
+                        }
+                        return Error.InvalidBinary;
+                    } else {
+                        return Error.InvalidBinary;
+                    }
+                } else {
+                    record.consume();
+                    record.consume();
+                }
+            } else {
+                return Error.InvalidBinary;
+            }
+        }
+        return Error.InvalidBinary;
+    }
+};
+
+const ASTGen = struct {
     index: usize,
-    buffer: [*]Token,
+    buffer: []Token,
+    source: [:0]u8,
     vm: Vm,
+    db: Db,
 
     const State = enum {
         start,
@@ -403,36 +726,89 @@ const ASTBuilder = struct {
         from,
     };
 
-    pub fn from(buffer: [*]Token) void {
-        return ASTBuilder{
+    pub fn from(
+        token_buffer: []Token,
+        source: [:0]u8,
+        file_buffer: []u8,
+    ) Error!ASTGen {
+        const db = try Db.from(file_buffer);
+        return ASTGen{
             .index = 0,
-            .buffer = buffer,
+            .buffer = token_buffer,
+            .source = source,
+            .vm = Vm{
+                .pc = 0,
+                .registers = undefined,
+                .insts = undefined,
+                .stmt = undefined,
+            },
+            .db = db,
         };
     }
 
-    fn build_select_statement(self: *ASTBuilder) SelectStmt {
+    fn getTokenSource(self: *ASTGen, token: Token) []u8 {
+        return self.source[token.location.start..token.location.end];
+    }
+
+    fn buildSelectStatement(self: *ASTGen) Error!SelectStmt {
         var state: State = .select;
+        var columns: u64 = 0;
+        var table: DbTable = undefined;
         while (self.index < self.buffer.len) : (self.index += 1) {
-            const token = self.buffer[self.index];
+            const token: Token = self.buffer[self.index];
             switch (state) {
                 .select => {
-                    switch (token) {
+                    switch (token.type) {
                         .asterisk => {
                             // All columns
+                            columns = 0xFFFFFFFF_FFFFFFFF;
+                        },
+                        .keyword_from => {
+                            state = .from;
+                        },
+                        else => {
+                            break;
                         },
                     }
                 },
+                .from => {
+                    switch (token.type) {
+                        .word => {
+                            const table_name = self.getTokenSource(token);
+                            table = try self.db.getTable(table_name);
+                        },
+                        .semicolon => {
+                            state = .end;
+                        },
+                        else => {
+                            break;
+                        },
+                    }
+                },
+                .end => {
+                    debug("AST built", .{});
+                    break;
+                },
+                else => {
+                    break;
+                },
             }
         }
+
+        return SelectStmt{
+            .columns = columns,
+            .table = table,
+            .where = undefined,
+        };
     }
 
-    pub fn build_statement(self: *ASTBuilder) void {
+    pub fn buildStatement(self: *ASTGen) void {
         var state: State = .start;
         while (self.index < self.buffer.len) : (self.index += 1) {
             const token = self.buffer[self.index];
             switch (state) {
                 .start => {
-                    switch (token) {
+                    switch (token.type) {
                         .keyword_select => {
                             state = .select;
                         },
@@ -442,15 +818,16 @@ const ASTBuilder = struct {
                     }
                 },
                 .select => {
-                    build_select_statement();
+                    self.vm.stmt = self.buildSelectStatement() catch null;
                 },
                 else => {},
             }
         }
+        debug("built statement: select({d}, {d})", .{ self.vm.stmt.?.columns, self.vm.stmt.?.table.page });
     }
 };
 
-fn parse_statement(str: [:0]u8) void {
+fn parseStatement(str: [:0]u8, file_buffer: []u8) Error!void {
     var tokenizer = Tokenizer.from(str);
     var token_count: u32 = 0;
     while (token_count < token_buf.len) : (token_count += 1) {
@@ -462,16 +839,23 @@ fn parse_statement(str: [:0]u8) void {
         // debugging
         tokenizer.dump(&token);
     }
+    var ast = try ASTGen.from(&token_buf, str, file_buffer);
+    ast.buildStatement();
 }
 
 export fn parse_buffer(ptr: ?*u8, size: usize) void {
-    parse_statement(@constCast(select_str));
     if (ptr == null) {
         print(err_string, err_string.len);
         return;
     }
     const buffer: [*]u8 = @as([*]u8, @ptrCast(ptr));
     const slice = buffer[0..size];
+    _ = parseStatement(@constCast(select_str), slice) catch null;
+
+    // TODO: remove code below
+    if (true) {
+        return;
+    }
     if (slice.len < @sizeOf(SQLiteDbHeader)) {
         print(err_string, err_string.len);
         return;

@@ -21,6 +21,8 @@ and then run a web server
 python3 -m http.server
 ```
 
+open the browser and navigate to `http://localhost:8000/zql.html`
+
 ### Access SQLite Database
 
 `../sqlite/sqlite3 test.db "select * from example;"`
