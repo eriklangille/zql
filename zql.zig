@@ -20,6 +20,11 @@ export fn malloc(size: usize) ?*u8 {
     return @ptrCast(mem);
 }
 
+fn valFromPtr(comptime T: type, val: []u8) T {
+    const result: *T = @alignCast(@ptrCast(val[0..@sizeOf(T)]));
+    return result.*;
+}
+
 // SQLite stores the header in big-endian format
 const sqlite_header_size = 100;
 const SQLiteDbHeader = extern struct {
@@ -66,6 +71,14 @@ const SQLiteBtHeader = extern struct {
         return @alignCast(@ptrCast(buffer[0..sqlite_bt_header_size]));
     }
 
+    pub fn get_cell_addr(self: *SQLiteBtHeader, buffer: []u8, index: u32) u16 {
+        const bt_header_size = self.get_header_size();
+        const start = bt_header_size + (index * 2);
+        const cell_adr: u16 = @byteSwap(valFromPtr(u16, buffer[start .. start + 2]));
+        debug("cell adr: {d}", .{cell_adr});
+        return cell_adr;
+    }
+
     pub fn get_header_size(self: *SQLiteBtHeader) u8 {
         const page_type = self.get_page_type();
         switch (page_type) {
@@ -108,7 +121,7 @@ const SQLiteBtHeader = extern struct {
     }
 
     pub fn get_right_child_page(self: *SQLiteBtHeader) u32 {
-        assert(self.get_page_type() != 0x0D and self.get_page_type() != 0x0A, "Leaf pages don't have right child pages");
+        assert(self.get_page_type() != 0x0D and self.get_page_type() != 0x0A);
         return @byteSwap(self.right_child_page);
     }
 };
@@ -117,6 +130,9 @@ const SQLiteBtHeader = extern struct {
 const bits_7 = 0x7f;
 const slot_2_0 = (0x7f << 14) | 0x7f;
 const slot_4_2_0 = (0x7f << 28) | slot_2_0;
+
+// max 64 bit value
+const max_64_bit = 0xFFFFFFFF_FFFFFFFF;
 
 const err_string = "Error!";
 const select_str = "SELECT * FROM example;";
@@ -419,11 +435,6 @@ const SQLiteColumnValue = struct {
         slice: []u8,
     },
 
-    fn valFromPtr(comptime T: type, val: []u8) T {
-        const result: *T = @alignCast(@ptrCast(val[0..@sizeOf(T)]));
-        return result.*;
-    }
-
     pub fn from(col_type: SQLiteColumnType, val: []u8) SQLiteColumnValue {
         switch (col_type) {
             .empty, .value_0, .value_1 => {
@@ -435,35 +446,35 @@ const SQLiteColumnValue = struct {
             .i16 => {
                 return .{
                     .type = col_type,
-                    .value = .{ .int = @byteSwap(SQLiteColumnValue.valFromPtr(i16, val)) },
+                    .value = .{ .int = @byteSwap(valFromPtr(i16, val)) },
                 };
             },
             .i24 => {
                 return .{
                     .type = col_type,
-                    .value = .{ .int = @byteSwap(SQLiteColumnValue.valFromPtr(i24, val)) },
+                    .value = .{ .int = @byteSwap(valFromPtr(i24, val)) },
                 };
             },
             .i32 => {
                 return .{
                     .type = col_type,
-                    .value = .{ .int = @byteSwap(SQLiteColumnValue.valFromPtr(i32, val)) },
+                    .value = .{ .int = @byteSwap(valFromPtr(i32, val)) },
                 };
             },
             .i48 => {
                 return .{
                     .type = col_type,
-                    .value = .{ .int = @byteSwap(SQLiteColumnValue.valFromPtr(i48, val)) },
+                    .value = .{ .int = @byteSwap(valFromPtr(i48, val)) },
                 };
             },
             .i64 => {
                 return .{
                     .type = col_type,
-                    .value = .{ .int = @byteSwap(SQLiteColumnValue.valFromPtr(i64, val)) },
+                    .value = .{ .int = @byteSwap(valFromPtr(i64, val)) },
                 };
             },
             .f64 => {
-                const result = SQLiteColumnValue.valFromPtr(u64, val);
+                const result = valFromPtr(u64, val);
                 return .{
                     .type = col_type,
                     .value = .{ .float = @floatFromInt(@byteSwap(result)) },
@@ -630,7 +641,7 @@ const SQLiteColumnType = enum {
     }
 };
 
-pub const Error = error{InvalidBinary};
+pub const Error = error{ InvalidBinary, InvalidSyntax };
 
 const Db = struct {
     cursor: usize,
@@ -652,6 +663,23 @@ const Db = struct {
         };
     }
 
+    pub fn readPage(self: *Db, index: u32) []u8 {
+        debug("index: {d}, page_size: {d}", .{ index, self.page_size });
+        const page_start: u32 = index * self.page_size;
+        debug("page start {d}", .{page_start});
+        if (self.buffer.len <= page_start) {
+            // TODO: buffer management (alloc?)
+            debug("increasing buffer size", .{});
+            const length = page_start + self.page_size;
+            readBuffer(self.buffer.ptr, 0, length);
+            const new_slice = self.buffer.ptr[0..length]; // first page
+            self.buffer = new_slice;
+            debug("allocated", .{});
+        }
+        debug("buffer len: {d}, page_start: {d}", .{ self.buffer.len, page_start });
+        return self.buffer[page_start..];
+    }
+
     // Table schema:
     // CREATE TABLE sqlite_schema(
     //   type text,
@@ -668,19 +696,14 @@ const Db = struct {
         const new_slice = self.buffer.ptr[0..self.page_size]; // first page
         self.buffer = new_slice;
         const bt_header = SQLiteBtHeader.from(new_slice[sqlite_header_size..]);
-        const cell_count = bt_header.get_cell_count();
-        debug("cell_count: {d}", .{cell_count});
-        const bt_header_size = bt_header.get_header_size();
 
-        const cell_ptr: *u16 = @alignCast(@ptrCast(new_slice[sqlite_header_size + bt_header_size .. sqlite_header_size + bt_header_size + 2]));
-        const cell_adr: u16 = @byteSwap(cell_ptr.*);
-        debug("first cell: {d}", .{cell_adr});
+        const cell_adr = bt_header.get_cell_addr(new_slice[sqlite_header_size..], 0);
         const cell_start = new_slice[cell_adr..];
 
         var record = SQLiteRecord.from(cell_start);
 
         // TODO: this could probably be refactored with comptime
-        debug("record..  created: {}", .{record});
+        debug("table record: {}", .{record});
         while (true) {
             record.consume();
             record.consume();
@@ -690,9 +713,12 @@ const Db = struct {
                 if (eql(u8, table_name, name_col.value.slice)) {
                     if (record.next()) |index_col| {
                         if (index_col.type.isInt()) {
+                            assert(index_col.value.int >= 0);
                             debug("int: {d}", .{index_col.value.int});
-                            return .{
-                                .page = @intCast(index_col.value.int),
+                            const page_index: u32 = @intCast(index_col.value.int);
+                            debug("uint: {d}", .{page_index});
+                            return DbTable{
+                                .page = page_index,
                             };
                         }
                         return Error.InvalidBinary;
@@ -753,7 +779,7 @@ const ASTGen = struct {
     fn buildSelectStatement(self: *ASTGen) Error!SelectStmt {
         var state: State = .select;
         var columns: u64 = 0;
-        var table: DbTable = undefined;
+        var table: ?DbTable = null;
         while (self.index < self.buffer.len) : (self.index += 1) {
             const token: Token = self.buffer[self.index];
             switch (state) {
@@ -795,15 +821,22 @@ const ASTGen = struct {
             }
         }
 
+        if (table == null) {
+            return Error.InvalidSyntax;
+        }
+        debug("table: {}", .{table.?});
+
         return SelectStmt{
             .columns = columns,
-            .table = table,
+            .table = table.?,
             .where = undefined,
         };
     }
 
     pub fn buildStatement(self: *ASTGen) void {
         var state: State = .start;
+        // TODO: better handling, I think since there's a fixed buffer size this will iterate through 300 tokens even
+        // if there isn't. Probably need an end token
         while (self.index < self.buffer.len) : (self.index += 1) {
             const token = self.buffer[self.index];
             switch (state) {
@@ -819,11 +852,37 @@ const ASTGen = struct {
                 },
                 .select => {
                     self.vm.stmt = self.buildSelectStatement() catch null;
+                    break;
                 },
-                else => {},
+                else => {
+                    break;
+                },
             }
         }
         debug("built statement: select({d}, {d})", .{ self.vm.stmt.?.columns, self.vm.stmt.?.table.page });
+    }
+
+    pub fn buildInstructions(self: *ASTGen) void {
+        if (self.vm.stmt) |stmt| {
+            // TODO: handle statement
+            const index: u32 = stmt.table.page - 1;
+            debug("index: {d}", .{index});
+
+            const buffer = self.db.readPage(index);
+            debug("buffer created", .{});
+            const header = SQLiteBtHeader.from(buffer);
+            const addr = header.get_cell_addr(buffer, 0);
+
+            var record = SQLiteRecord.from(buffer[addr..]);
+            while (record.next()) |first| {
+                debug("in table: {}", .{first.type});
+                if (first.type == SQLiteColumnType.text) {
+                    debug("text: {s}", .{first.value.slice});
+                }
+            }
+        } else {
+            debug("no select statement to build!", .{});
+        }
     }
 };
 
@@ -841,6 +900,9 @@ fn parseStatement(str: [:0]u8, file_buffer: []u8) Error!void {
     }
     var ast = try ASTGen.from(&token_buf, str, file_buffer);
     ast.buildStatement();
+
+    // TODO: ast built, now translate into instructions for VM.
+    ast.buildInstructions();
 }
 
 export fn parse_buffer(ptr: ?*u8, size: usize) void {
