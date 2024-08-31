@@ -8,6 +8,7 @@ const eqlLenIgnoreCase = @import("std").static_string_map.eqlAsciiIgnoreCase;
 const eql = @import("std").mem.eql;
 const ArrayListUnmanaged = @import("std").ArrayListUnmanaged;
 const Allocator = @import("std").mem.Allocator;
+const maxInt = @import("std").math.maxInt;
 
 // (arrayPointer: i32, length: i32)
 extern fn print(ptr: [*]const u8, len: usize) void;
@@ -84,6 +85,7 @@ const SQLiteBtHeader = extern struct {
 
     pub fn get_header_size(self: *SQLiteBtHeader) u8 {
         const page_type = self.get_page_type();
+        debug("page type: {x}", .{page_type});
         switch (page_type) {
             0x0D, 0x0A => {
                 return 8;
@@ -100,22 +102,22 @@ const SQLiteBtHeader = extern struct {
 
     pub fn get_first_freeblock(self: *SQLiteBtHeader) u16 {
         var block: u16 = 0;
-        block = @as(u16, self.metadata[2]) << 8;
-        block |= self.metadata[1];
+        block = @as(u16, self.metadata[1]) << 8;
+        block |= self.metadata[2];
         return block;
     }
 
     pub fn get_cell_count(self: *SQLiteBtHeader) u16 {
         var block: u16 = 0;
-        block = @as(u16, self.metadata[4]) << 8;
-        block |= self.metadata[3];
+        block = @as(u16, self.metadata[3]) << 8;
+        block |= self.metadata[4];
         return block;
     }
 
     pub fn get_cell_offset(self: *SQLiteBtHeader) u16 {
         var block: u16 = 0;
-        block = @as(u16, self.metadata[6]) << 8;
-        block |= self.metadata[5];
+        block = @as(u16, self.metadata[5]) << 8;
+        block |= self.metadata[6];
         return block;
     }
 
@@ -137,7 +139,6 @@ const slot_4_2_0 = (0x7f << 28) | slot_2_0;
 // max 64 bit value
 const max_64_bit = 0xFFFFFFFF_FFFFFFFF;
 
-const err_string = "Error!";
 const select_str = "SELECT * FROM example;";
 
 const one_kb = 1024;
@@ -145,12 +146,6 @@ const query_buffer_size = 512;
 const memory_buffery_size = 32 * one_kb;
 var query_buf: [query_buffer_size]u8 = undefined;
 var memory_buf: [memory_buffery_size]u8 = undefined;
-var vm: Vm = .{
-    .pc = 0,
-    .insts = undefined,
-    .registers = undefined,
-    .stmt = null,
-};
 
 comptime {
     assert(@sizeOf(SQLiteDbHeader) == sqlite_header_size);
@@ -430,7 +425,7 @@ const Expr = struct {
 const SelectStmt = struct {
     columns: u64, // Each bit represents one column in the table
     table: TableStmt,
-    where: *Expr,
+    where: Expr,
 };
 
 const ElementType = enum {
@@ -475,7 +470,7 @@ const Inst = struct {
     p1: u32,
     p2: u32,
     p3: u32,
-    p4: u64,
+    p4: u64, // p4 seems optional, only some instructions have it? We can do the same
     p5: u16,
 };
 
@@ -483,7 +478,7 @@ const Opcode = enum(u8) {
     init,
     open_read,
     rewind,
-    rowid,
+    row_id,
     column,
     result_row,
     next,
@@ -492,95 +487,48 @@ const Opcode = enum(u8) {
     goto,
 };
 
-const Register = struct {
-    memory: union {
-        int: i64,
-        float: f64,
-    },
-    str: *u8,
-    len: u32,
-};
+const Register = union(enum) {
+    none,
+    int: i64,
+    float: f64,
+    str: []u8,
+    binary: []u8,
 
-const Vm = struct {
-    pc: u32,
-    registers: [100]Register,
-    insts: [100]Inst,
-    stmt: ?SelectStmt,
-}; // 100 instructions, 100 stack, 100 instructions
+    pub fn from_column(column: SQLiteColumn) Register {
+        switch (column) {
+            .i8, .i16, .i24, .i32, .i48, .i64 => return .{ .int = column.getInt().? },
+            .value_0 => return .{ .int = 0 },
+            .value_1 => return .{ .int = 1 },
+            .f64 => return .{ .float = column.f64 },
+            .empty => return Register.none,
+            .invalid => {
+                debug("invalid SQLiteColumn when converting to register", .{});
+                return Register.none;
+            },
+            .blob => return .{ .binary = column.blob },
+            .text => return .{ .str = column.text },
+        }
+    }
+
+    pub fn to_str(self: Register, buffer: []u8) anyerror![]u8 {
+        return switch (self) {
+            .none => try fmt.bufPrint(buffer, "[null]", .{}),
+            .int => try fmt.bufPrint(buffer, "{d}", .{self.int}),
+            .float => try fmt.bufPrint(buffer, "{e}", .{self.float}),
+            .str => try fmt.bufPrint(buffer, "{s}", .{self.str}),
+            .binary => try fmt.bufPrint(buffer, "[binary]", .{}),
+        };
+    }
+};
 
 const SQLiteDbTable = struct {
     page: u32,
     sql: String,
 };
 
-const SQLiteColumnValue = struct {
-    type: SQLiteColumnType,
-    value: union {
-        int: i64,
-        float: f64,
-        slice: []u8,
-    },
-
-    pub fn from(col_type: SQLiteColumnType, val: []u8) SQLiteColumnValue {
-        switch (col_type) {
-            .empty, .value_0, .value_1 => {
-                return .{ .type = col_type, .value = .{ .int = 0 } };
-            },
-            .i8 => {
-                return .{ .type = col_type, .value = .{ .int = @intCast(val[0]) } };
-            },
-            .i16 => {
-                return .{
-                    .type = col_type,
-                    .value = .{ .int = @byteSwap(valFromSlice(i16, val)) },
-                };
-            },
-            .i24 => {
-                return .{
-                    .type = col_type,
-                    .value = .{ .int = @byteSwap(valFromSlice(i24, val)) },
-                };
-            },
-            .i32 => {
-                return .{
-                    .type = col_type,
-                    .value = .{ .int = @byteSwap(valFromSlice(i32, val)) },
-                };
-            },
-            .i48 => {
-                return .{
-                    .type = col_type,
-                    .value = .{ .int = @byteSwap(valFromSlice(i48, val)) },
-                };
-            },
-            .i64 => {
-                return .{
-                    .type = col_type,
-                    .value = .{ .int = @byteSwap(valFromSlice(i64, val)) },
-                };
-            },
-            .f64 => {
-                const result = valFromSlice(u64, val);
-                return .{
-                    .type = col_type,
-                    .value = .{ .float = @floatFromInt(@byteSwap(result)) },
-                };
-            },
-            .blob, .text => {
-                return .{
-                    .type = col_type,
-                    .value = .{ .slice = val },
-                };
-            },
-            .invalid => {
-                return .{ .type = .invalid, .value = .{ .int = 0 } };
-            },
-        }
-    }
-};
-
 const SQLiteRecord = struct {
     buffer: []u8,
+    row_id: u64,
     size: u32,
     header_size: u32,
     cursor: u32,
@@ -594,7 +542,7 @@ const SQLiteRecord = struct {
         var cell_header_size: u64 = 0;
         var cursor: u32 = 0;
         var cell_header_int: u32 = 0;
-        var row_id: u64 = 0; // TODO: use this?
+        var row_id: u64 = 0;
 
         // TODO: this only supports 0x0d pages. Support the other pages
         cursor += get_varint(buffer.ptr, &cell_size);
@@ -608,6 +556,7 @@ const SQLiteRecord = struct {
         // TODO: extra validation to make sure its 32 bit size?
         return SQLiteRecord{
             .buffer = buffer[cursor..],
+            .row_id = row_id,
             .size = @intCast(cell_size),
             .header_size = @intCast(cell_header_size),
             .cursor = @intCast(cell_header_size),
@@ -620,7 +569,7 @@ const SQLiteRecord = struct {
         self.header_cursor = 0;
     }
 
-    pub fn next(self: *SQLiteRecord) ?SQLiteColumnValue {
+    pub fn next(self: *SQLiteRecord) ?SQLiteColumn {
         if (self.cursor >= self.size) return null;
         if (self.header_cursor >= self.header_size) {
             self.header_cursor = 0;
@@ -628,19 +577,14 @@ const SQLiteRecord = struct {
         var header_val: u64 = 0;
         self.header_cursor += get_varint(self.buffer.ptr + self.header_cursor, &header_val);
 
-        const size: u32 = @truncate(SQLiteColumnType.size(header_val));
+        const size: u32 = @truncate(SQLiteColumn.size(header_val));
 
-        const col_type = SQLiteColumnType.from(header_val);
-        debug("next() size: {d} col_type: {}", .{ size, col_type });
-
-        if (size == 0) {
-            return SQLiteColumnValue.from(col_type, self.buffer);
-        }
-
-        const result = SQLiteColumnValue.from(
-            col_type,
-            self.buffer[self.cursor .. self.cursor + size],
+        const result = SQLiteColumn.from(
+            header_val,
+            self.buffer[self.cursor..],
         );
+
+        debug("next() size: {d} col_type: {s}", .{ size, @tagName(result) });
 
         self.cursor += size;
         return result;
@@ -659,51 +603,80 @@ const SQLiteRecord = struct {
         // const col_type = SQLiteColumnType.from(header_val);
         // debug("next() size: {d} col_type: {}", .{ size, col_type });
 
-        self.cursor += @truncate(SQLiteColumnType.size(header_val));
+        self.cursor += @truncate(SQLiteColumn.size(header_val));
     }
 };
 
-const SQLiteColumnType = enum {
-    empty,
-    i8,
-    i16,
-    i24,
-    i32,
-    i48,
-    i64,
-    f64,
-    value_0,
-    value_1,
-    invalid,
-    blob,
-    text,
+const SQLiteColumn = union(enum) {
+    empty: void,
+    i8: i8,
+    i16: i16,
+    i24: i24,
+    i32: i32,
+    i48: i48,
+    i64: i64,
+    f64: f64,
+    value_0: void,
+    value_1: void,
+    invalid: void,
+    blob: []u8,
+    text: []u8,
 
-    pub fn from(val: u64) SQLiteColumnType {
-        switch (val) {
-            0 => return .empty,
-            1 => return .i8,
-            2 => return .i16,
-            3 => return .i24,
-            4 => return .i32,
-            5 => return .i48,
-            6 => return .i64,
-            7 => return .f64,
-            8 => return .value_0,
-            9 => return .value_1,
-            10, 11 => return .invalid,
+    pub fn from(header_int: u64, buffer: []u8) SQLiteColumn {
+        switch (header_int) {
+            0 => {
+                return SQLiteColumn.empty;
+            },
+            1 => {
+                return .{ .i8 = @intCast(buffer[0]) };
+            },
+            2 => {
+                return .{ .i16 = @byteSwap(valFromSlice(i16, buffer)) };
+            },
+            3 => {
+                return .{ .i24 = @byteSwap(valFromSlice(i24, buffer)) };
+            },
+            4 => {
+                return .{ .i32 = @byteSwap(valFromSlice(i32, buffer)) };
+            },
+            5 => {
+                return .{ .i48 = @byteSwap(valFromSlice(i48, buffer)) };
+            },
+            6 => {
+                return .{ .i64 = @byteSwap(valFromSlice(i64, buffer)) };
+            },
+            7 => {
+                const result = valFromSlice(u64, buffer);
+                return .{ .f64 = @floatFromInt(@byteSwap(result)) };
+            },
+            8 => {
+                return SQLiteColumn.value_0;
+            },
+            9 => {
+                return SQLiteColumn.value_1;
+            },
+            10, 11 => {
+                return SQLiteColumn.invalid;
+            },
             else => {
-                if (val % 2 == 0) {
-                    return .blob;
+                const buffer_size: u32 = @truncate(SQLiteColumn.size(header_int));
+                if (header_int % 2 == 0) {
+                    return .{ .blob = buffer[0..buffer_size] };
                 }
-                return .text;
+                return .{ .text = buffer[0..buffer_size] };
             },
         }
     }
 
-    pub fn isInt(self: SQLiteColumnType) bool {
+    pub fn getInt(self: SQLiteColumn) ?i64 {
         switch (self) {
-            .i8, .i16, .i24, .i32, .i48, .i64 => return true,
-            else => return false,
+            .i8 => return self.i8,
+            .i16 => return self.i16,
+            .i24 => return self.i24,
+            .i32 => return self.i32,
+            .i48 => return self.i48,
+            .i64 => return self.i64,
+            else => return null,
         }
     }
 
@@ -730,7 +703,7 @@ const SQLiteColumnType = enum {
 pub const Error = error{ InvalidBinary, InvalidSyntax, OutOfMemory };
 
 const Db = struct {
-    cursor: usize,
+    cursor: usize, // TODO: use this?
     buffer: []u8,
     page_size: u16,
 
@@ -752,7 +725,7 @@ const Db = struct {
     pub fn readPage(self: *Db, index: u32) []u8 {
         debug("index: {d}, page_size: {d}", .{ index, self.page_size });
         const page_start: u32 = index * self.page_size;
-        debug("page start {d}", .{page_start});
+        debug("page start {x}", .{page_start});
         if (self.buffer.len <= page_start) {
             // TODO: buffer management (alloc?)
             debug("increasing buffer size", .{});
@@ -795,16 +768,17 @@ const Db = struct {
             record.consume();
 
             if (record.next()) |name_col| {
-                if (name_col.type != SQLiteColumnType.text) return Error.InvalidBinary;
-                if (eql(u8, table_name, name_col.value.slice)) {
+                if (name_col != SQLiteColumn.text) return Error.InvalidBinary;
+                if (eql(u8, table_name, name_col.text)) {
                     if (record.next()) |index_col| {
-                        if (!index_col.type.isInt()) return Error.InvalidBinary;
-                        assert(index_col.value.int >= 0);
-                        const page_index: u32 = @intCast(index_col.value.int);
+                        const index_int = index_col.getInt();
+                        if (index_int == null) return Error.InvalidBinary;
+                        assert(index_int.? >= 0);
+                        const page_index: u32 = @intCast(index_int.?);
                         debug("page_index: {d}", .{page_index});
                         if (record.next()) |sql_col| {
-                            if (sql_col.type != SQLiteColumnType.text) return Error.InvalidBinary;
-                            const sql_str = try String.initAddSentinel(alloc, sql_col.value.slice, 0);
+                            if (sql_col != SQLiteColumn.text) return Error.InvalidBinary;
+                            const sql_str = try String.initAddSentinel(alloc, sql_col.text, 0);
                             return SQLiteDbTable{
                                 .page = page_index,
                                 .sql = sql_str,
@@ -831,7 +805,6 @@ const ASTGen = struct {
     token_list: *TokenList,
     element_list: *ElementList,
     source: [:0]u8,
-    vm: Vm,
     db: Db,
 
     const State = enum {
@@ -854,16 +827,14 @@ const ASTGen = struct {
         token_list: *TokenList,
         element_list: *ElementList,
         source: [:0]u8,
-        file_buffer: []u8,
+        db: Db,
     ) Error!ASTGen {
-        const db = try Db.from(file_buffer);
         return ASTGen{
             .index = 0,
             .gpa = gpa,
             .token_list = token_list,
             .element_list = element_list,
             .source = source,
-            .vm = vm, // TODO: more than one VM?
             .db = db,
         };
     }
@@ -962,13 +933,18 @@ const ASTGen = struct {
                                 .tag = ElementType.table,
                                 .data = undefined,
                             });
+                            // TODO: it doesn't make sense to store primary key always in the first column, because if its in a different order
+                            // in the db then theres no way to map the column headers to the columns fields..
+                            // so we need to indicate primary key index as a separate metadata info thing
+                            // probably as a custom value in .rhs
+
                             primary_key_index = try self.addElement(.{
                                 .value = undefined,
                                 .tag = undefined,
                                 .data = undefined,
                             });
-                            self.replaceDataAtIndex(table_index.?, .{ .lhs = col_index, .rhs = sqlite_table.page });
                             col_index = primary_key_index.?;
+                            self.replaceDataAtIndex(table_index.?, .{ .lhs = col_index, .rhs = sqlite_table.page });
                         },
                         .lparen => {
                             state = .table_col_name;
@@ -1003,6 +979,7 @@ const ASTGen = struct {
                             if (primary_key == PrimaryKeyState.current) {
                                 primary_key = PrimaryKeyState.filled;
                                 self.replaceNameAtIndex(primary_key_index.?, name.?);
+                                debug("primary key tag: {}", .{tag.?});
                                 self.replaceTagAtIndex(primary_key_index.?, tag.?);
                             } else {
                                 const new_index = try self.addElement(.{
@@ -1038,7 +1015,7 @@ const ASTGen = struct {
                     }
                 },
                 .end => {
-                    self.replaceDataAtIndex(col_index, .{ .lhs = 0, .rhs = 0 });
+                    self.replaceDataAtIndex(col_index, .{ .lhs = maxInt(u32), .rhs = 0 });
                     return table_index.?;
                 },
                 else => unreachable,
@@ -1109,7 +1086,7 @@ const ASTGen = struct {
         };
     }
 
-    pub fn buildStatement(self: *ASTGen) Error!void {
+    pub fn buildStatement(self: *ASTGen) Error!SelectStmt {
         var state: State = .start;
         // TODO: better handling, I think since there's a fixed buffer size this will iterate through 300 tokens even
         // if there isn't. Probably need an end token
@@ -1127,37 +1104,352 @@ const ASTGen = struct {
                     }
                 },
                 .select => {
-                    self.vm.stmt = try self.buildSelectStatement();
-                    break;
+                    const select = try self.buildSelectStatement();
+                    debug("built statement: select({d}, {d})", .{ select.columns, select.table.page });
+                    return select;
                 },
                 else => {
                     break;
                 },
             }
         }
-        debug("built statement: select({d}, {d})", .{ self.vm.stmt.?.columns, self.vm.stmt.?.table.page });
+        return Error.InvalidSyntax;
+    }
+};
+
+const TableMetadataReader = struct {
+    element_list: *ElementList,
+    index: u32,
+    name: String,
+
+    pub fn from(element_list: *ElementList, table_stmt: *const TableStmt) TableMetadataReader {
+        return .{
+            .element_list = element_list,
+            .index = table_stmt.first_column,
+            .name = table_stmt.name,
+        };
     }
 
-    pub fn buildInstructions(self: *ASTGen) void {
-        if (self.vm.stmt) |stmt| {
-            // TODO: handle statement
-            const index: u32 = stmt.table.page - 1;
-            debug("index: {d}", .{index});
+    pub fn next(self: *TableMetadataReader) ?Element {
+        if (self.index % 100 == 0) {
+            debug("next element: {d}, len: {d}", .{ self.index, self.element_list.len });
+        }
+        if (self.index >= self.element_list.len or self.index == maxInt(u32)) {
+            return null;
+        }
+        const element = self.element_list.get(self.index);
+        self.index = element.data.lhs;
+        return element;
+    }
+};
 
-            const buffer = self.db.readPage(index);
-            debug("buffer created", .{});
-            const header = SQLiteBtHeader.from(buffer);
-            const addr = header.get_cell_addr(buffer, 0);
+const Stmt = union(enum) {
+    select: SelectStmt,
+};
 
-            var record = SQLiteRecord.from(buffer[addr..]);
-            while (record.next()) |first| {
-                debug("in table: {}", .{first.type});
-                if (first.type == SQLiteColumnType.text) {
-                    debug("text: {s}", .{first.value.slice});
+const InstGen = struct {
+    gpa: Allocator,
+    element_list: *ElementList,
+    inst_list: *InstList,
+    statement: Stmt,
+    db: Db,
+    cursor_count: u8, // TODO: this count probably isn't necessary
+
+    pub fn from(
+        gpa: Allocator,
+        element_list: *ElementList,
+        inst_list: *InstList,
+        db: Db,
+        statement: Stmt,
+    ) Error!InstGen {
+        return InstGen{
+            .gpa = gpa,
+            .element_list = element_list,
+            .inst_list = inst_list,
+            .statement = statement,
+            .db = db,
+            .cursor_count = 0,
+        };
+    }
+
+    // TODO: replace instruction list as struct with .Data and .Opcode. If > 2 32 bit values, then put it in extra_data arraylist
+
+    fn addInst(self: *InstGen, inst: Inst) Allocator.Error!u32 {
+        const result = @as(u32, @intCast(self.inst_list.len));
+        try self.inst_list.append(self.gpa, inst);
+        return result;
+    }
+
+    fn replaceP2AtIndex(self: *InstGen, index: u32, p2: u32) void {
+        self.inst_list.items(.p2)[index] = p2;
+    }
+
+    fn markInst(self: *InstGen, opcode: Opcode) Error!u32 {
+        return try self.addInst(.{ .opcode = opcode, .p1 = 0, .p2 = 0, .p3 = 0, .p4 = 0, .p5 = 0 });
+    }
+
+    fn instInit(self: *InstGen, index: u32, start_inst: u32) void {
+        self.replaceP2AtIndex(index, start_inst);
+    }
+
+    fn openRead(self: *InstGen, index: u32, table_index: u32) void {
+        self.replaceP2AtIndex(index, table_index);
+        self.cursor_count += 1;
+    }
+
+    // The next use of the Rowid or Column or Next instruction for P1 will refer to the first entry in the database table or index.
+    // If the table or index is empty, jump immediately to P2. If the table or index is not empty, fall through to the following instruction.
+    // If P2 is zero, that is an assertion that the P1 table is never empty and hence the jump will never be taken.
+    // This opcode leaves the cursor configured to move in forward order, from the beginning toward the end. In other words, the cursor is configured to use Next, not Prev.
+    fn rewind(self: *InstGen, index: u32, end_inst: u32) void {
+        self.replaceP2AtIndex(index, end_inst);
+    }
+
+    // Store in register P2 an integer which is the key of the table entry that P1 is currently point to.
+    // P1 can be either an ordinary table or a virtual table. There used to be a separate OP_VRowid opcode for use with virtual tables,
+    // but this one opcode now works for both table types.
+    fn rowId(self: *InstGen, read_cursor: u32, store_reg: u32) Error!void {
+        _ = try self.addInst(.{ .opcode = .row_id, .p1 = read_cursor, .p2 = store_reg, .p3 = 0, .p4 = 0, .p5 = 0 });
+    }
+
+    // Interpret the data that cursor P1 points to as a structure built using the MakeRecord instruction. Extract the P2-th column from this record.
+    // If there are less than (P2+1) values in the record, extract a NULL.
+    // The value extracted is stored in register P3.
+    // If the record contains fewer than P2 fields, then extract a NULL. Or, if the P4 argument is a P4_MEM use the value of the P4 argument as the result.
+    fn column(self: *InstGen, read_cursor: u32, store_reg: u32, col_num: u32) Error!void {
+        _ = try self.addInst(.{ .opcode = .column, .p1 = read_cursor, .p2 = col_num, .p3 = store_reg, .p4 = 0, .p5 = 0 });
+    }
+
+    // The registers P1 through P1+P2-1 contain a single row of results. This opcode causes the sqlite3_step() call to terminate with an SQLITE_ROW return code
+    // and it sets up the sqlite3_stmt structure to provide access to the r(P1)..r(P1+P2-1) values as the result row.
+    fn resultRow(self: *InstGen, reg_index_start: u32, reg_index_end: u32) Error!void {
+        _ = try self.addInst(.{ .opcode = .result_row, .p1 = reg_index_start, .p2 = reg_index_end, .p3 = 0, .p4 = 0, .p5 = 0 });
+    }
+
+    fn next(self: *InstGen, cursor: u32, success_jump: u32) Error!void {
+        _ = try self.addInst(.{ .opcode = .next, .p1 = cursor, .p2 = success_jump, .p3 = 0, .p4 = 0, .p5 = 0 });
+    }
+
+    fn halt(self: *InstGen) Error!void {
+        _ = try self.addInst(.{ .opcode = .halt, .p1 = 0, .p2 = 0, .p3 = 0, .p4 = 0, .p5 = 0 });
+    }
+
+    // Begin a transaction on database P1 if a transaction is not already active. If P2 is non-zero, then a write-transaction is started,
+    // or if a read-transaction is already active, it is upgraded to a write-transaction. If P2 is zero, then a read-transaction is started.
+    // If P2 is 2 or more then an exclusive transaction is started.
+    // P1 is the index of the database file on which the transaction is started. Index 0 is the main database file and index 1 is the file
+    // used for temporary tables. Indices of 2 or more are used for attached databases.
+    // If P5!=0 then this opcode also checks the schema cookie against P3 and the schema generation counter against P4.
+    // The cookie changes its value whenever the database schema changes. This operation is used to detect when that the cookie has changed
+    // and that the current process needs to reread the schema. If the schema cookie in P3 differs from the schema cookie in the database header
+    // or if the schema generation counter in P4 differs from the current generation counter, then an SQLITE_SCHEMA error is raised and
+    // execution halts. The sqlite3_step() wrapper function might then reprepare the statement and rerun it from the beginning.
+    fn transaction(self: *InstGen, database_id: u32, write: bool) Error!void {
+        const write_int: u32 = if (write) 1 else 0;
+        _ = try self.addInst(.{ .opcode = .transaction, .p1 = database_id, .p2 = write_int, .p3 = 0, .p4 = 0, .p5 = 0 });
+    }
+
+    fn goto(self: *InstGen, inst_jump: u32) Error!void {
+        _ = try self.addInst(.{ .opcode = .goto, .p1 = 0, .p2 = inst_jump, .p3 = 0, .p4 = 0, .p5 = 0 });
+    }
+
+    pub fn buildInstructions(self: *InstGen) Error!void {
+        switch (self.statement) {
+            Stmt.select => {
+                const select = self.statement.select;
+                const page_index: u32 = select.table.page - 1;
+                debug("page_index: {d}", .{page_index});
+
+                const cursor = 0;
+
+                const init_index = try self.markInst(.init);
+                const open_read_index = try self.markInst(.open_read);
+                const rewind_index = try self.markInst(.rewind);
+                const rewind_start = self.inst_list.len;
+
+                var col_count: u32 = 0;
+                var output_count: u32 = 0;
+                var reader = TableMetadataReader.from(self.element_list, &select.table);
+                while (reader.next()) |col| {
+                    // TODO: support more than 64 columns
+                    if (select.columns & (@as(u64, 0x1) << @truncate(col_count)) > 0) {
+                        if (col_count == 0 and col.tag == .integer) {
+                            // rowId reads for a integer primary key row. If this isn't explicitly noted as a primary key,
+                            // then column instruction is used instead.
+                            try self.rowId(cursor, output_count + 1);
+                        } else {
+                            try self.column(cursor, output_count + 1, col_count);
+                        }
+                        output_count += 1;
+                    }
+                    col_count += 1;
                 }
-            }
+                debug("columns", .{});
+
+                debug("output count: {d}", .{output_count});
+                try self.resultRow(1, output_count + 1);
+                try self.next(cursor, rewind_start);
+                try self.halt();
+                const halt_index = self.inst_list.len - 1;
+                // TODO: support multiples databases, writing to tables
+                try self.transaction(0, false);
+                const transaction_index = self.inst_list.len - 1;
+                try self.goto(open_read_index);
+                self.instInit(init_index, transaction_index);
+                self.openRead(open_read_index, page_index);
+                self.rewind(rewind_index, halt_index);
+                debug("instructions written", .{});
+            },
+        }
+    }
+};
+
+const Vm = struct {
+    gpa: Allocator,
+    db: Db,
+    inst_list: InstList.Slice,
+    reg_list: ArrayListUnmanaged(Register),
+    pc: u32,
+
+    const Cursor = struct {
+        addr: u16,
+        index: u32,
+    };
+
+    pub fn from(gpa: Allocator, db: Db, inst_list: InstList.Slice) Vm {
+        return .{
+            .gpa = gpa,
+            .db = db,
+            .inst_list = inst_list,
+            .reg_list = .{},
+            .pc = 0,
+        };
+    }
+
+    fn reg(self: *Vm, index: u32, register: Register) Error!void {
+        debug("reg index: {d}, len: {d}", .{ index, self.reg_list.items.len });
+        // registers start at 1, not 0
+        if (index - 1 == self.reg_list.items.len) {
+            try self.reg_list.append(self.gpa, register);
         } else {
-            debug("no select statement to build!", .{});
+            self.reg_list.items[index - 1] = register;
+        }
+    }
+
+    pub fn exec(self: *Vm) Error!void {
+        var instruction = self.inst_list.get(self.pc);
+        // TODO: multiple cursors
+        // TODO: clean up these variables
+        var buffer: ?[]u8 = null;
+        var header: ?*SQLiteBtHeader = null;
+        var record: ?SQLiteRecord = null;
+        var col_count: u32 = 0;
+        var cell_size: u32 = 0;
+        var cell_count: u32 = 0;
+        var col_value: ?SQLiteColumn = null;
+
+        while (self.pc < self.inst_list.len and instruction.opcode != .halt) {
+            instruction = self.inst_list.get(self.pc);
+            switch (instruction.opcode) {
+                .init => {
+                    self.pc = instruction.p2;
+                },
+                .open_read => {
+                    const page_index = instruction.p2;
+                    buffer = self.db.readPage(page_index);
+                    debug("buffer created", .{});
+                    header = SQLiteBtHeader.from(buffer.?);
+                    // TODO: refactor this mess
+                    cell_size = header.?.get_cell_count();
+                    debug("cell count: {d}", .{cell_size});
+                    const addr = header.?.get_cell_addr(buffer.?, cell_count);
+                    debug("cell address: {x}", .{addr});
+                    record = SQLiteRecord.from(buffer.?[addr..]);
+                    self.pc += 1;
+                },
+                .rewind => {
+                    // TODO: escape when table is empty
+                    assert(record != null);
+                    col_value = record.?.next();
+                    if (col_value == null) {
+                        break;
+                    }
+                    col_count += 1;
+                    self.pc += 1;
+                },
+                .row_id => {
+                    assert(record != null);
+                    assert(col_value != null);
+                    const value = col_value.?;
+                    debug("row_id SQLiteColumn: {s}", .{@tagName(value)});
+                    try self.reg(instruction.p2, Register{ .int = @intCast(record.?.row_id) });
+                    col_value = record.?.next();
+                    col_count += 1;
+                    self.pc += 1;
+                },
+                .column => {
+                    assert(record != null);
+                    const col = instruction.p2;
+                    if (col_count < col) {
+                        while (col_count < col) : (col_count += 1) {
+                            record.?.consume();
+                        }
+                        col_value = record.?.next();
+                        col_count += 1;
+                    }
+                    assert(col_value != null);
+                    try self.reg(instruction.p3, Register.from_column(col_value.?));
+                    col_value = record.?.next();
+                    debug("col_value: {?}", .{col_value});
+                    col_count += 1;
+                    self.pc += 1;
+                },
+                .result_row => {
+                    const start_reg = instruction.p1;
+                    const end_reg = instruction.p2;
+
+                    // TODO: callback method to handle these regs or smth. Right now we will simply log them to console
+                    var i = start_reg;
+                    var write_buf: [256]u8 = undefined;
+                    var write_count: u8 = 0;
+                    while (i < end_reg) : (i += 1) {
+                        const written = self.reg_list.items[i - 1].to_str(@constCast(write_buf[write_count..])) catch write_buf[write_count..];
+                        const written_len: u8 = @intCast(written.len);
+                        write_count += written_len;
+                        if (i != end_reg - 1) {
+                            write_buf[write_count] = '|';
+                            write_count += 1;
+                        }
+                    }
+                    print(write_buf[0..write_count].ptr, write_buf[0..write_count].len);
+                    self.pc += 1;
+                },
+                .next => {
+                    debug("col_value: {?}", .{col_value});
+                    if (cell_count >= cell_size - 1) {
+                        self.pc += 1;
+                    } else {
+                        cell_count += 1;
+
+                        const addr = header.?.get_cell_addr(buffer.?, cell_count);
+                        debug("cell address: {x}", .{addr});
+                        record = SQLiteRecord.from(buffer.?[addr..]);
+                        col_value = record.?.next();
+
+                        const inst_addr = instruction.p2;
+                        self.pc = inst_addr;
+                    }
+                },
+                .halt => break,
+                .transaction => {
+                    // TODO: support transactions, attached databases, writing
+                    self.pc += 1;
+                },
+                .goto => {
+                    self.pc = instruction.p2;
+                },
+                // else => debug("instruction not implemented: {}", .{instruction.opcode}),
+            }
         }
     }
 };
@@ -1197,9 +1489,10 @@ const String = struct {
     }
 };
 
-const TokenList = MultiArrayList(MinimizedToken);
 var string_bytes: ArrayListUnmanaged(u8) = .{};
+const TokenList = MultiArrayList(MinimizedToken);
 const ElementList = MultiArrayList(Element);
+const InstList = MultiArrayList(Inst);
 
 fn parseStatement(str: [:0]u8, file_buffer: []u8) Error!void {
     var tokenizer = Tokenizer.from(str, 0);
@@ -1211,19 +1504,29 @@ fn parseStatement(str: [:0]u8, file_buffer: []u8) Error!void {
     var data = ElementList{};
     defer data.deinit(fixed_alloc.allocator());
 
+    var insts = InstList{};
+    defer insts.deinit(fixed_alloc.allocator());
+
     try tokenizer.ingest(fixed_alloc.allocator(), &tokens);
 
+    const db = try Db.from(file_buffer);
+
     // ASTGen can allocate more tokens, so we pass the struct instead of the underlying buffer
-    var ast = try ASTGen.from(fixed_alloc.allocator(), &tokens, &data, str, file_buffer);
-    try ast.buildStatement();
+    var ast = try ASTGen.from(fixed_alloc.allocator(), &tokens, &data, str, db);
+    const statement = try ast.buildStatement();
+
+    var inst_gen = try InstGen.from(fixed_alloc.allocator(), &data, &insts, db, Stmt{ .select = statement });
 
     // TODO: ast built, now translate into instructions for VM.
-    ast.buildInstructions();
+    try inst_gen.buildInstructions();
+
+    var vm = Vm.from(fixed_alloc.allocator(), db, inst_gen.inst_list.slice());
+    try vm.exec();
 }
 
 export fn parse_buffer(ptr: ?*u8, size: usize) void {
     if (ptr == null) {
-        print(err_string, err_string.len);
+        debug("uh oh no pointer", .{});
         return;
     }
     const buffer: [*]u8 = @as([*]u8, @ptrCast(ptr));
@@ -1237,43 +1540,6 @@ export fn parse_buffer(ptr: ?*u8, size: usize) void {
         }
         return;
     };
-
-    // TODO: remove code below
-    if (true) {
-        return;
-    }
-    if (slice.len < @sizeOf(SQLiteDbHeader)) {
-        print(err_string, err_string.len);
-        return;
-    }
-    // make sure not to overwrite the first 100 bytes in the buffer.. otherwise header goes away :(
-    const header_size = @sizeOf(SQLiteDbHeader);
-    const bt_header_size = @sizeOf(SQLiteBtHeader);
-    debug("bt_header_size: {d}", .{bt_header_size});
-    const header: *SQLiteDbHeader = @alignCast(@ptrCast(slice[0..header_size]));
-    print(&(header.header_string), header.header_string.len);
-    const page_size = header.get_page_size();
-    debug("page_size: {d}", .{page_size});
-    readBuffer(buffer, 0, page_size); // the first page contains the buffer (first 100 bytes), so we have a 0 offset to allocate the first page
-    const new_slice = buffer[0..page_size]; // first page
-    const bt_header: *SQLiteBtHeader = @alignCast(@ptrCast(new_slice[header_size .. header_size + bt_header_size]));
-    const cell_count = bt_header.get_cell_count();
-    debug("cell_count: {d}", .{cell_count});
-    debug("page_type: {d}", .{bt_header.get_page_type()});
-    debug("free_block: {d}", .{bt_header.get_first_freeblock()});
-    debug("sqlite version num: {d}", .{header.get_version()});
-
-    // now read the first cell pointer (2 byte offset)
-    const cell_ptr: *u16 = @alignCast(@ptrCast(new_slice[header_size + bt_header_size - 4 .. header_size + bt_header_size - 2]));
-    const cell_adr: u16 = @byteSwap(cell_ptr.*);
-    debug("first cell: {d}", .{cell_adr});
-
-    // now read the first cell
-    const cell_start = new_slice[cell_adr..];
-    var cell_header_size: u64 = undefined;
-    var size_so_far: u32 = 0;
-    size_so_far += get_varint(cell_start.ptr, &cell_header_size);
-    debug("cell header size: {d}", .{cell_header_size});
 }
 
 // export fn free(ptr: *u8) void {
