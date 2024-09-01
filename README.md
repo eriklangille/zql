@@ -3,16 +3,17 @@
 SQLite File Reader natively built for use in the browser. Maybe this will be something more one day..
 
 ## How to build
+
 Make sure to add more `--export`s to include the functions you want to export to the web assembly module.
 
 ```bash
-zig build-exe zql.zig -target wasm32-freestanding -fno-entry --export=add --export=malloc --export=parse_buffer
+zig build-exe zql.zig -target wasm32-freestanding -fno-entry  --export=runStatementWithFile --export=getStatementAddr --export=malloc
 ```
 
 One can also use the [build mode](https://ziglang.org/documentation/master/#Build-Mode) to build a release version of the program.
 
 ```bash
-zig build-exe zql.zig -target wasm32-freestanding -O ReleaseSmall -fno-entry --export=add --export=parse_buffer
+zig build-exe zql.zig -target wasm32-freestanding -O ReleaseSmall  -fno-entry  --export=runStatementWithFile --export=getStatementAddr --export=malloc
 ```
 
 and then run a web server

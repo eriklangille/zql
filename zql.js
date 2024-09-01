@@ -5,6 +5,7 @@
 
 const BUFFER_SIZE = 1024 * 64; // 64 KiB
 const SQLITE_HEADER_SIZE = 100;
+const MAX_STATEMENT_LEN = 512;
 let instance = null;
 let fileReader = null;
 
@@ -47,13 +48,24 @@ async function listenForFile() {
 
 async function handle(instance) {
   console.log('WASM Loaded, instance:', instance);
-  const { malloc, parse_buffer } = instance.exports;
+  const { malloc, runStatementWithFile, getStatementAddr } = instance.exports;
   const dbFileReader = await listenForFile();
   const dbFile = new Uint8Array(dbFileReader.result);
-  const readBuffer = malloc(BUFFER_SIZE)
+  const sqlStatement = document.getElementById('statementInput').value;
+  console.log(`statementInput: ${sqlStatement}`);
+  const readBuffer = malloc(BUFFER_SIZE);
+
+  const encoder = new TextEncoder();
+  const sqlArray = encoder.encode(sqlStatement);
+  const sqlArrayTerminator = new Uint8Array(sqlArray.length + 1);
+  sqlArrayTerminator.set(sqlArray);
+  sqlArrayTerminator[sqlArray.length] = 0;
+  const sqlAddress = getStatementAddr();
+
   const memory = new Uint8Array(instance.exports.memory.buffer);
   memory.set(dbFile.slice(0, SQLITE_HEADER_SIZE), readBuffer);
-  parse_buffer(readBuffer, SQLITE_HEADER_SIZE);
+  memory.set(sqlArrayTerminator.slice(0, MAX_STATEMENT_LEN), sqlAddress);
+  runStatementWithFile(readBuffer, SQLITE_HEADER_SIZE);
 }
 
 function main() {

@@ -144,7 +144,7 @@ const select_str = "SELECT * FROM example;";
 const one_kb = 1024;
 const query_buffer_size = 512;
 const memory_buffery_size = 32 * one_kb;
-var query_buf: [query_buffer_size]u8 = undefined;
+var query_buf: [query_buffer_size:0]u8 = undefined;
 var memory_buf: [memory_buffery_size]u8 = undefined;
 
 comptime {
@@ -1524,7 +1524,7 @@ fn parseStatement(str: [:0]u8, file_buffer: []u8) Error!void {
     try vm.exec();
 }
 
-export fn parse_buffer(ptr: ?*u8, size: usize) void {
+export fn runStatementWithFile(ptr: ?*u8, size: usize) void {
     if (ptr == null) {
         debug("uh oh no pointer", .{});
         return;
@@ -1532,7 +1532,7 @@ export fn parse_buffer(ptr: ?*u8, size: usize) void {
     const buffer: [*]u8 = @as([*]u8, @ptrCast(ptr));
     const slice = buffer[0..size];
 
-    parseStatement(@constCast(select_str), slice) catch |err| {
+    parseStatement(&query_buf, slice) catch |err| {
         switch (err) {
             Error.InvalidBinary => debug("uh oh stinky binary file", .{}),
             Error.InvalidSyntax => debug("uh oh stinky SQL syntax", .{}),
@@ -1542,7 +1542,11 @@ export fn parse_buffer(ptr: ?*u8, size: usize) void {
     };
 }
 
+export fn getStatementAddr() [*]u8 {
+    return &query_buf;
+}
+
 // export fn free(ptr: *u8) void {
-//     const page_allocator = std.heap.page_allocator;
+//     const page_allocator = heap.page_allocator;
 //     page_allocator.free(@as([*]u8, @ptrCast(ptr)));
 // }
