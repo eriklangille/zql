@@ -51,7 +51,8 @@ async function handle(instance) {
   const { malloc, runStatementWithFile, getStatementAddr } = instance.exports;
   const dbFileReader = await listenForFile();
   const dbFile = new Uint8Array(dbFileReader.result);
-  const sqlStatement = document.getElementById('statementInput').value;
+  const inputSqlStatement = document.getElementById('statementInput');
+  const sqlStatement = inputSqlStatement.value;
   console.log(`statementInput: ${sqlStatement}`);
   const readBuffer = malloc(BUFFER_SIZE);
 

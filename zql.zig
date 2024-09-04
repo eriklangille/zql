@@ -139,8 +139,6 @@ const slot_4_2_0 = (0x7f << 28) | slot_2_0;
 // max 64 bit value
 const max_64_bit = 0xFFFFFFFF_FFFFFFFF;
 
-const select_str = "SELECT * FROM example;";
-
 const one_kb = 1024;
 const query_buffer_size = 512;
 const memory_buffery_size = 32 * one_kb;
@@ -335,7 +333,7 @@ const Tokenizer = struct {
         if (token.type.lexeme()) |word| {
             print(word.ptr, word.len);
         } else {
-            print(self.buffer[token.location.start..token.location.end].ptr, token.location.end - token.location.start);
+            debug("[{d}]: {s}", .{ token.location.start, self.buffer[token.location.start..token.location.end] });
         }
     }
 
@@ -423,7 +421,7 @@ const Expr = struct {
 };
 
 const SelectStmt = struct {
-    columns: u64, // Each bit represents one column in the table
+    columns: u64, // Each bit represents one column in the table TODO: support tables with more than 64 columns
     table: TableStmt,
     where: Expr,
 };
@@ -457,6 +455,20 @@ const TableStmt = struct {
     // primary key is always in the first column of the table
     pub fn getPrimaryKey(self: *TableStmt) u32 {
         return self.first_column;
+    }
+
+    // TODO: benchmark to see if a hash table or getting the slices of the element list will speed this up
+    pub fn getColumnIndex(self: *const TableStmt, list: *ElementList, name: []const u8) ?u32 {
+        var index: u32 = self.first_column;
+        var col_count: u32 = 0;
+        while (index < list.len) : (col_count += 1) {
+            const col = list.get(index);
+            if (eql(u8, name, col.value.str.str())) {
+                return col_count;
+            }
+            index = col.data.lhs;
+        }
+        return null;
     }
 
     pub fn from(elem: Element) TableStmt {
@@ -811,7 +823,8 @@ const ASTGen = struct {
         create,
         end,
         from,
-        select,
+        select_first,
+        select_second,
         select_column,
         start,
         table,
@@ -845,7 +858,14 @@ const ASTGen = struct {
         }
         var tokenizer = Tokenizer.from(buffer, min_token.start);
         const token = tokenizer.next();
+        debug("min token start, str: {d}, {s}. {s}", .{ token.location.start, buffer[token.location.start..token.location.end], buffer });
         return buffer[token.location.start..token.location.end];
+    }
+
+    fn getTokenEnd(buffer: [:0]const u8, min_token: MinimizedToken) u32 {
+        var tokenizer = Tokenizer.from(buffer, min_token.start);
+        const token = tokenizer.next();
+        return token.location.end;
     }
 
     fn addElement(self: *ASTGen, elem: Element) Allocator.Error!u32 {
@@ -892,8 +912,8 @@ const ASTGen = struct {
         // Right now we only support from the DB file, which requires tokenizing the SQL from the DB file
         // We can also use the function call to push/pop index from stack instead of using an internal index
         var index = self.token_list.len;
-        const sql_str = sqlite_table.sql.strSentinel();
-        var tokenizer = Tokenizer.from(sql_str, 0);
+        const sql_str = sqlite_table.sql;
+        var tokenizer = Tokenizer.from(sql_str.strSentinel(), 0);
         try tokenizer.ingest(self.gpa, self.token_list);
 
         var state: State = .create;
@@ -927,9 +947,10 @@ const ASTGen = struct {
                 .table_name => {
                     switch (token.tag) {
                         .word => {
-                            const table_name = ASTGen.getTokenSource(sql_str, token);
+                            const token_end = ASTGen.getTokenEnd(sql_str.strSentinel(), token);
+                            const table_name = try String.initFromSubstring(self.gpa, sql_str, token.start, token_end);
                             table_index = try self.addElement(.{
-                                .value = .{ .str = try String.init(self.gpa, table_name) },
+                                .value = .{ .str = table_name },
                                 .tag = ElementType.table,
                                 .data = undefined,
                             });
@@ -955,7 +976,8 @@ const ASTGen = struct {
                 .table_col_name => {
                     switch (token.tag) {
                         .word => {
-                            name = try String.init(self.gpa, ASTGen.getTokenSource(sql_str, token));
+                            const token_end = ASTGen.getTokenEnd(sql_str.strSentinel(), token);
+                            name = try String.initFromSubstring(self.gpa, sql_str, token.start, token_end);
                             col_count += 1;
                             state = .table_col_type;
                         },
@@ -1026,19 +1048,54 @@ const ASTGen = struct {
     }
 
     fn buildSelectStatement(self: *ASTGen) Error!SelectStmt {
-        var state: State = .select;
+        var state: State = .select_first;
         var columns: u64 = 0;
         var table: ?TableStmt = null;
+        var column_list_index: u32 = maxInt(u32);
+        var processed_columns: bool = false;
         while (self.index < self.token_list.len) : (self.index += 1) {
             const token = self.token_list.get(self.index);
             switch (state) {
-                .select => {
+                .select_first => {
                     switch (token.tag) {
                         .asterisk => {
                             // All columns
                             columns = max_64_bit;
+                            processed_columns = true;
                         },
                         .keyword_from => {
+                            state = .from;
+                        },
+                        .word => {
+                            if (column_list_index == maxInt(u32)) {
+                                column_list_index = self.index;
+                            }
+                        },
+                        .comma => {},
+                        else => {
+                            break;
+                        },
+                    }
+                },
+                .select_second => {
+                    switch (token.tag) {
+                        .word => {
+                            const col_name = ASTGen.getTokenSource(self.source, token);
+                            if (table) |tbl| {
+                                const is_col_index: ?u32 = tbl.getColumnIndex(self.element_list, col_name);
+                                if (is_col_index) |col_index| {
+                                    columns |= (@as(u64, 1) << @truncate(col_index));
+                                } else {
+                                    debug("Could not find column: {s}", .{col_name});
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        },
+                        .comma => {},
+                        .keyword_from => {
+                            processed_columns = true;
                             state = .from;
                         },
                         else => {
@@ -1049,15 +1106,22 @@ const ASTGen = struct {
                 .from => {
                     switch (token.tag) {
                         .word => {
-                            const table_name = ASTGen.getTokenSource(self.source, token);
-                            // TODO: return the table sql string if not allocated. If it is allocated, then it should return
-                            // the table. I think the allocated tables should be a different struct
-                            const sqlite_table = try self.db.getTable(self.gpa, table_name);
-                            const table_data_index = try self.buildCreateTable(sqlite_table);
-                            table = TableStmt.from(self.getElement(table_data_index));
+                            if (table == null) {
+                                const table_name = ASTGen.getTokenSource(self.source, token);
+                                // TODO: return the table sql string if not allocated. If it is allocated, then it should return
+                                // the table. I think the allocated tables should be a different struct
+                                const sqlite_table = try self.db.getTable(self.gpa, table_name);
+                                const table_data_index = try self.buildCreateTable(sqlite_table);
+                                table = TableStmt.from(self.getElement(table_data_index));
+                            }
                         },
                         .semicolon => {
-                            state = .end;
+                            if (processed_columns) {
+                                state = .end;
+                            } else {
+                                state = .select_second;
+                                self.index = column_list_index - 1;
+                            }
                         },
                         else => {
                             break;
@@ -1096,14 +1160,14 @@ const ASTGen = struct {
                 .start => {
                     switch (token.tag) {
                         .keyword_select => {
-                            state = .select;
+                            state = .select_first;
                         },
                         else => {
                             break;
                         },
                     }
                 },
-                .select => {
+                .select_first => {
                     const select = try self.buildSelectStatement();
                     debug("built statement: select({d}, {d})", .{ select.columns, select.table.page });
                     return select;
@@ -1284,7 +1348,7 @@ const InstGen = struct {
                     }
                     col_count += 1;
                 }
-                debug("columns", .{});
+                debug("columns: {b}", .{select.columns});
 
                 debug("output count: {d}", .{output_count});
                 try self.resultRow(1, output_count + 1);
@@ -1415,6 +1479,7 @@ const Vm = struct {
                     while (i < end_reg) : (i += 1) {
                         const written = self.reg_list.items[i - 1].to_str(@constCast(write_buf[write_count..])) catch write_buf[write_count..];
                         const written_len: u8 = @intCast(written.len);
+                        debug("written len: {d}", .{written_len});
                         write_count += written_len;
                         if (i != end_reg - 1) {
                             write_buf[write_count] = '|';
@@ -1467,7 +1532,6 @@ const String = struct {
 
     pub fn strSentinel(self: *const Self) [:0]const u8 {
         assert(hasSentinel(self, 0));
-        debug("index: {d}, str len: {d}, bytes len: {d}", .{ self.index, self.len, string_bytes.items.len });
         return string_bytes.items[self.index .. self.index + self.len - 1 :0];
     }
 
@@ -1475,10 +1539,25 @@ const String = struct {
         return string_bytes.items[self.index + self.len - 1] == sentinel;
     }
 
+    pub fn initAssumeCapacity(chars: []const u8) Self {
+        const len: u32 = @intCast(string_bytes.items.len);
+        string_bytes.appendSliceAssumeCapacity(chars);
+        return Self{ .index = len, .len = chars.len };
+    }
+
+    pub fn ensureExtraCapacity(alloc: Allocator, additional_count: u32) !void {
+        try string_bytes.ensureUnusedCapacity(alloc, additional_count);
+    }
+
     pub fn init(alloc: Allocator, chars: []const u8) !Self {
         const len: u32 = @intCast(string_bytes.items.len);
         try string_bytes.appendSlice(alloc, chars);
         return Self{ .index = len, .len = chars.len };
+    }
+
+    pub fn initFromSubstring(alloc: Allocator, str_str: Self, start_index: u32, end_index: u32) !Self {
+        try String.ensureExtraCapacity(alloc, end_index - start_index);
+        return String.initAssumeCapacity(str_str.str()[start_index..end_index]);
     }
 
     pub fn initAddSentinel(alloc: Allocator, chars: []const u8, comptime sentinel: u8) !Self {
@@ -1514,8 +1593,10 @@ fn parseStatement(str: [:0]u8, file_buffer: []u8) Error!void {
     // ASTGen can allocate more tokens, so we pass the struct instead of the underlying buffer
     var ast = try ASTGen.from(fixed_alloc.allocator(), &tokens, &data, str, db);
     const statement = try ast.buildStatement();
+    debug("statement built!", .{});
 
     var inst_gen = try InstGen.from(fixed_alloc.allocator(), &data, &insts, db, Stmt{ .select = statement });
+    debug("inst generated!", .{});
 
     // TODO: ast built, now translate into instructions for VM.
     try inst_gen.buildInstructions();
