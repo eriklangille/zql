@@ -948,7 +948,7 @@ const ASTGen = struct {
                     switch (token.tag) {
                         .word => {
                             const token_end = ASTGen.getTokenEnd(sql_str.strSentinel(), token);
-                            const table_name = try String.initFromSubstring(self.gpa, sql_str, token.start, token_end);
+                            const table_name = try sql_str.copySubstring(self.gpa, token.start, token_end);
                             table_index = try self.addElement(.{
                                 .value = .{ .str = table_name },
                                 .tag = ElementType.table,
@@ -977,7 +977,7 @@ const ASTGen = struct {
                     switch (token.tag) {
                         .word => {
                             const token_end = ASTGen.getTokenEnd(sql_str.strSentinel(), token);
-                            name = try String.initFromSubstring(self.gpa, sql_str, token.start, token_end);
+                            name = try sql_str.copySubstring(self.gpa, token.start, token_end);
                             col_count += 1;
                             state = .table_col_type;
                         },
@@ -1555,9 +1555,9 @@ const String = struct {
         return Self{ .index = len, .len = chars.len };
     }
 
-    pub fn initFromSubstring(alloc: Allocator, str_str: Self, start_index: u32, end_index: u32) !Self {
+    pub fn copySubstring(self: *const Self, alloc: Allocator, start_index: u32, end_index: u32) !Self {
         try String.ensureExtraCapacity(alloc, end_index - start_index);
-        return String.initAssumeCapacity(str_str.str()[start_index..end_index]);
+        return String.initAssumeCapacity(self.str()[start_index..end_index]);
     }
 
     pub fn initAddSentinel(alloc: Allocator, chars: []const u8, comptime sentinel: u8) !Self {
