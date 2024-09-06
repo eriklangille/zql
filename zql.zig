@@ -225,6 +225,8 @@ const TokenType = enum {
     eq,
     ne,
     comma,
+    integer,
+    float,
     single_quote_word,
     double_quote_word,
     word,
@@ -245,7 +247,9 @@ const TokenType = enum {
         return switch (token_type) {
             .asterisk => "*",
             .comma => ",",
+            .eq => "=",
             .lparen => "(",
+            .ne => "!=",
             .rparen => ")",
             .semicolon => ";",
             .keyword_and => "AND",
@@ -298,10 +302,11 @@ const Tokenizer = struct {
 
     const State = enum {
         asterisk,
-        semicolon,
         double_quote_word,
-        int,
+        float,
         identifier,
+        int,
+        semicolon,
         single_quote_word,
         start,
     };
@@ -354,8 +359,14 @@ const Tokenizer = struct {
                     'a'...'z', 'A'...'Z' => {
                         state = .identifier;
                     },
+                    '0'...'9' => {
+                        state = .int;
+                    },
                     ' ', '\n' => {
                         token.location.start = self.index + 1;
+                    },
+                    '"' => {
+                        state = .double_quote_word;
                     },
                     ';' => {
                         token.type = .semicolon;
@@ -400,6 +411,33 @@ const Tokenizer = struct {
                         break;
                     },
                 },
+                .int => switch (c) {
+                    '0'...'9' => {},
+                    '.' => {
+                        state = .float;
+                    },
+                    else => {
+                        token.type = TokenType.integer;
+                        break;
+                    },
+                },
+                .double_quote_word => switch (c) {
+                    'a'...'z', 'A'...'Z' => {},
+                    '"' => {
+                        token.type = TokenType.double_quote_word;
+                        break;
+                    },
+                    else => {
+                        token.type = TokenType.invalid;
+                    },
+                },
+                .float => switch (c) {
+                    '0'...'9' => {},
+                    else => {
+                        token.type = TokenType.float;
+                        break;
+                    },
+                },
                 else => {
                     break;
                 },
@@ -416,17 +454,27 @@ const Tokenizer = struct {
 };
 
 const Expr = struct {
-    // TODO: Expr uses Element struct, value is val, tag is type of comparison, and data lhs rhs are the right and left linked
-    // list expressions
+    // Expr uses Element struct, value is val, tag is type of comparison, and data lhs rhs is the left right linked
+    // expressions for and or. Literal comparison has the column id in the lhs
+    index: u32,
 };
 
 const SelectStmt = struct {
     columns: u64, // Each bit represents one column in the table TODO: support tables with more than 64 columns
     table: TableStmt,
-    where: Expr,
+    where: ?Expr,
 };
 
 const ElementType = enum {
+    compare_and,
+    compare_eq_float,
+    compare_eq_int,
+    compare_eq_str,
+    compare_ne_float,
+    compare_ne_int,
+    compare_ne_str,
+    compare_or,
+    expr_group,
     integer,
     table,
     text,
@@ -833,6 +881,8 @@ const ASTGen = struct {
         table_col_type,
         table_name,
         table_next,
+        where,
+        where_comparison,
     };
 
     pub fn from(
@@ -876,6 +926,10 @@ const ASTGen = struct {
 
     fn getElement(self: *ASTGen, index: u32) Element {
         return self.element_list.get(index);
+    }
+
+    fn getElementData(self: *ASTGen, index: u32) Data {
+        return self.element_list.items(.data)[index];
     }
 
     fn replaceDataAtIndex(self: *ASTGen, index: u32, data: Data) void {
@@ -1053,6 +1107,7 @@ const ASTGen = struct {
         var table: ?TableStmt = null;
         var column_list_index: u32 = maxInt(u32);
         var processed_columns: bool = false;
+        var where: ?Expr = null;
         while (self.index < self.token_list.len) : (self.index += 1) {
             const token = self.token_list.get(self.index);
             switch (state) {
@@ -1128,6 +1183,9 @@ const ASTGen = struct {
                         },
                     }
                 },
+                .where => {
+                    where = try self.buildWhereClause(table.?);
+                },
                 .end => {
                     debug("AST built", .{});
                     break;
@@ -1146,8 +1204,54 @@ const ASTGen = struct {
         return SelectStmt{
             .columns = columns,
             .table = table.?,
-            .where = undefined,
+            .where = where,
         };
+    }
+
+    pub fn buildWhereClause(self: *ASTGen, table: TableStmt) Error!?Expr {
+        // var state: State = .where;
+        var equality: ?TokenType = null;
+        var col_index: ?u32 = null;
+        var expr_index: ?u32 = null;
+        var expr_first_index: ?u32 = null;
+        while (self.index < self.token_list.len) : (self.index += 1) {
+            const token = self.token_list.get(self.index);
+            // TODO: add states
+            switch (token.tag) {
+                .word => {
+                    const column_name = ASTGen.getTokenSource(self.source, token);
+                    col_index = table.getColumnIndex(self.element_list, column_name);
+                },
+                .eq, .ne => {
+                    equality = token.tag;
+                },
+                .double_quote_word => {
+                    if (equality == null or col_index == null) {
+                        return Error.InvalidSyntax;
+                    }
+                    const string_literal = ASTGen.getTokenSource(self.source, token);
+                    const value = try String.init(self.gpa, string_literal[1..]);
+                    const last_expr = expr_index;
+                    expr_index = try self.addElement(.{
+                        .value = .{ .str = value },
+                        .tag = switch (equality.?) {
+                            .eq => ElementType.compare_eq_str,
+                            .ne => ElementType.compare_ne_str,
+                            else => return Error.InvalidSyntax,
+                        },
+                        .data = .{ .lhs = col_index.?, .rhs = 0 },
+                    });
+                    if (last_expr) |expr| {
+                        const data = self.getElementData(expr);
+                        self.replaceDataAtIndex(expr, .{ .lhs = data.lhs, .rhs = expr_index.? });
+                    } else {
+                        expr_first_index = expr_index;
+                    }
+                },
+                else => break,
+            }
+        }
+        return null;
     }
 
     pub fn buildStatement(self: *ASTGen) Error!SelectStmt {
