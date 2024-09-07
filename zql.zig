@@ -882,7 +882,10 @@ const ASTGen = struct {
         table_name,
         table_next,
         where,
-        where_comparison,
+        where_andor,
+        where_equality,
+        where_lhs,
+        where_rhs,
     };
 
     pub fn from(
@@ -1209,49 +1212,80 @@ const ASTGen = struct {
     }
 
     pub fn buildWhereClause(self: *ASTGen, table: TableStmt) Error!?Expr {
-        // var state: State = .where;
+        var state: State = .where_lhs;
         var equality: ?TokenType = null;
         var col_index: ?u32 = null;
         var expr_index: ?u32 = null;
+        var last_element_andor = false;
         var expr_first_index: ?u32 = null;
         while (self.index < self.token_list.len) : (self.index += 1) {
             const token = self.token_list.get(self.index);
-            // TODO: add states
-            switch (token.tag) {
-                .word => {
-                    const column_name = ASTGen.getTokenSource(self.source, token);
-                    col_index = table.getColumnIndex(self.element_list, column_name);
+            switch (state) {
+                .where => {
+                    state = .where_lhs;
                 },
-                .eq, .ne => {
-                    equality = token.tag;
+                .where_lhs => switch (token.tag) {
+                    .word => {
+                        const column_name = ASTGen.getTokenSource(self.source, token);
+                        col_index = table.getColumnIndex(self.element_list, column_name);
+                        state = .where_equality;
+                    },
+                    .keyword_and, .keyword_or => {
+                        const replace_first_expr = expr_first_index == expr_index;
+                        expr_index = try self.addElement(.{
+                            .value = undefined,
+                            .tag = switch (token.tag) {
+                                .keyword_and => ElementType.compare_and,
+                                .keyword_or => ElementType.compare_or,
+                                else => break,
+                            },
+                            .data = .{ .lhs = expr_index.?, .rhs = 0 },
+                        });
+                        last_element_andor = true;
+                        if (replace_first_expr) {
+                            expr_first_index = expr_index;
+                        }
+                    },
+                    else => break,
                 },
-                .double_quote_word => {
-                    if (equality == null or col_index == null) {
-                        return Error.InvalidSyntax;
-                    }
-                    const string_literal = ASTGen.getTokenSource(self.source, token);
-                    const value = try String.init(self.gpa, string_literal[1..]);
-                    const last_expr = expr_index;
-                    expr_index = try self.addElement(.{
-                        .value = .{ .str = value },
-                        .tag = switch (equality.?) {
-                            .eq => ElementType.compare_eq_str,
-                            .ne => ElementType.compare_ne_str,
-                            else => return Error.InvalidSyntax,
-                        },
-                        .data = .{ .lhs = col_index.?, .rhs = 0 },
-                    });
-                    if (last_expr) |expr| {
-                        const data = self.getElementData(expr);
-                        self.replaceDataAtIndex(expr, .{ .lhs = data.lhs, .rhs = expr_index.? });
-                    } else {
-                        expr_first_index = expr_index;
-                    }
+                .where_equality => switch (token.tag) {
+                    .eq, .ne => {
+                        equality = token.tag;
+                        state = .where_rhs;
+                    },
+                    else => break,
+                },
+                .where_rhs => switch (token.tag) {
+                    .double_quote_word => {
+                        if (equality == null or col_index == null) {
+                            return Error.InvalidSyntax;
+                        }
+                        const string_literal = ASTGen.getTokenSource(self.source, token);
+                        const value = try String.init(self.gpa, string_literal[1 .. string_literal.len - 1]);
+                        const last_expr = expr_index;
+                        expr_index = try self.addElement(.{
+                            .value = .{ .str = value },
+                            .tag = switch (equality.?) {
+                                .eq => ElementType.compare_eq_str,
+                                .ne => ElementType.compare_ne_str,
+                                else => return Error.InvalidSyntax,
+                            },
+                            .data = .{ .lhs = col_index.?, .rhs = 0 },
+                        });
+                        last_element_andor = false;
+                        if (last_expr) |expr| {
+                            const data = self.getElementData(expr);
+                            self.replaceDataAtIndex(expr, .{ .lhs = data.lhs, .rhs = expr_index.? });
+                        } else {
+                            expr_first_index = expr_index;
+                        }
+                    },
+                    else => break,
                 },
                 else => break,
             }
         }
-        return null;
+        return Error.InvalidSyntax;
     }
 
     pub fn buildStatement(self: *ASTGen) Error!SelectStmt {
