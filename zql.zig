@@ -2,6 +2,8 @@ const heap = @import("std").heap;
 const MultiArrayList = @import("std").MultiArrayList;
 const assert = @import("std").debug.assert;
 const fmt = @import("std").fmt;
+const io = @import("std").io;
+const FixedBufferStream = @import("std").io.FixedBufferStream;
 const panic = @import("std").debug.panic;
 const StaticStringMap = @import("std").StaticStringMapWithEql;
 const eqlLenIgnoreCase = @import("std").static_string_map.eqlAsciiIgnoreCase;
@@ -457,6 +459,39 @@ const Expr = struct {
     // Expr uses Element struct, value is val, tag is type of comparison, and data lhs rhs is the left right linked
     // expressions for and or. Literal comparison has the column id in the lhs
     index: u32,
+
+    pub fn debug(self: *Expr, element_list: *ElementList) void {
+        const buf: [500]u8 = undefined;
+        var fbs = io.fixedBufferStream(@constCast(&buf));
+        _ = self.bufWrite(@constCast(&fbs), element_list, self.index) catch null;
+        const slice = fbs.getWritten();
+        print(slice.ptr, slice.len);
+    }
+
+    fn bufWrite(self: *Expr, buffer: *FixedBufferStream([]u8), element_list: *ElementList, index: u32) anyerror!void {
+        const item: Element = element_list.get(index);
+        switch (item.tag) {
+            .compare_and, .compare_or => {
+                switch (item.tag) {
+                    .compare_and => _ = try buffer.write("AND ("),
+                    .compare_or => _ = try buffer.write("OR ("),
+                    else => _ = try buffer.write("("),
+                }
+                try self.bufWrite(buffer, element_list, item.data.lhs);
+                _ = try buffer.write(", ");
+                try self.bufWrite(buffer, element_list, item.data.rhs);
+                _ = try buffer.write(")");
+            },
+            .compare_eq_int => {
+                try fmt.format(buffer.writer().any(), "(EQ COL_{d}, {d})", .{ item.data.lhs, item.value.int });
+            },
+            .compare_eq_str => {
+                try fmt.format(buffer.writer().any(), "(EQ COL_{d}, {s})", .{ item.data.lhs, item.value.str.str() });
+            },
+            .compare_ne_float, .compare_ne_int, .compare_ne_str => {}, // TODO: formatting for rest of expr types
+            else => {},
+        }
+    }
 };
 
 const SelectStmt = struct {
@@ -1188,6 +1223,7 @@ const ASTGen = struct {
                 },
                 .where => {
                     where = try self.buildWhereClause(table.?);
+                    where.?.debug(self.element_list);
                 },
                 .end => {
                     debug("AST built", .{});
@@ -1212,7 +1248,7 @@ const ASTGen = struct {
     }
 
     pub fn buildWhereClause(self: *ASTGen, table: TableStmt) Error!?Expr {
-        var state: State = .where_lhs;
+        var state: State = .where;
         var equality: ?TokenType = null;
         var col_index: ?u32 = null;
         var expr_index: ?u32 = null;
@@ -1231,6 +1267,9 @@ const ASTGen = struct {
                         state = .where_equality;
                     },
                     .keyword_and, .keyword_or => {
+                        if (last_element_andor or expr_index == null) {
+                            break;
+                        }
                         const replace_first_expr = expr_first_index == expr_index;
                         expr_index = try self.addElement(.{
                             .value = undefined,
@@ -1239,7 +1278,7 @@ const ASTGen = struct {
                                 .keyword_or => ElementType.compare_or,
                                 else => break,
                             },
-                            .data = .{ .lhs = expr_index.?, .rhs = 0 },
+                            .data = .{ .lhs = expr_index.?, .rhs = maxInt(u32) },
                         });
                         last_element_andor = true;
                         if (replace_first_expr) {
@@ -1255,32 +1294,49 @@ const ASTGen = struct {
                     },
                     else => break,
                 },
-                .where_rhs => switch (token.tag) {
-                    .double_quote_word => {
-                        if (equality == null or col_index == null) {
-                            return Error.InvalidSyntax;
-                        }
-                        const string_literal = ASTGen.getTokenSource(self.source, token);
-                        const value = try String.init(self.gpa, string_literal[1 .. string_literal.len - 1]);
-                        const last_expr = expr_index;
-                        expr_index = try self.addElement(.{
-                            .value = .{ .str = value },
-                            .tag = switch (equality.?) {
-                                .eq => ElementType.compare_eq_str,
-                                .ne => ElementType.compare_ne_str,
-                                else => return Error.InvalidSyntax,
-                            },
-                            .data = .{ .lhs = col_index.?, .rhs = 0 },
-                        });
-                        last_element_andor = false;
-                        if (last_expr) |expr| {
-                            const data = self.getElementData(expr);
-                            self.replaceDataAtIndex(expr, .{ .lhs = data.lhs, .rhs = expr_index.? });
-                        } else {
-                            expr_first_index = expr_index;
-                        }
-                    },
-                    else => break,
+                .where_rhs => {
+                    if (equality == null or col_index == null) {
+                        return Error.InvalidSyntax;
+                    }
+                    var last_expr: ?u32 = null;
+                    switch (token.tag) {
+                        .double_quote_word => {
+                            const string_literal = ASTGen.getTokenSource(self.source, token);
+                            const value = try String.init(self.gpa, string_literal[1 .. string_literal.len - 1]);
+                            last_expr = expr_index;
+                            expr_index = try self.addElement(.{
+                                .value = .{ .str = value },
+                                .tag = switch (equality.?) {
+                                    .eq => ElementType.compare_eq_str,
+                                    .ne => ElementType.compare_ne_str,
+                                    else => return Error.InvalidSyntax,
+                                },
+                                .data = .{ .lhs = col_index.?, .rhs = maxInt(u32) },
+                            });
+                        },
+                        .integer => {
+                            const slice = ASTGen.getTokenSource(self.source, token);
+                            const value = fmt.parseInt(i64, slice, 10) catch break;
+                            last_expr = expr_index;
+                            expr_index = try self.addElement(.{
+                                .value = .{ .int = value },
+                                .tag = switch (equality.?) {
+                                    .eq => ElementType.compare_eq_int,
+                                    .ne => ElementType.compare_ne_int,
+                                    else => return Error.InvalidSyntax,
+                                },
+                                .data = .{ .lhs = col_index.?, .rhs = maxInt(u32) },
+                            });
+                        },
+                        else => break,
+                    }
+                    last_element_andor = false;
+                    if (last_expr) |expr| {
+                        const data = self.getElementData(expr);
+                        self.replaceDataAtIndex(expr, .{ .lhs = data.lhs, .rhs = expr_index.? });
+                    } else {
+                        expr_first_index = expr_index;
+                    }
                 },
                 else => break,
             }
