@@ -481,9 +481,9 @@ const Expr = struct {
         switch (item.tag) {
             .compare_and, .compare_or => {
                 switch (item.tag) {
-                    .compare_and => _ = try buffer.write("AND ("),
-                    .compare_or => _ = try buffer.write("OR ("),
-                    else => _ = try buffer.write("("),
+                    .compare_and => _ = try buffer.write("(AND "),
+                    .compare_or => _ = try buffer.write("(OR "),
+                    else => _ = try buffer.write("( "),
                 }
                 try self.bufWrite(buffer, element_list, item.data.lhs);
                 _ = try buffer.write(", ");
@@ -955,7 +955,6 @@ const ASTGen = struct {
         }
         var tokenizer = Tokenizer.from(buffer, min_token.start);
         const token = tokenizer.next();
-        debug("min token start, str: {d}, {s}. {s}", .{ token.location.start, buffer[token.location.start..token.location.end], buffer });
         return buffer[token.location.start..token.location.end];
     }
 
@@ -1234,7 +1233,6 @@ const ASTGen = struct {
                 .from_after => {
                     switch (token.tag) {
                         .keyword_where => {
-                            debug("WHERE ARE THOU ROMEO?", .{});
                             where = try self.buildWhereClause(table.?);
                             where.?.dump(self.element_list);
                         },
@@ -1267,8 +1265,9 @@ const ASTGen = struct {
         var state: State = .where;
         var equality: ?TokenType = null;
         var col_index: ?u32 = null;
-        var expr_index: ?u32 = null;
         var last_element_andor = false;
+        var expr_index: ?u32 = null;
+        var expr_prev_index: ?u32 = null;
         var expr_first_index: ?u32 = null;
         while (self.index < self.token_list.len) : (self.index += 1) {
             const token = self.token_list.get(self.index);
@@ -1286,8 +1285,8 @@ const ASTGen = struct {
                         if (last_element_andor or expr_index == null) {
                             break;
                         }
-                        debug("and_or expression", .{});
                         const replace_first_expr = expr_first_index == expr_index;
+                        const expr_prev_temp_index = expr_index;
                         expr_index = try self.addElement(.{
                             .value = undefined,
                             .tag = switch (token.tag) {
@@ -1298,12 +1297,20 @@ const ASTGen = struct {
                             .data = .{ .lhs = expr_index.?, .rhs = maxInt(u32) },
                         });
                         last_element_andor = true;
+                        if (expr_prev_index) |expr| {
+                            const data = self.getElementData(expr);
+                            self.replaceDataAtIndex(expr, .{ .lhs = data.lhs, .rhs = expr_index.? });
+                        }
+                        expr_prev_index = expr_prev_temp_index;
                         if (replace_first_expr) {
                             expr_first_index = expr_index;
                         }
                     },
                     else => {
-                        if (expr_index) |index| {
+                        if (last_element_andor) {
+                            break;
+                        }
+                        if (expr_first_index) |index| {
                             return .{ .index = index };
                         }
                         break;
@@ -1340,7 +1347,7 @@ const ASTGen = struct {
                         .integer => {
                             const slice = ASTGen.getTokenSource(self.source, token);
                             const value = fmt.parseInt(i64, slice, 10) catch break;
-                            last_expr = expr_index;
+                            expr_prev_index = expr_index;
                             expr_index = try self.addElement(.{
                                 .value = .{ .int = value },
                                 .tag = switch (equality.?) {
@@ -1354,11 +1361,10 @@ const ASTGen = struct {
                         else => break,
                     }
                     last_element_andor = false;
-                    if (last_expr) |expr| {
+                    if (expr_prev_index) |expr| {
                         const data = self.getElementData(expr);
                         self.replaceDataAtIndex(expr, .{ .lhs = data.lhs, .rhs = expr_index.? });
                     } else {
-                        debug("first expression", .{});
                         expr_first_index = expr_index;
                     }
                     equality = null;
