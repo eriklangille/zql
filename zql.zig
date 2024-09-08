@@ -375,6 +375,11 @@ const Tokenizer = struct {
                         self.index += 1;
                         break;
                     },
+                    '=' => {
+                        token.type = .eq;
+                        self.index += 1;
+                        break;
+                    },
                     '*' => {
                         token.type = .asterisk;
                         self.index += 1;
@@ -460,7 +465,7 @@ const Expr = struct {
     // expressions for and or. Literal comparison has the column id in the lhs
     index: u32,
 
-    pub fn debug(self: *Expr, element_list: *ElementList) void {
+    pub fn dump(self: *Expr, element_list: *ElementList) void {
         const buf: [500]u8 = undefined;
         var fbs = io.fixedBufferStream(@constCast(&buf));
         _ = self.bufWrite(@constCast(&fbs), element_list, self.index) catch null;
@@ -469,6 +474,9 @@ const Expr = struct {
     }
 
     fn bufWrite(self: *Expr, buffer: *FixedBufferStream([]u8), element_list: *ElementList, index: u32) anyerror!void {
+        if (index == maxInt(u32)) {
+            _ = try buffer.write("NULL");
+        }
         const item: Element = element_list.get(index);
         switch (item.tag) {
             .compare_and, .compare_or => {
@@ -906,6 +914,7 @@ const ASTGen = struct {
         create,
         end,
         from,
+        from_after,
         select_first,
         select_second,
         select_column,
@@ -1206,6 +1215,7 @@ const ASTGen = struct {
                                 const sqlite_table = try self.db.getTable(self.gpa, table_name);
                                 const table_data_index = try self.buildCreateTable(sqlite_table);
                                 table = TableStmt.from(self.getElement(table_data_index));
+                                state = .from_after;
                             }
                         },
                         .semicolon => {
@@ -1221,9 +1231,15 @@ const ASTGen = struct {
                         },
                     }
                 },
-                .where => {
-                    where = try self.buildWhereClause(table.?);
-                    where.?.debug(self.element_list);
+                .from_after => {
+                    switch (token.tag) {
+                        .keyword_where => {
+                            debug("WHERE ARE THOU ROMEO?", .{});
+                            where = try self.buildWhereClause(table.?);
+                            where.?.dump(self.element_list);
+                        },
+                        else => break,
+                    }
                 },
                 .end => {
                     debug("AST built", .{});
@@ -1270,6 +1286,7 @@ const ASTGen = struct {
                         if (last_element_andor or expr_index == null) {
                             break;
                         }
+                        debug("and_or expression", .{});
                         const replace_first_expr = expr_first_index == expr_index;
                         expr_index = try self.addElement(.{
                             .value = undefined,
@@ -1285,7 +1302,12 @@ const ASTGen = struct {
                             expr_first_index = expr_index;
                         }
                     },
-                    else => break,
+                    else => {
+                        if (expr_index) |index| {
+                            return .{ .index = index };
+                        }
+                        break;
+                    },
                 },
                 .where_equality => switch (token.tag) {
                     .eq, .ne => {
@@ -1295,6 +1317,7 @@ const ASTGen = struct {
                     else => break,
                 },
                 .where_rhs => {
+                    debug("where rhs eq: {?}, col_index: {d}", .{ equality, col_index.? });
                     if (equality == null or col_index == null) {
                         return Error.InvalidSyntax;
                     }
@@ -1335,8 +1358,12 @@ const ASTGen = struct {
                         const data = self.getElementData(expr);
                         self.replaceDataAtIndex(expr, .{ .lhs = data.lhs, .rhs = expr_index.? });
                     } else {
+                        debug("first expression", .{});
                         expr_first_index = expr_index;
                     }
+                    equality = null;
+                    col_index = null;
+                    state = .where_lhs;
                 },
                 else => break,
             }
