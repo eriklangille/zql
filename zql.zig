@@ -541,11 +541,11 @@ const Data = struct {
 const TableStmt = struct {
     name: String,
     first_column: u32,
+    primary_column: u32,
     page: u32,
 
-    // primary key is always in the first column of the table
     pub fn getPrimaryKey(self: *TableStmt) u32 {
-        return self.first_column;
+        return self.primary_column;
     }
 
     // TODO: benchmark to see if a hash table or getting the slices of the element list will speed this up
@@ -562,9 +562,9 @@ const TableStmt = struct {
         return null;
     }
 
-    pub fn from(elem: Element) TableStmt {
+    pub fn from(elem: Element, primary: u32) TableStmt {
         assert(elem.tag == ElementType.table);
-        return .{ .name = elem.value.str, .first_column = elem.data.lhs, .page = elem.data.rhs };
+        return .{ .name = elem.value.str, .first_column = elem.data.lhs, .primary_column = primary, .page = elem.data.rhs };
     }
 };
 
@@ -1001,7 +1001,7 @@ const ASTGen = struct {
         return result;
     }
 
-    fn buildCreateTable(self: *ASTGen, sqlite_table: SQLiteDbTable) Error!u32 {
+    fn buildCreateTable(self: *ASTGen, sqlite_table: SQLiteDbTable) Error!TableStmt {
         const PrimaryKeyState = enum {
             unfilled,
             current,
@@ -1023,7 +1023,7 @@ const ASTGen = struct {
         var col_count: u32 = 0;
         var col_index: u32 = 0;
         var table_index: ?u32 = null;
-        var primary_key_index: ?u32 = null;
+        var primary_key_index: u32 = 0;
 
         // TODO: errdefer dealloc elements of partially allocated table
 
@@ -1052,20 +1052,8 @@ const ASTGen = struct {
                             table_index = try self.addElement(.{
                                 .value = .{ .str = table_name },
                                 .tag = ElementType.table,
-                                .data = undefined,
+                                .data = .{ .lhs = maxInt(u32), .rhs = sqlite_table.page },
                             });
-                            // TODO: it doesn't make sense to store primary key always in the first column, because if its in a different order
-                            // in the db then theres no way to map the column headers to the columns fields..
-                            // so we need to indicate primary key index as a separate metadata info thing
-                            // probably as a custom value in .rhs
-
-                            primary_key_index = try self.addElement(.{
-                                .value = undefined,
-                                .tag = undefined,
-                                .data = undefined,
-                            });
-                            col_index = primary_key_index.?;
-                            self.replaceDataAtIndex(table_index.?, .{ .lhs = col_index, .rhs = sqlite_table.page });
                         },
                         .lparen => {
                             state = .table_col_name;
@@ -1098,19 +1086,18 @@ const ASTGen = struct {
                     }
                     switch (token.tag) {
                         .comma, .rparen => {
+                            const rhs: u32 = if (primary_key == PrimaryKeyState.current) 1 else 0;
+                            const new_index = try self.addElement(.{
+                                .value = .{ .str = name.? },
+                                .tag = tag.?,
+                                .data = .{ .lhs = maxInt(u32), .rhs = rhs },
+                            });
+                            const data = self.getElementData(col_index);
+                            self.replaceDataAtIndex(col_index, .{ .lhs = new_index, .rhs = data.rhs });
+                            col_index = new_index;
                             if (primary_key == PrimaryKeyState.current) {
+                                primary_key_index = col_count - 1;
                                 primary_key = PrimaryKeyState.filled;
-                                self.replaceNameAtIndex(primary_key_index.?, name.?);
-                                debug("primary key tag: {}", .{tag.?});
-                                self.replaceTagAtIndex(primary_key_index.?, tag.?);
-                            } else {
-                                const new_index = try self.addElement(.{
-                                    .value = .{ .str = name.? },
-                                    .tag = tag.?,
-                                    .data = undefined,
-                                });
-                                self.replaceDataAtIndex(col_index, .{ .lhs = new_index, .rhs = 0 });
-                                col_index = new_index;
                             }
                             if (token.tag == TokenType.comma) {
                                 state = .table_col_name;
@@ -1137,8 +1124,7 @@ const ASTGen = struct {
                     }
                 },
                 .end => {
-                    self.replaceDataAtIndex(col_index, .{ .lhs = maxInt(u32), .rhs = 0 });
-                    return table_index.?;
+                    return TableStmt.from(self.element_list.get(table_index.?), primary_key_index);
                 },
                 else => unreachable,
             }
@@ -1212,8 +1198,7 @@ const ASTGen = struct {
                                 // TODO: return the table sql string if not allocated. If it is allocated, then it should return
                                 // the table. I think the allocated tables should be a different struct
                                 const sqlite_table = try self.db.getTable(self.gpa, table_name);
-                                const table_data_index = try self.buildCreateTable(sqlite_table);
-                                table = TableStmt.from(self.getElement(table_data_index));
+                                table = try self.buildCreateTable(sqlite_table);
                                 state = .from_after;
                             }
                         },
@@ -1272,6 +1257,7 @@ const ASTGen = struct {
         while (self.index < self.token_list.len) : (self.index += 1) {
             const token = self.token_list.get(self.index);
             switch (state) {
+                // TODO: support nested parenthesis
                 .where => {
                     state = .where_lhs;
                 },
@@ -1564,7 +1550,7 @@ const InstGen = struct {
                 while (reader.next()) |col| {
                     // TODO: support more than 64 columns
                     if (select.columns & (@as(u64, 0x1) << @truncate(col_count)) > 0) {
-                        if (col_count == 0 and col.tag == .integer) {
+                        if (col_count == select.table.primary_column and col.tag == .integer) {
                             // rowId reads for a integer primary key row. If this isn't explicitly noted as a primary key,
                             // then column instruction is used instead.
                             try self.rowId(cursor, output_count + 1);
