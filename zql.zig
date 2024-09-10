@@ -1394,6 +1394,28 @@ const ASTGen = struct {
     }
 };
 
+const Column = struct {
+    name: String,
+    tag: enum {
+        str,
+        integer,
+        float,
+    },
+    is_primary_key: bool,
+
+    pub fn from_element(element: Element) Column {
+        return .{
+            .name = element.value.str,
+            .tag = switch (element.tag) {
+                .text => .str,
+                .integer => .integer,
+                else => unreachable, // Only column types should be used
+            },
+            .is_primary_key = element.data.rhs == 1,
+        };
+    }
+};
+
 const TableMetadataReader = struct {
     element_list: *ElementList,
     index: u32,
@@ -1407,16 +1429,13 @@ const TableMetadataReader = struct {
         };
     }
 
-    pub fn next(self: *TableMetadataReader) ?Element {
-        if (self.index % 100 == 0) {
-            debug("next element: {d}, len: {d}", .{ self.index, self.element_list.len });
-        }
+    pub fn next(self: *TableMetadataReader) ?Column {
         if (self.index >= self.element_list.len or self.index == maxInt(u32)) {
             return null;
         }
         const element = self.element_list.get(self.index);
         self.index = element.data.lhs;
-        return element;
+        return Column.from_element(element);
     }
 };
 
@@ -1550,7 +1569,7 @@ const InstGen = struct {
                 while (reader.next()) |col| {
                     // TODO: support more than 64 columns
                     if (select.columns & (@as(u64, 0x1) << @truncate(col_count)) > 0) {
-                        if (col_count == select.table.primary_column and col.tag == .integer) {
+                        if (col.is_primary_key and col.tag == .integer) {
                             // rowId reads for a integer primary key row. If this isn't explicitly noted as a primary key,
                             // then column instruction is used instead.
                             try self.rowId(cursor, output_count + 1);
