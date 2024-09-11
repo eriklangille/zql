@@ -460,6 +460,42 @@ const Tokenizer = struct {
     }
 };
 
+const ConditionRef = struct {
+    index: u32,
+
+    const Condition = struct {
+        equality: enum(u32) {
+            condition_and,
+            condition_or,
+        },
+        lhs: union(enum) {
+            column_id: u32,
+            condition: ConditionRef,
+        },
+        rhs: union(enum) {
+            condition: ConditionRef,
+            str: String,
+            int: i64,
+            float: f64,
+        },
+    };
+
+    pub fn unwrap(self: ConditionRef, element_list: *ElementList) ?Condition {
+        if (self.index >= element_list.slice.len) return null;
+        const element = element_list.get(self.index);
+
+        return .{
+            .equality = switch (element.tag) {
+                .compare_and => .compare_and,
+                .compare_or => .compare_or,
+                else => unreachable, // TODO: implement other types
+            },
+            .lhs = .{ .index = element.data.lhs },
+            .rhs = .{ .index = element.data.rhs },
+        };
+    }
+};
+
 const Expr = struct {
     // Expr uses Element struct, value is val, tag is type of comparison, and data lhs rhs is the left right linked
     // expressions for and or. Literal comparison has the column id in the lhs
