@@ -467,6 +467,8 @@ const ConditionRef = struct {
         equality: enum(u32) {
             condition_and,
             condition_or,
+            compare_eq,
+            compare_ne,
         },
         lhs: union(enum) {
             column_id: u32,
@@ -484,15 +486,31 @@ const ConditionRef = struct {
         if (self.index >= element_list.slice.len) return null;
         const element = element_list.get(self.index);
 
-        return .{
-            .equality = switch (element.tag) {
-                .compare_and => .compare_and,
-                .compare_or => .compare_or,
-                else => unreachable, // TODO: implement other types
+        switch (element.tag) {
+            .compare_eq_int, .compare_eq_str => return .{
+                .equality = switch (element.tag) {
+                    .compare_eq_str, .compare_eq_float, .compare_eq_int => .compare_eq,
+                    else => unreachable, // handled in different case
+                },
+                .lhs = .{ .column_id = element.data.lhs },
+                .rhs = switch (element.tag) {
+                    .compare_eq_str => .{ .str = element.value.str },
+                    .compare_eq_int => .{ .int = element.value.int },
+                    .compare_eq_float => .{ .float = element.value.float },
+                    else => unreachable,
+                },
             },
-            .lhs = .{ .index = element.data.lhs },
-            .rhs = .{ .index = element.data.rhs },
-        };
+            .compare_or, .compare_and => return .{
+                .equality = switch (element.tag) {
+                    .compare_and => .compare_and,
+                    .compare_or => .compare_or,
+                    else => unreachable,
+                },
+                .lhs = .{ .index = element.data.lhs },
+                .rhs = .{ .index = element.data.rhs },
+            },
+            else => unreachable, // TODO: implement other types
+        }
     }
 };
 
