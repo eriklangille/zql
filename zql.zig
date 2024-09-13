@@ -641,6 +641,8 @@ const Inst = struct {
         halt,
         transaction,
         goto,
+        eq,
+        neq,
     };
 };
 
@@ -665,6 +667,16 @@ const Register = union(enum) {
             .blob => return .{ .binary = column.blob },
             .text => return .{ .str = column.text },
         }
+    }
+
+    pub fn tag(self: Register) usize {
+        return switch (self) {
+            .none => 0,
+            .int => 1,
+            .float => 2,
+            .str => 3,
+            .binary => 4,
+        };
     }
 
     pub fn to_str(self: Register, buffer: []u8) anyerror![]u8 {
@@ -1582,6 +1594,16 @@ const InstGen = struct {
         _ = try self.addInst(.{ .opcode = .column, .data = .{ .lhs = read_cursor, .rhs = extra_index } });
     }
 
+    fn eq(self: *InstGen, jump_address: u32, lhs_reg: u32, rhs_reg: u32) Error!void {
+        const extra_index = try self.addExtra(.{ .lhs_reg = lhs_reg, .rhs_reg = rhs_reg });
+        _ = try self.addInst(.{ .opcode = .eq, .data = .{ .lhs = jump_address, .rhs = extra_index } });
+    }
+
+    fn neq(self: *InstGen, jump_address: u32, lhs_reg: u32, rhs_reg: u32) Error!void {
+        const extra_index = try self.addExtra(.{ .lhs_reg = lhs_reg, .rhs_reg = rhs_reg });
+        _ = try self.addInst(.{ .opcode = .neq, .data = .{ .lhs = jump_address, .rhs = extra_index } });
+    }
+
     // The registers P1 through P1+P2-1 contain a single row of results. This opcode causes the sqlite3_step() call to terminate with an SQLITE_ROW return code
     // and it sets up the sqlite3_stmt structure to provide access to the r(P1)..r(P1+P2-1) values as the result row.
     fn resultRow(self: *InstGen, reg_index_start: u32, reg_index_end: u32) Error!void {
@@ -1790,6 +1812,30 @@ const Vm = struct {
                     }
                     print(write_buf[0..write_count].ptr, write_buf[0..write_count].len);
                     self.pc += 1;
+                },
+                .neq, .eq => {
+                    const jump_address = instruction.data.lhs;
+                    const extra_index = instruction.data.rhs;
+                    const lhs_reg_index = extra.items[extra_index];
+                    const rhs_reg_index = extra.items[extra_index + 1];
+                    const lhs_reg = self.reg_list.items[lhs_reg_index - 1];
+                    const rhs_reg = self.reg_list.items[rhs_reg_index - 1];
+                    var equal_values: bool = false;
+
+                    if (lhs_reg.tag() == rhs_reg.tag()) {
+                        equal_values = switch (lhs_reg) {
+                            .none => true,
+                            .int => lhs_reg.int == rhs_reg.int,
+                            .float => lhs_reg.float == rhs_reg.float,
+                            .str => eql(u8, lhs_reg.str, rhs_reg.str),
+                            .binary => unreachable, // TODO: implement
+                        };
+                    }
+                    if ((instruction.opcode == .eq and equal_values) or (instruction.opcode == .neq and !equal_values)) {
+                        self.pc = jump_address;
+                    } else {
+                        self.pc += 1;
+                    }
                 },
                 .next => {
                     debug("col_value: {?}", .{col_value});
