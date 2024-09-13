@@ -11,6 +11,7 @@ const eql = @import("std").mem.eql;
 const ArrayListUnmanaged = @import("std").ArrayListUnmanaged;
 const Allocator = @import("std").mem.Allocator;
 const maxInt = @import("std").math.maxInt;
+const meta = @import("std").meta;
 
 // (arrayPointer: i32, length: i32)
 extern fn print(ptr: [*]const u8, len: usize) void;
@@ -133,7 +134,7 @@ const SQLiteBtHeader = extern struct {
     }
 };
 
-// Bit masks for get_varint
+// Bit masks for getVarint
 const bits_7 = 0x7f;
 const slot_2_0 = (0x7f << 14) | 0x7f;
 const slot_4_2_0 = (0x7f << 28) | slot_2_0;
@@ -161,7 +162,7 @@ fn debug(comptime format: []const u8, args: anytype) void {
     print(line.ptr, line.len);
 }
 
-fn get_varint(ptr1: [*]u8, result: *u64) u8 {
+fn getVarint(ptr1: [*]u8, result: *u64) u8 {
     var a: u32 = undefined;
     var b: u32 = undefined;
     var ptr: [*]u8 = ptr1;
@@ -461,6 +462,8 @@ const Tokenizer = struct {
 };
 
 const ConditionRef = struct {
+    // ConditionRef uses Element struct, value is val, tag is type of comparison, and data lhs rhs is the left right linked
+    // expressions for and or. Literal comparison has the column id in the lhs
     index: u32,
 
     const Condition = struct {
@@ -481,6 +484,10 @@ const ConditionRef = struct {
             float: f64,
         },
     };
+
+    pub fn init(index: u32) ConditionRef {
+        return .{ .index = index };
+    }
 
     pub fn unwrap(self: ConditionRef, element_list: *ElementList) ?Condition {
         if (self.index >= element_list.slice.len) return null;
@@ -512,14 +519,8 @@ const ConditionRef = struct {
             else => unreachable, // TODO: implement other types
         }
     }
-};
 
-const Expr = struct {
-    // Expr uses Element struct, value is val, tag is type of comparison, and data lhs rhs is the left right linked
-    // expressions for and or. Literal comparison has the column id in the lhs
-    index: u32,
-
-    pub fn dump(self: *Expr, element_list: *ElementList) void {
+    pub fn dump(self: *ConditionRef, element_list: *ElementList) void {
         const buf: [500]u8 = undefined;
         var fbs = io.fixedBufferStream(@constCast(&buf));
         _ = self.bufWrite(@constCast(&fbs), element_list, self.index) catch null;
@@ -527,7 +528,7 @@ const Expr = struct {
         print(slice.ptr, slice.len);
     }
 
-    fn bufWrite(self: *Expr, buffer: *FixedBufferStream([]u8), element_list: *ElementList, index: u32) anyerror!void {
+    fn bufWrite(self: *ConditionRef, buffer: *FixedBufferStream([]u8), element_list: *ElementList, index: u32) anyerror!void {
         if (index == maxInt(u32)) {
             _ = try buffer.write("NULL");
         }
@@ -559,7 +560,7 @@ const Expr = struct {
 const SelectStmt = struct {
     columns: u64, // Each bit represents one column in the table TODO: support tables with more than 64 columns
     table: TableStmt,
-    where: ?Expr,
+    where: ?ConditionRef,
 };
 
 const ElementType = enum {
@@ -623,25 +624,24 @@ const TableStmt = struct {
 };
 
 const Inst = struct {
+    // In SQLite, Instructions have 6 properties: opcode, p1: u32, p2: u32, p3: u32, p4: u64 (optional?), and p5: u16.
+    // For our Zig implementation, we will do a data struct with two u32 values
+    // and then any instruction that requires more than 64 bits of information can be stored in extra data
     opcode: Opcode,
-    p1: u32,
-    p2: u32,
-    p3: u32,
-    p4: u64, // p4 seems optional, only some instructions have it? We can do the same
-    p5: u16,
-};
+    data: Data,
 
-const Opcode = enum(u8) {
-    init,
-    open_read,
-    rewind,
-    row_id,
-    column,
-    result_row,
-    next,
-    halt,
-    transaction,
-    goto,
+    pub const Opcode = enum(u8) {
+        init,
+        open_read,
+        rewind,
+        row_id,
+        column,
+        result_row,
+        next,
+        halt,
+        transaction,
+        goto,
+    };
 };
 
 const Register = union(enum) {
@@ -702,9 +702,9 @@ const SQLiteRecord = struct {
         var row_id: u64 = 0;
 
         // TODO: this only supports 0x0d pages. Support the other pages
-        cursor += get_varint(buffer.ptr, &cell_size);
-        cursor += get_varint(buffer.ptr + cursor, &row_id);
-        cell_header_int += get_varint(buffer.ptr + cursor, &cell_header_size);
+        cursor += getVarint(buffer.ptr, &cell_size);
+        cursor += getVarint(buffer.ptr + cursor, &row_id);
+        cell_header_int += getVarint(buffer.ptr + cursor, &cell_header_size);
 
         cell_header_size -= cell_header_int;
         cell_size -= cell_header_int;
@@ -732,7 +732,7 @@ const SQLiteRecord = struct {
             self.header_cursor = 0;
         }
         var header_val: u64 = 0;
-        self.header_cursor += get_varint(self.buffer.ptr + self.header_cursor, &header_val);
+        self.header_cursor += getVarint(self.buffer.ptr + self.header_cursor, &header_val);
 
         const size: u32 = @truncate(SQLiteColumn.size(header_val));
 
@@ -753,7 +753,7 @@ const SQLiteRecord = struct {
             self.header_cursor = 0;
         }
         var header_val: u64 = 0;
-        self.header_cursor += get_varint(self.buffer.ptr + self.header_cursor, &header_val);
+        self.header_cursor += getVarint(self.buffer.ptr + self.header_cursor, &header_val);
 
         // for debugging
         // const size: u32 = @truncate(SQLiteColumnType.size(header_val));
@@ -1193,7 +1193,7 @@ const ASTGen = struct {
         var table: ?TableStmt = null;
         var column_list_index: u32 = maxInt(u32);
         var processed_columns: bool = false;
-        var where: ?Expr = null;
+        var where: ?ConditionRef = null;
         while (self.index < self.token_list.len) : (self.index += 1) {
             const token = self.token_list.get(self.index);
             switch (state) {
@@ -1300,7 +1300,7 @@ const ASTGen = struct {
         };
     }
 
-    pub fn buildWhereClause(self: *ASTGen, table: TableStmt) Error!?Expr {
+    pub fn buildWhereClause(self: *ASTGen, table: TableStmt) Error!?ConditionRef {
         var state: State = .where;
         var equality: ?TokenType = null;
         var col_index: ?u32 = null;
@@ -1522,28 +1522,39 @@ const InstGen = struct {
         };
     }
 
-    // TODO: replace instruction list as struct with .Data and .Opcode. If > 2 32 bit values, then put it in extra_data arraylist
-
     fn addInst(self: *InstGen, inst: Inst) Allocator.Error!u32 {
         const result = @as(u32, @intCast(self.inst_list.len));
         try self.inst_list.append(self.gpa, inst);
         return result;
     }
 
-    fn replaceP2AtIndex(self: *InstGen, index: u32, p2: u32) void {
-        self.inst_list.items(.p2)[index] = p2;
+    fn replaceDataAtIndex(self: *InstGen, index: u32, data: Data) void {
+        self.inst_list.items(.data)[index] = data;
     }
 
-    fn markInst(self: *InstGen, opcode: Opcode) Error!u32 {
-        return try self.addInst(.{ .opcode = opcode, .p1 = 0, .p2 = 0, .p3 = 0, .p4 = 0, .p5 = 0 });
+    fn addExtra(self: *InstGen, extra_data: anytype) Allocator.Error!u32 {
+        const fields = meta.fields(@TypeOf(extra_data));
+        try extra.ensureUnusedCapacity(self.gpa, fields.len);
+        const extra_index: u32 = @intCast(extra.items.len);
+        extra.items.len += fields.len;
+        var i = extra_index;
+        inline for (fields) |field| {
+            extra.items[i] = @field(extra_data, field.name);
+            i += 1;
+        }
+        return extra_index;
+    }
+
+    fn markInst(self: *InstGen, opcode: Inst.Opcode) Error!u32 {
+        return try self.addInst(.{ .opcode = opcode, .data = .{ .lhs = 0, .rhs = 0 } });
     }
 
     fn instInit(self: *InstGen, index: u32, start_inst: u32) void {
-        self.replaceP2AtIndex(index, start_inst);
+        self.replaceDataAtIndex(index, .{ .lhs = start_inst, .rhs = 0 });
     }
 
     fn openRead(self: *InstGen, index: u32, table_index: u32) void {
-        self.replaceP2AtIndex(index, table_index);
+        self.replaceDataAtIndex(index, .{ .lhs = table_index, .rhs = 0 });
         self.cursor_count += 1;
     }
 
@@ -1552,14 +1563,14 @@ const InstGen = struct {
     // If P2 is zero, that is an assertion that the P1 table is never empty and hence the jump will never be taken.
     // This opcode leaves the cursor configured to move in forward order, from the beginning toward the end. In other words, the cursor is configured to use Next, not Prev.
     fn rewind(self: *InstGen, index: u32, end_inst: u32) void {
-        self.replaceP2AtIndex(index, end_inst);
+        self.replaceDataAtIndex(index, .{ .lhs = end_inst, .rhs = 0 });
     }
 
     // Store in register P2 an integer which is the key of the table entry that P1 is currently point to.
     // P1 can be either an ordinary table or a virtual table. There used to be a separate OP_VRowid opcode for use with virtual tables,
     // but this one opcode now works for both table types.
     fn rowId(self: *InstGen, read_cursor: u32, store_reg: u32) Error!void {
-        _ = try self.addInst(.{ .opcode = .row_id, .p1 = read_cursor, .p2 = store_reg, .p3 = 0, .p4 = 0, .p5 = 0 });
+        _ = try self.addInst(.{ .opcode = .row_id, .data = .{ .lhs = read_cursor, .rhs = store_reg } });
     }
 
     // Interpret the data that cursor P1 points to as a structure built using the MakeRecord instruction. Extract the P2-th column from this record.
@@ -1567,21 +1578,22 @@ const InstGen = struct {
     // The value extracted is stored in register P3.
     // If the record contains fewer than P2 fields, then extract a NULL. Or, if the P4 argument is a P4_MEM use the value of the P4 argument as the result.
     fn column(self: *InstGen, read_cursor: u32, store_reg: u32, col_num: u32) Error!void {
-        _ = try self.addInst(.{ .opcode = .column, .p1 = read_cursor, .p2 = col_num, .p3 = store_reg, .p4 = 0, .p5 = 0 });
+        const extra_index = try self.addExtra(.{ .store_reg = store_reg, .col_num = col_num });
+        _ = try self.addInst(.{ .opcode = .column, .data = .{ .lhs = read_cursor, .rhs = extra_index } });
     }
 
     // The registers P1 through P1+P2-1 contain a single row of results. This opcode causes the sqlite3_step() call to terminate with an SQLITE_ROW return code
     // and it sets up the sqlite3_stmt structure to provide access to the r(P1)..r(P1+P2-1) values as the result row.
     fn resultRow(self: *InstGen, reg_index_start: u32, reg_index_end: u32) Error!void {
-        _ = try self.addInst(.{ .opcode = .result_row, .p1 = reg_index_start, .p2 = reg_index_end, .p3 = 0, .p4 = 0, .p5 = 0 });
+        _ = try self.addInst(.{ .opcode = .result_row, .data = .{ .lhs = reg_index_start, .rhs = reg_index_end } });
     }
 
     fn next(self: *InstGen, cursor: u32, success_jump: u32) Error!void {
-        _ = try self.addInst(.{ .opcode = .next, .p1 = cursor, .p2 = success_jump, .p3 = 0, .p4 = 0, .p5 = 0 });
+        _ = try self.addInst(.{ .opcode = .next, .data = .{ .lhs = cursor, .rhs = success_jump } });
     }
 
     fn halt(self: *InstGen) Error!void {
-        _ = try self.addInst(.{ .opcode = .halt, .p1 = 0, .p2 = 0, .p3 = 0, .p4 = 0, .p5 = 0 });
+        _ = try self.addInst(.{ .opcode = .halt, .data = .{ .lhs = 0, .rhs = 0 } });
     }
 
     // Begin a transaction on database P1 if a transaction is not already active. If P2 is non-zero, then a write-transaction is started,
@@ -1596,11 +1608,11 @@ const InstGen = struct {
     // execution halts. The sqlite3_step() wrapper function might then reprepare the statement and rerun it from the beginning.
     fn transaction(self: *InstGen, database_id: u32, write: bool) Error!void {
         const write_int: u32 = if (write) 1 else 0;
-        _ = try self.addInst(.{ .opcode = .transaction, .p1 = database_id, .p2 = write_int, .p3 = 0, .p4 = 0, .p5 = 0 });
+        _ = try self.addInst(.{ .opcode = .transaction, .data = .{ .lhs = database_id, .rhs = write_int } });
     }
 
     fn goto(self: *InstGen, inst_jump: u32) Error!void {
-        _ = try self.addInst(.{ .opcode = .goto, .p1 = 0, .p2 = inst_jump, .p3 = 0, .p4 = 0, .p5 = 0 });
+        _ = try self.addInst(.{ .opcode = .goto, .data = .{ .lhs = inst_jump, .rhs = 0 } });
     }
 
     pub fn buildInstructions(self: *InstGen) Error!void {
@@ -1686,6 +1698,8 @@ const Vm = struct {
         }
     }
 
+    // TODO: do not reference instruction list or extra data directly. Have them go through a layer and provide a struct with field names.
+    // That way don't have to figure out data.lhs/rhs for each instruction
     pub fn exec(self: *Vm) Error!void {
         var instruction = self.inst_list.get(self.pc);
         // TODO: multiple cursors
@@ -1702,10 +1716,10 @@ const Vm = struct {
             instruction = self.inst_list.get(self.pc);
             switch (instruction.opcode) {
                 .init => {
-                    self.pc = instruction.p2;
+                    self.pc = instruction.data.lhs;
                 },
                 .open_read => {
-                    const page_index = instruction.p2;
+                    const page_index = instruction.data.lhs;
                     buffer = self.db.readPage(page_index);
                     debug("buffer created", .{});
                     header = SQLiteBtHeader.from(buffer.?);
@@ -1732,14 +1746,16 @@ const Vm = struct {
                     assert(col_value != null);
                     const value = col_value.?;
                     debug("row_id SQLiteColumn: {s}", .{@tagName(value)});
-                    try self.reg(instruction.p2, Register{ .int = @intCast(record.?.row_id) });
+                    try self.reg(instruction.data.rhs, Register{ .int = @intCast(record.?.row_id) });
                     col_value = record.?.next();
                     col_count += 1;
                     self.pc += 1;
                 },
                 .column => {
                     assert(record != null);
-                    const col = instruction.p2;
+                    const extra_index = instruction.data.rhs;
+                    const store_reg = extra.items[extra_index];
+                    const col = extra.items[extra_index + 1];
                     if (col_count < col) {
                         while (col_count < col) : (col_count += 1) {
                             record.?.consume();
@@ -1748,15 +1764,15 @@ const Vm = struct {
                         col_count += 1;
                     }
                     assert(col_value != null);
-                    try self.reg(instruction.p3, Register.from_column(col_value.?));
+                    try self.reg(store_reg, Register.from_column(col_value.?));
                     col_value = record.?.next();
                     debug("col_value: {?}", .{col_value});
                     col_count += 1;
                     self.pc += 1;
                 },
                 .result_row => {
-                    const start_reg = instruction.p1;
-                    const end_reg = instruction.p2;
+                    const start_reg = instruction.data.lhs;
+                    const end_reg = instruction.data.rhs;
 
                     // TODO: callback method to handle these regs or smth. Right now we will simply log them to console
                     var i = start_reg;
@@ -1787,7 +1803,7 @@ const Vm = struct {
                         record = SQLiteRecord.from(buffer.?[addr..]);
                         col_value = record.?.next();
 
-                        const inst_addr = instruction.p2;
+                        const inst_addr = instruction.data.lhs;
                         self.pc = inst_addr;
                     }
                 },
@@ -1797,7 +1813,7 @@ const Vm = struct {
                     self.pc += 1;
                 },
                 .goto => {
-                    self.pc = instruction.p2;
+                    self.pc = instruction.data.lhs;
                 },
                 // else => debug("instruction not implemented: {}", .{instruction.opcode}),
             }
@@ -1854,7 +1870,10 @@ const String = struct {
     }
 };
 
+// TODO: put all these into a self-contained structure like how the Zig compiler does with InternPool
+// Then only return the filled out structures, not the data oriented design ones
 var string_bytes: ArrayListUnmanaged(u8) = .{};
+var extra: ArrayListUnmanaged(u32) = .{};
 const TokenList = MultiArrayList(MinimizedToken);
 const ElementList = MultiArrayList(Element);
 const InstList = MultiArrayList(Inst);
