@@ -466,13 +466,15 @@ const ConditionRef = struct {
     // expressions for and or. Literal comparison has the column id in the lhs
     index: u32,
 
-    const Condition = struct {
-        equality: enum(u32) {
-            condition_and,
-            condition_or,
-            compare_eq,
-            compare_ne,
-        },
+    pub const ConditionEquality = enum(u32) {
+        condition_and,
+        condition_or,
+        compare_eq,
+        compare_ne,
+    };
+
+    pub const Condition = struct {
+        equality: ConditionEquality,
         lhs: union(enum) {
             column_id: u32,
             condition: ConditionRef,
@@ -643,6 +645,9 @@ const Inst = struct {
         goto,
         eq,
         neq,
+        string,
+        int,
+        float,
     };
 };
 
@@ -650,6 +655,7 @@ const Register = union(enum) {
     none,
     int: i64,
     float: f64,
+    string: String,
     str: []u8,
     binary: []u8,
 
@@ -674,9 +680,28 @@ const Register = union(enum) {
             .none => 0,
             .int => 1,
             .float => 2,
-            .str => 3,
-            .binary => 4,
+            .string => 3,
+            .str => 4,
+            .binary => 5,
         };
+    }
+
+    pub fn compare(self: Register, other: Register) bool {
+        if (self.tag() == other.tag()) {
+            return switch (self) {
+                .none => true,
+                .int => self.int == other.int,
+                .float => self.float == other.float,
+                .str => eql(u8, self.str, other.str),
+                .string => eql(u8, self.string.str(), other.string.str()),
+                .binary => unreachable, // TODO: implement
+            };
+        } else if (self.tag() == 3 and other.tag() == 4) {
+            return eql(u8, self.string.str(), other.str);
+        } else if (self.tag() == 4 and other.tag() == 3) {
+            return eql(u8, self.str, other.string.str());
+        }
+        return false;
     }
 
     pub fn to_str(self: Register, buffer: []u8) anyerror![]u8 {
@@ -685,6 +710,7 @@ const Register = union(enum) {
             .int => try fmt.bufPrint(buffer, "{d}", .{self.int}),
             .float => try fmt.bufPrint(buffer, "{e}", .{self.float}),
             .str => try fmt.bufPrint(buffer, "{s}", .{self.str}),
+            .string => try fmt.bufPrint(buffer, "{s}", .{self.string.str()}),
             .binary => try fmt.bufPrint(buffer, "[binary]", .{}),
         };
     }
@@ -1505,6 +1531,52 @@ const TableMetadataReader = struct {
     }
 };
 
+const ConditionTraversal = struct {
+    element_list: *ElementList,
+    index: u32,
+    current_condition: ConditionRef.ConditionEquality,
+    stack: ArrayListUnmanaged(u32),
+    last_pop: ConditionRef,
+
+    pub fn init(element_list: *ElementList, index: u32) ConditionTraversal {
+        return .{
+            .element_list = element_list,
+            .index = index,
+            .current_condition = .condition_or,
+            .stack = .{},
+            .last_pop = .{ .index = maxInt(u32) },
+        };
+    }
+
+    pub fn next(self: *ConditionTraversal, alloc: Allocator) Allocator.Error!?ConditionRef.Condition {
+        var curr_ref: ConditionRef = .{ .index = self.index };
+        while (self.index < self.element_list.len) {
+            if (curr_ref.unwrap(self.element_list)) |cond| {
+                switch (cond.equality) {
+                    .condition_or, .condition_and => {
+                        curr_ref = cond.lhs.condition;
+                        try self.stack.append(alloc, curr_ref.index);
+                        self.current_condition = cond.equality;
+                    },
+                    .compare_eq, .compare_ne => {
+                        self.index = curr_ref.index;
+                        return cond;
+                    },
+                }
+            } else {
+                if (self.stack.items.len == 0) return null;
+                self.last_pop = .{ .index = self.stack.pop() };
+                curr_ref = self.last_pop.unwrap(self.element_list).?.rhs.condition;
+            }
+        }
+        return null;
+    }
+
+    pub fn deint(self: *ConditionTraversal, alloc: Allocator) void {
+        self.stack.deinit(alloc);
+    }
+};
+
 const Stmt = union(enum) {
     select: SelectStmt,
 };
@@ -1542,6 +1614,18 @@ const InstGen = struct {
 
     fn replaceDataAtIndex(self: *InstGen, index: u32, data: Data) void {
         self.inst_list.items(.data)[index] = data;
+    }
+
+    fn replaceOpcodeAtIndex(self: *InstGen, index: u32, opcode: Inst.Opcode) void {
+        self.inst_list.items(.opcode)[index] = opcode;
+    }
+
+    fn getDataAtIndex(self: *InstGen, index: u32) Data {
+        return self.inst_list.items(.data)[index];
+    }
+
+    fn getOpcodeAtIndex(self: *InstGen, index: u32) Inst.Opcode {
+        return self.inst_list.items(.opcode)[index];
     }
 
     fn addExtra(self: *InstGen, extra_data: anytype) Allocator.Error!u32 {
@@ -1594,14 +1678,33 @@ const InstGen = struct {
         _ = try self.addInst(.{ .opcode = .column, .data = .{ .lhs = read_cursor, .rhs = extra_index } });
     }
 
-    fn eq(self: *InstGen, jump_address: u32, lhs_reg: u32, rhs_reg: u32) Error!void {
+    fn eq(self: *InstGen, lhs_reg: u32, rhs_reg: u32) Error!void {
         const extra_index = try self.addExtra(.{ .lhs_reg = lhs_reg, .rhs_reg = rhs_reg });
-        _ = try self.addInst(.{ .opcode = .eq, .data = .{ .lhs = jump_address, .rhs = extra_index } });
+        _ = try self.addInst(.{ .opcode = .eq, .data = .{ .lhs = 0, .rhs = extra_index } });
     }
 
-    fn neq(self: *InstGen, jump_address: u32, lhs_reg: u32, rhs_reg: u32) Error!void {
+    fn neq(self: *InstGen, lhs_reg: u32, rhs_reg: u32) Error!void {
         const extra_index = try self.addExtra(.{ .lhs_reg = lhs_reg, .rhs_reg = rhs_reg });
-        _ = try self.addInst(.{ .opcode = .neq, .data = .{ .lhs = jump_address, .rhs = extra_index } });
+        _ = try self.addInst(.{ .opcode = .neq, .data = .{ .lhs = 0, .rhs = extra_index } });
+    }
+
+    fn eqReplaceJump(self: *InstGen, index: u32, jump_address: u32) void {
+        const data = self.getDataAtIndex(index);
+        self.replaceDataAtIndex(index, .{ .lhs = jump_address, .rhs = data.rhs });
+    }
+
+    fn eqNegate(self: *InstGen, index: u32) void {
+        const opcode = self.getOpcodeAtIndex(index);
+        self.replaceOpcodeAtIndex(index, switch (opcode) {
+            .neq => .eq,
+            .eq => .neq,
+            else => opcode,
+        });
+    }
+
+    fn string(self: *InstGen, str: String, store_reg: u32) Error!void {
+        const extra_index = try self.addExtra(str);
+        _ = try self.addInst(.{ .opcode = .string, .data = .{ .lhs = store_reg, .rhs = extra_index } });
     }
 
     // The registers P1 through P1+P2-1 contain a single row of results. This opcode causes the sqlite3_step() call to terminate with an SQLITE_ROW return code
@@ -1652,20 +1755,37 @@ const InstGen = struct {
                 const rewind_start = self.inst_list.len;
 
                 var col_count: u32 = 0;
-                var output_count: u32 = 0;
-                const reg_count: u32 = 1;
+                var reg_count: u32 = 1;
                 var reader = TableMetadataReader.from(self.element_list, &select.table);
                 const where_clause = select.where;
+                const compare_reg = reg_count;
                 if (where_clause) |ref| {
-                    const optional_condition = ref.unwrap(self.element_list);
-                    while (optional_condition) |condition| {
-                        // TODO: add conditions
-                        if (condition.equality == .compare_eq) {
-                            try self.column(cursor, reg_count, condition.lhs.column_id);
-                            // try self.neq()
+                    var traversal = ConditionTraversal.init(self.element_list, ref.index);
+                    defer traversal.deint(self.gpa);
+                    var comparisons: ArrayListUnmanaged(u32) = .{};
+                    var columns_start = self.inst_list.len;
+                    defer comparisons.deinit(self.gpa);
+                    while (try traversal.next(self.gpa)) |cond| {
+                        try self.column(cursor, compare_reg, cond.lhs.column_id);
+                        reg_count += 1;
+                        switch (traversal.current_condition) {
+                            .condition_or => {
+                                try self.eq(compare_reg, reg_count);
+                                try comparisons.append(self.gpa, self.inst_list.len);
+                            },
+                            else => return Error.InvalidSyntax, // TODO: implement and clause
                         }
+                    } else {
+                        columns_start = self.inst_list.len;
+                    }
+                    for (comparisons.items, 0..) |value, i| {
+                        if (i == comparisons.items.len - 1) {
+                            self.eqNegate(value);
+                        }
+                        self.eqReplaceJump(value, columns_start);
                     }
                 }
+                var output_count: u32 = reg_count;
                 while (reader.next()) |col| {
                     // TODO: support more than 64 columns
                     if (select.columns & (@as(u64, 0x1) << @truncate(col_count)) > 0) {
@@ -1690,6 +1810,18 @@ const InstGen = struct {
                 // TODO: support multiples databases, writing to tables
                 try self.transaction(0, false);
                 const transaction_index = self.inst_list.len - 1;
+                if (where_clause) |where| {
+                    var traversal = ConditionTraversal.init(self.element_list, where.index);
+                    var store_reg = compare_reg + 1;
+                    defer traversal.deint(self.gpa);
+                    while (try traversal.next(self.gpa)) |cond| {
+                        switch (cond.rhs) {
+                            .str => try self.string(cond.rhs.str, store_reg),
+                            else => return Error.InvalidSyntax, // TODO: implement int, float
+                        }
+                        store_reg += 1;
+                    }
+                }
                 try self.goto(open_read_index);
                 self.instInit(init_index, transaction_index);
                 self.openRead(open_read_index, page_index);
@@ -1832,22 +1964,21 @@ const Vm = struct {
                     const rhs_reg_index = extra.items[extra_index + 1];
                     const lhs_reg = self.reg_list.items[lhs_reg_index - 1];
                     const rhs_reg = self.reg_list.items[rhs_reg_index - 1];
-                    var equal_values: bool = false;
+                    const equal_values: bool = lhs_reg.compare(rhs_reg);
 
-                    if (lhs_reg.tag() == rhs_reg.tag()) {
-                        equal_values = switch (lhs_reg) {
-                            .none => true,
-                            .int => lhs_reg.int == rhs_reg.int,
-                            .float => lhs_reg.float == rhs_reg.float,
-                            .str => eql(u8, lhs_reg.str, rhs_reg.str),
-                            .binary => unreachable, // TODO: implement
-                        };
-                    }
                     if ((instruction.opcode == .eq and equal_values) or (instruction.opcode == .neq and !equal_values)) {
                         self.pc = jump_address;
                     } else {
                         self.pc += 1;
                     }
+                },
+                .string => {
+                    const store_reg = instruction.data.lhs;
+                    const extra_index = instruction.data.rhs;
+                    const str_index = extra.items[extra_index];
+                    const str_len = extra.items[extra_index + 1];
+                    try self.reg(store_reg, .{ .string = .{ .index = str_index, .len = str_len } });
+                    self.pc += 1;
                 },
                 .next => {
                     debug("col_value: {?}", .{col_value});
@@ -1873,7 +2004,7 @@ const Vm = struct {
                 .goto => {
                     self.pc = instruction.data.lhs;
                 },
-                // else => debug("instruction not implemented: {}", .{instruction.opcode}),
+                else => debug("instruction not implemented: {}", .{instruction.opcode}),
             }
         }
     }
