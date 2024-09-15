@@ -490,7 +490,7 @@ const ConditionRef = struct {
     }
 
     pub fn unwrap(self: ConditionRef, element_list: *ElementList) ?Condition {
-        if (self.index >= element_list.slice.len) return null;
+        if (self.index >= element_list.len) return null;
         const element = element_list.get(self.index);
 
         switch (element.tag) {
@@ -509,12 +509,12 @@ const ConditionRef = struct {
             },
             .compare_or, .compare_and => return .{
                 .equality = switch (element.tag) {
-                    .compare_and => .compare_and,
-                    .compare_or => .compare_or,
+                    .compare_and => .condition_and,
+                    .compare_or => .condition_or,
                     else => unreachable,
                 },
-                .lhs = .{ .index = element.data.lhs },
-                .rhs = .{ .index = element.data.rhs },
+                .lhs = .{ .condition = .{ .index = element.data.lhs } },
+                .rhs = .{ .condition = .{ .index = element.data.rhs } },
             },
             else => unreachable, // TODO: implement other types
         }
@@ -1653,7 +1653,19 @@ const InstGen = struct {
 
                 var col_count: u32 = 0;
                 var output_count: u32 = 0;
+                const reg_count: u32 = 1;
                 var reader = TableMetadataReader.from(self.element_list, &select.table);
+                const where_clause = select.where;
+                if (where_clause) |ref| {
+                    const optional_condition = ref.unwrap(self.element_list);
+                    while (optional_condition) |condition| {
+                        // TODO: add conditions
+                        if (condition.equality == .compare_eq) {
+                            try self.column(cursor, reg_count, condition.lhs.column_id);
+                            // try self.neq()
+                        }
+                    }
+                }
                 while (reader.next()) |col| {
                     // TODO: support more than 64 columns
                     if (select.columns & (@as(u64, 0x1) << @truncate(col_count)) > 0) {
