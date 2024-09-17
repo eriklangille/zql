@@ -433,6 +433,7 @@ const Tokenizer = struct {
                     'a'...'z', 'A'...'Z' => {},
                     '"' => {
                         token.type = TokenType.double_quote_word;
+                        self.index += 1;
                         break;
                     },
                     else => {
@@ -533,6 +534,7 @@ const ConditionRef = struct {
     fn bufWrite(self: *ConditionRef, buffer: *FixedBufferStream([]u8), element_list: *ElementList, index: u32) anyerror!void {
         if (index == maxInt(u32)) {
             _ = try buffer.write("NULL");
+            return;
         }
         const item: Element = element_list.get(index);
         switch (item.tag) {
@@ -1550,7 +1552,8 @@ const ConditionTraversal = struct {
 
     pub fn next(self: *ConditionTraversal, alloc: Allocator) Allocator.Error!?ConditionRef.Condition {
         var curr_ref: ConditionRef = .{ .index = self.index };
-        while (self.index < self.element_list.len) {
+        debug("next condition: {d}", .{curr_ref.index});
+        while (true) {
             if (curr_ref.unwrap(self.element_list)) |cond| {
                 switch (cond.equality) {
                     .condition_or, .condition_and => {
@@ -1559,7 +1562,7 @@ const ConditionTraversal = struct {
                         self.current_condition = cond.equality;
                     },
                     .compare_eq, .compare_ne => {
-                        self.index = curr_ref.index;
+                        self.index = maxInt(u32);
                         return cond;
                     },
                 }
@@ -1759,6 +1762,7 @@ const InstGen = struct {
                 var reader = TableMetadataReader.from(self.element_list, &select.table);
                 const where_clause = select.where;
                 const compare_reg = reg_count;
+                var final_comparison: u32 = 0;
                 if (where_clause) |ref| {
                     var traversal = ConditionTraversal.init(self.element_list, ref.index);
                     defer traversal.deint(self.gpa);
@@ -1771,7 +1775,7 @@ const InstGen = struct {
                         switch (traversal.current_condition) {
                             .condition_or => {
                                 try self.eq(compare_reg, reg_count);
-                                try comparisons.append(self.gpa, self.inst_list.len);
+                                try comparisons.append(self.gpa, self.inst_list.len - 1);
                             },
                             else => return Error.InvalidSyntax, // TODO: implement and clause
                         }
@@ -1781,8 +1785,10 @@ const InstGen = struct {
                     for (comparisons.items, 0..) |value, i| {
                         if (i == comparisons.items.len - 1) {
                             self.eqNegate(value);
+                            final_comparison = value;
+                        } else {
+                            self.eqReplaceJump(value, columns_start);
                         }
-                        self.eqReplaceJump(value, columns_start);
                     }
                 }
                 var output_count: u32 = reg_count;
@@ -1803,14 +1809,16 @@ const InstGen = struct {
                 debug("columns: {b}", .{select.columns});
 
                 debug("output count: {d}", .{output_count});
-                try self.resultRow(1, output_count + 1);
+                try self.resultRow(reg_count + 1, output_count + 1);
                 try self.next(cursor, rewind_start);
+                const next_index = self.inst_list.len - 1;
                 try self.halt();
                 const halt_index = self.inst_list.len - 1;
                 // TODO: support multiples databases, writing to tables
                 try self.transaction(0, false);
                 const transaction_index = self.inst_list.len - 1;
                 if (where_clause) |where| {
+                    self.eqReplaceJump(final_comparison, next_index);
                     var traversal = ConditionTraversal.init(self.element_list, where.index);
                     var store_reg = compare_reg + 1;
                     defer traversal.deint(self.gpa);
@@ -1860,6 +1868,9 @@ const Vm = struct {
         if (index - 1 == self.reg_list.items.len) {
             try self.reg_list.append(self.gpa, register);
         } else {
+            while (index > self.reg_list.items.len) {
+                try self.reg_list.append(self.gpa, Register.none);
+            }
             self.reg_list.items[index - 1] = register;
         }
     }
@@ -1880,6 +1891,7 @@ const Vm = struct {
 
         while (self.pc < self.inst_list.len and instruction.opcode != .halt) {
             instruction = self.inst_list.get(self.pc);
+            debug("inst: {s}", .{@tagName(instruction.opcode)});
             switch (instruction.opcode) {
                 .init => {
                     self.pc = instruction.data.lhs;
@@ -1909,12 +1921,8 @@ const Vm = struct {
                 },
                 .row_id => {
                     assert(record != null);
-                    assert(col_value != null);
-                    const value = col_value.?;
-                    debug("row_id SQLiteColumn: {s}", .{@tagName(value)});
+                    debug("row_id SQLiteColumn: {d}", .{record.?.row_id});
                     try self.reg(instruction.data.rhs, Register{ .int = @intCast(record.?.row_id) });
-                    col_value = record.?.next();
-                    col_count += 1;
                     self.pc += 1;
                 },
                 .column => {
@@ -1922,13 +1930,15 @@ const Vm = struct {
                     const extra_index = instruction.data.rhs;
                     const store_reg = extra.items[extra_index];
                     const col = extra.items[extra_index + 1];
-                    if (col_count < col) {
-                        while (col_count < col) : (col_count += 1) {
-                            record.?.consume();
-                        }
-                        col_value = record.?.next();
-                        col_count += 1;
+                    if (col_count > col) {
+                        record.?.reset();
+                        col_count = 0;
                     }
+                    while (col_count < col) : (col_count += 1) {
+                        record.?.consume();
+                    }
+                    col_value = record.?.next();
+                    col_count += 1;
                     assert(col_value != null);
                     try self.reg(store_reg, Register.from_column(col_value.?));
                     col_value = record.?.next();
@@ -1968,6 +1978,7 @@ const Vm = struct {
 
                     if ((instruction.opcode == .eq and equal_values) or (instruction.opcode == .neq and !equal_values)) {
                         self.pc = jump_address;
+                        debug("jump: {d}", .{jump_address});
                     } else {
                         self.pc += 1;
                     }
@@ -2090,10 +2101,11 @@ fn parseStatement(str: [:0]u8, file_buffer: []u8) Error!void {
     debug("statement built!", .{});
 
     var inst_gen = try InstGen.from(fixed_alloc.allocator(), &data, &insts, db, Stmt{ .select = statement });
-    debug("inst generated!", .{});
 
     // TODO: ast built, now translate into instructions for VM.
+    debug("building instructions", .{});
     try inst_gen.buildInstructions();
+    debug("inst generated!", .{});
 
     var vm = Vm.from(fixed_alloc.allocator(), db, inst_gen.inst_list.slice());
     try vm.exec();
