@@ -1408,12 +1408,12 @@ const ASTGen = struct {
                     if (equality == null or col_index == null) {
                         return Error.InvalidSyntax;
                     }
-                    var last_expr: ?u32 = null;
                     switch (token.tag) {
                         .double_quote_word => {
                             const string_literal = ASTGen.getTokenSource(self.source, token);
+                            debug("where_rhs literal: {s}", .{string_literal});
                             const value = try String.init(self.gpa, string_literal[1 .. string_literal.len - 1]);
-                            last_expr = expr_index;
+                            expr_prev_index = expr_index;
                             expr_index = try self.addElement(.{
                                 .value = .{ .str = value },
                                 .tag = switch (equality.?) {
@@ -1557,8 +1557,8 @@ const ConditionTraversal = struct {
             if (curr_ref.unwrap(self.element_list)) |cond| {
                 switch (cond.equality) {
                     .condition_or, .condition_and => {
-                        curr_ref = cond.lhs.condition;
                         try self.stack.append(alloc, curr_ref.index);
+                        curr_ref = cond.lhs.condition;
                         self.current_condition = cond.equality;
                     },
                     .compare_eq, .compare_ne => {
@@ -1569,6 +1569,7 @@ const ConditionTraversal = struct {
             } else {
                 if (self.stack.items.len == 0) return null;
                 self.last_pop = .{ .index = self.stack.pop() };
+                debug("last pop: {d}", .{self.last_pop.index});
                 curr_ref = self.last_pop.unwrap(self.element_list).?.rhs.condition;
             }
         }
