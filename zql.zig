@@ -12,6 +12,7 @@ const ArrayListUnmanaged = @import("std").ArrayListUnmanaged;
 const Allocator = @import("std").mem.Allocator;
 const maxInt = @import("std").math.maxInt;
 const meta = @import("std").meta;
+// TODO: clean up imports
 
 // (arrayPointer: i32, length: i32)
 extern fn print(ptr: [*]const u8, len: usize) void;
@@ -59,11 +60,11 @@ const SQLiteDbHeader = extern struct {
     version_valid_for: u32,
     sqlite_version_number: u32,
 
-    pub fn get_page_size(self: *SQLiteDbHeader) u16 {
+    pub fn getPageSize(self: *SQLiteDbHeader) u16 {
         return @byteSwap(self.page_size);
     }
 
-    pub fn get_version(self: *SQLiteDbHeader) u32 {
+    pub fn getVersion(self: *SQLiteDbHeader) u32 {
         return @byteSwap(self.sqlite_version_number);
     }
 };
@@ -78,16 +79,16 @@ const SQLiteBtHeader = extern struct {
         return @alignCast(@ptrCast(buffer[0..sqlite_bt_header_size])); // TODO: align(1)?
     }
 
-    pub fn get_cell_addr(self: *SQLiteBtHeader, buffer: []u8, index: u32) u16 {
-        const bt_header_size = self.get_header_size();
+    pub fn getCellAddr(self: *SQLiteBtHeader, buffer: []u8, index: u32) u16 {
+        const bt_header_size = self.getHeaderSize();
         const start = bt_header_size + (index * 2);
         const cell_adr: u16 = @byteSwap(valFromSlice(u16, buffer[start .. start + 2]));
         debug("cell adr: {d}", .{cell_adr});
         return cell_adr;
     }
 
-    pub fn get_header_size(self: *SQLiteBtHeader) u8 {
-        const page_type = self.get_page_type();
+    pub fn getHeaderSize(self: *SQLiteBtHeader) u8 {
+        const page_type = self.getPageType();
         debug("page type: {x}", .{page_type});
         switch (page_type) {
             0x0D, 0x0A => {
@@ -99,37 +100,37 @@ const SQLiteBtHeader = extern struct {
         }
     }
 
-    pub fn get_page_type(self: *SQLiteBtHeader) u8 {
+    pub fn getPageType(self: *SQLiteBtHeader) u8 {
         return self.metadata[0];
     }
 
-    pub fn get_first_freeblock(self: *SQLiteBtHeader) u16 {
+    pub fn getFirstFreeblock(self: *SQLiteBtHeader) u16 {
         var block: u16 = 0;
         block = @as(u16, self.metadata[1]) << 8;
         block |= self.metadata[2];
         return block;
     }
 
-    pub fn get_cell_count(self: *SQLiteBtHeader) u16 {
+    pub fn getCellCount(self: *SQLiteBtHeader) u16 {
         var block: u16 = 0;
         block = @as(u16, self.metadata[3]) << 8;
         block |= self.metadata[4];
         return block;
     }
 
-    pub fn get_cell_offset(self: *SQLiteBtHeader) u16 {
+    pub fn getCellOffset(self: *SQLiteBtHeader) u16 {
         var block: u16 = 0;
         block = @as(u16, self.metadata[5]) << 8;
         block |= self.metadata[6];
         return block;
     }
 
-    pub fn get_fragment_count(self: *SQLiteBtHeader) u8 {
+    pub fn getFragmentCount(self: *SQLiteBtHeader) u8 {
         return self.metadata[7];
     }
 
-    pub fn get_right_child_page(self: *SQLiteBtHeader) u32 {
-        assert(self.get_page_type() != 0x0D and self.get_page_type() != 0x0A);
+    pub fn getRightChildPage(self: *SQLiteBtHeader) u32 {
+        assert(self.getPageType() != 0x0D and self.getPageType() != 0x0A);
         return @byteSwap(self.right_child_page);
     }
 };
@@ -706,7 +707,7 @@ const Register = union(enum) {
         return false;
     }
 
-    pub fn to_str(self: Register, buffer: []u8) anyerror![]u8 {
+    pub fn toStr(self: Register, buffer: []u8) anyerror![]u8 {
         return switch (self) {
             .none => try fmt.bufPrint(buffer, "[null]", .{}),
             .int => try fmt.bufPrint(buffer, "{d}", .{self.int}),
@@ -910,7 +911,7 @@ const Db = struct {
             return error.InvalidBinary;
         }
         const header: *SQLiteDbHeader = @alignCast(@ptrCast(buffer[0..sqlite_header_size]));
-        const page_size = header.get_page_size();
+        const page_size = header.getPageSize();
         debug("page_size: {d}", .{page_size});
         return Db{
             .cursor = 0,
@@ -953,7 +954,7 @@ const Db = struct {
         self.buffer = new_slice;
         const bt_header = SQLiteBtHeader.from(new_slice[sqlite_header_size..]);
 
-        const cell_adr = bt_header.get_cell_addr(new_slice[sqlite_header_size..], 0);
+        const cell_adr = bt_header.getCellAddr(new_slice[sqlite_header_size..], 0);
         const cell_start = new_slice[cell_adr..];
 
         var record = SQLiteRecord.from(cell_start);
@@ -1497,7 +1498,7 @@ const Column = struct {
     },
     is_primary_key: bool,
 
-    pub fn from_element(element: Element) Column {
+    pub fn fromElement(element: Element) Column {
         return .{
             .name = element.value.str,
             .tag = switch (element.tag) {
@@ -1529,7 +1530,7 @@ const TableMetadataReader = struct {
         }
         const element = self.element_list.get(self.index);
         self.index = element.data.lhs;
-        return Column.from_element(element);
+        return Column.fromElement(element);
     }
 };
 
@@ -1903,9 +1904,9 @@ const Vm = struct {
                     debug("buffer created", .{});
                     header = SQLiteBtHeader.from(buffer.?);
                     // TODO: refactor this mess
-                    cell_size = header.?.get_cell_count();
+                    cell_size = header.?.getCellCount();
                     debug("cell count: {d}", .{cell_size});
-                    const addr = header.?.get_cell_addr(buffer.?, cell_count);
+                    const addr = header.?.getCellAddr(buffer.?, cell_count);
                     debug("cell address: {x}", .{addr});
                     record = SQLiteRecord.from(buffer.?[addr..]);
                     self.pc += 1;
@@ -1956,7 +1957,7 @@ const Vm = struct {
                     var write_buf: [256]u8 = undefined;
                     var write_count: u8 = 0;
                     while (i < end_reg) : (i += 1) {
-                        const written = self.reg_list.items[i - 1].to_str(@constCast(write_buf[write_count..])) catch write_buf[write_count..];
+                        const written = self.reg_list.items[i - 1].toStr(@constCast(write_buf[write_count..])) catch write_buf[write_count..];
                         const written_len: u8 = @intCast(written.len);
                         debug("written len: {d}", .{written_len});
                         write_count += written_len;
@@ -1999,7 +2000,7 @@ const Vm = struct {
                     } else {
                         cell_count += 1;
 
-                        const addr = header.?.get_cell_addr(buffer.?, cell_count);
+                        const addr = header.?.getCellAddr(buffer.?, cell_count);
                         debug("cell address: {x}", .{addr});
                         record = SQLiteRecord.from(buffer.?[addr..]);
                         col_value = record.?.next();
@@ -2103,7 +2104,6 @@ fn parseStatement(str: [:0]u8, file_buffer: []u8) Error!void {
 
     var inst_gen = try InstGen.from(fixed_alloc.allocator(), &data, &insts, db, Stmt{ .select = statement });
 
-    // TODO: ast built, now translate into instructions for VM.
     debug("building instructions", .{});
     try inst_gen.buildInstructions();
     debug("inst generated!", .{});
