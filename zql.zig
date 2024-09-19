@@ -954,14 +954,13 @@ const Db = struct {
         self.buffer = new_slice;
         const bt_header = SQLiteBtHeader.from(new_slice[sqlite_header_size..]);
 
-        const cell_adr = bt_header.getCellAddr(new_slice[sqlite_header_size..], 0);
-        const cell_start = new_slice[cell_adr..];
+        var cell_index: u32 = 0;
+        while (cell_index < bt_header.getCellCount()) : (cell_index += 1) {
+            const cell_adr = bt_header.getCellAddr(new_slice[sqlite_header_size..], cell_index);
+            const cell_start = new_slice[cell_adr..];
 
-        var record = SQLiteRecord.from(cell_start);
-
-        // TODO: this could probably be refactored with comptime
-        debug("table record: {}", .{record});
-        while (true) {
+            var record = SQLiteRecord.from(cell_start);
+            debug("table record: {}", .{record});
             record.consume();
             record.consume();
 
