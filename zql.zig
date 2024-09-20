@@ -739,17 +739,19 @@ const SQLiteRecord = struct {
         var cell_size: u64 = 0;
         var cell_header_size: u64 = 0;
         var cursor: u32 = 0;
-        var cell_header_int: u32 = 0;
         var row_id: u64 = 0;
 
         // TODO: this only supports 0x0d pages. Support the other pages
         cursor += getVarint(buffer.ptr, &cell_size);
         cursor += getVarint(buffer.ptr + cursor, &row_id);
-        cell_header_int += getVarint(buffer.ptr + cursor, &cell_header_size);
 
-        cell_header_size -= cell_header_int;
-        cell_size -= cell_header_int;
-        cursor += cell_header_int;
+        // The cell header size in bytes is part of the header size and therefore also part of the cell size.
+        // However, we can read this once and then subtract it from the other sizes
+        const cell_header_int_size_bytes = getVarint(buffer.ptr + cursor, &cell_header_size);
+
+        cell_header_size -= cell_header_int_size_bytes;
+        cell_size -= cell_header_int_size_bytes;
+        cursor += cell_header_int_size_bytes;
 
         // TODO: extra validation to make sure its 32 bit size?
         return SQLiteRecord{
@@ -1905,20 +1907,27 @@ const Vm = struct {
                     // TODO: refactor this mess
                     cell_size = header.?.getCellCount();
                     debug("cell count: {d}", .{cell_size});
-                    const addr = header.?.getCellAddr(buffer.?, cell_count);
-                    debug("cell address: {x}", .{addr});
-                    record = SQLiteRecord.from(buffer.?[addr..]);
+                    if (cell_count != 0) {
+                        const addr = header.?.getCellAddr(buffer.?, cell_count);
+                        debug("cell address: {x}", .{addr});
+                        record = SQLiteRecord.from(buffer.?[addr..]);
+                    }
                     self.pc += 1;
                 },
                 .rewind => {
                     // TODO: escape when table is empty
-                    assert(record != null);
-                    col_value = record.?.next();
-                    if (col_value == null) {
-                        break;
+                    const end_inst = instruction.data.lhs;
+                    if (record != null) {
+                        col_value = record.?.next();
+                        if (col_value == null) {
+                            break;
+                        }
+                        col_count += 1;
+                        self.pc += 1;
+                    } else {
+                        debug("table is empty", .{});
+                        self.pc = end_inst;
                     }
-                    col_count += 1;
-                    self.pc += 1;
                 },
                 .row_id => {
                     assert(record != null);
