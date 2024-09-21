@@ -1713,6 +1713,12 @@ const InstGen = struct {
         _ = try self.addInst(.{ .opcode = .string, .data = .{ .lhs = store_reg, .rhs = extra_index } });
     }
 
+    fn integer(self: *InstGen, int: i64, store_reg: u32) Error!void {
+        const uint: u64 = @intCast(int);
+        const extra_index = try self.addExtra(.{ .upper = @as(u32, @truncate(uint >> 8)), .lower = @as(u32, @truncate(uint)) });
+        _ = try self.addInst(.{ .opcode = .int, .data = .{ .lhs = store_reg, .rhs = extra_index } });
+    }
+
     // The registers P1 through P1+P2-1 contain a single row of results. This opcode causes the sqlite3_step() call to terminate with an SQLITE_ROW return code
     // and it sets up the sqlite3_stmt structure to provide access to the r(P1)..r(P1+P2-1) values as the result row.
     fn resultRow(self: *InstGen, reg_index_start: u32, reg_index_end: u32) Error!void {
@@ -1828,7 +1834,8 @@ const InstGen = struct {
                     while (try traversal.next(self.gpa)) |cond| {
                         switch (cond.rhs) {
                             .str => try self.string(cond.rhs.str, store_reg),
-                            else => return Error.InvalidSyntax, // TODO: implement int, float
+                            .int => try self.integer(cond.rhs.int, store_reg),
+                            else => return Error.InvalidSyntax, // TODO: implement float
                         }
                         store_reg += 1;
                     }
@@ -1999,6 +2006,15 @@ const Vm = struct {
                     const str_index = extra.items[extra_index];
                     const str_len = extra.items[extra_index + 1];
                     try self.reg(store_reg, .{ .string = .{ .index = str_index, .len = str_len } });
+                    self.pc += 1;
+                },
+                .int => {
+                    const store_reg = instruction.data.lhs;
+                    const extra_index = instruction.data.rhs;
+                    const int_upper = extra.items[extra_index];
+                    const int_lower = extra.items[extra_index + 1];
+                    const int: i64 = (int_upper << 8) + int_lower;
+                    try self.reg(store_reg, .{ .int = int });
                     self.pc += 1;
                 },
                 .next => {
