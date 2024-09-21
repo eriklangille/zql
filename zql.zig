@@ -1,18 +1,18 @@
-const heap = @import("std").heap;
-const MultiArrayList = @import("std").MultiArrayList;
-const assert = @import("std").debug.assert;
-const fmt = @import("std").fmt;
-const io = @import("std").io;
-const FixedBufferStream = @import("std").io.FixedBufferStream;
-const panic = @import("std").debug.panic;
-const StaticStringMap = @import("std").StaticStringMapWithEql;
-const eqlLenIgnoreCase = @import("std").static_string_map.eqlAsciiIgnoreCase;
-const eql = @import("std").mem.eql;
-const ArrayListUnmanaged = @import("std").ArrayListUnmanaged;
-const Allocator = @import("std").mem.Allocator;
-const maxInt = @import("std").math.maxInt;
-const meta = @import("std").meta;
-// TODO: clean up imports
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const ArrayListUnmanaged = std.ArrayListUnmanaged;
+const assert = std.debug.assert;
+const eql = std.mem.eql;
+const eqlLenIgnoreCase = std.static_string_map.eqlAsciiIgnoreCase;
+const FixedBufferStream = std.io.FixedBufferStream;
+const fmt = std.fmt;
+const heap = std.heap;
+const io = std.io;
+const maxInt = std.math.maxInt;
+const meta = std.meta;
+const MultiArrayList = std.MultiArrayList;
+const panic = std.debug.panic;
+const StaticStringMap = std.StaticStringMapWithEql;
 
 // (arrayPointer: i32, length: i32)
 extern fn print(ptr: [*]const u8, len: usize) void;
