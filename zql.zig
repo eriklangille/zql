@@ -19,6 +19,8 @@ extern fn print(ptr: [*]const u8, len: usize) void;
 
 extern fn readBuffer(ptr: [*]const u8, offset: usize, len: usize) void;
 
+extern fn renderRow(ptr: [*]const u8, len: usize) void;
+
 export fn malloc(size: usize) ?*u8 {
     const page_allocator = heap.page_allocator;
     const mem = page_allocator.alloc(u8, size) catch null;
@@ -715,6 +717,45 @@ const Register = union(enum) {
             .str => try fmt.bufPrint(buffer, "{s}", .{self.str}),
             .string => try fmt.bufPrint(buffer, "{s}", .{self.string.str()}),
             .binary => try fmt.bufPrint(buffer, "[binary]", .{}),
+        };
+    }
+
+    pub fn toBuf(self: Register, buffer: []u8) anyerror![]u8 {
+        return switch (self) {
+            .none => {
+                if (buffer.len == 0) return Allocator.Error.OutOfMemory;
+                buffer[0] = 0;
+                return buffer[1..];
+            },
+            .int => {
+                if (buffer.len < 9) return Allocator.Error.OutOfMemory;
+                buffer[0] = 1;
+                buffer[1..9].* = std.mem.toBytes(self.int);
+                return buffer[9..];
+            },
+            .float => {
+                if (buffer.len < 9) return Allocator.Error.OutOfMemory;
+                buffer[0] = 2;
+                buffer[1..9].* = std.mem.toBytes(self.float);
+                return buffer[9..];
+            },
+            .str => {
+                if (buffer.len < self.str.len + 1) return Allocator.Error.OutOfMemory;
+                buffer[0] = 3;
+                return fmt.bufPrint(buffer, "{s}", .{self.str});
+            },
+            .string => {
+                if (buffer.len < self.string.len + 1) return Allocator.Error.OutOfMemory;
+                buffer[0] = 3;
+                return fmt.bufPrint(buffer, "{s}", .{self.string.str()});
+            },
+            .binary => {
+                if (buffer.len < self.binary.len + 1) return Allocator.Error.OutOfMemory;
+                buffer[0] = 4;
+                const len = self.binary.len;
+                @memcpy(buffer[1..len], self.binary);
+                return buffer[len..];
+            },
         };
     }
 };
@@ -1970,9 +2011,14 @@ const Vm = struct {
                     // TODO: callback method to handle these regs or smth. Right now we will simply log them to console
                     var i = start_reg;
                     var write_buf: [256]u8 = undefined;
+                    var row_buf: [512]u8 = undefined;
+                    var row_buf_written: u32 = 0;
                     var write_count: u8 = 0;
                     while (i < end_reg) : (i += 1) {
-                        const written = self.reg_list.items[i - 1].toStr(@constCast(write_buf[write_count..])) catch write_buf[write_count..];
+                        const cur_reg = self.reg_list.items[i - 1];
+                        const written = cur_reg.toStr(@constCast(write_buf[write_count..])) catch write_buf[write_count..];
+                        const written_row = cur_reg.toBuf(row_buf[row_buf_written..]) catch row_buf[row_buf_written..];
+                        row_buf_written += written_row.len;
                         const written_len: u8 = @intCast(written.len);
                         debug("written len: {d}", .{written_len});
                         write_count += written_len;
@@ -1982,6 +2028,7 @@ const Vm = struct {
                         }
                     }
                     print(write_buf[0..write_count].ptr, write_buf[0..write_count].len);
+                    renderRow(row_buf[0..row_buf_written].ptr, row_buf[0..row_buf_written].len);
                     self.pc += 1;
                 },
                 .neq, .eq => {

@@ -15,6 +15,23 @@ function print(arrayPointer, length) {
   console.log(string);
 }
 
+function renderRow(arrayPointer, length) {
+  const memory = new Uint8Array(instance.exports.memory.buffer, arrayPointer, length);
+  const dataView = new DataView(memory.buffer);
+  let i = 0;
+  while (i < length) {
+    const colType = dataView.getUInt32(0);
+    switch (colType) {
+      case 1: // Integer
+        
+        break;
+    
+      default:
+        break;
+    }
+  }
+}
+
 function readBuffer(writePointer, readPointer, length) {
   if (fileReader == null || instance == null) return;
   console.log('writePointer:', writePointer, 'readPointer:', readPointer, 'length:', length);
@@ -74,6 +91,7 @@ function main() {
     env: {
       print: print,
       readBuffer: readBuffer,
+      renderRow: renderRow,
     }
   }).then(results => {
     instance = results.instance;
