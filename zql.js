@@ -15,21 +15,66 @@ function print(arrayPointer, length) {
   console.log(string);
 }
 
+function clearTable() {
+  const tableBody = document.querySelector("#myTable tbody");
+  tableBody.innerHTML = '';
+}
+
+function addTableRow(array) {
+  const tableBody = document.querySelector("#myTable tbody");
+  const tr = document.createElement("tr");
+  array.forEach(value => {
+    const td = document.createElement("td");
+    td.textContent = value;
+    tr.appendChild(td)
+  });
+  tableBody.appendChild(tr);
+}
+
 function renderRow(arrayPointer, length) {
   const memory = new Uint8Array(instance.exports.memory.buffer, arrayPointer, length);
-  const dataView = new DataView(memory.buffer);
-  let i = 0;
-  while (i < length) {
-    const colType = dataView.getUInt32(0);
+  const dataView = new DataView(instance.exports.memory.buffer);
+  const colCount = dataView.getUint32(arrayPointer, true)
+  let i = 4;
+  let row = [];
+  let colIndex = 0;
+  while (colIndex <= colCount && i < length) {
+    const colType = dataView.getUint32(i + arrayPointer, true);
+    i += 4;
     switch (colType) {
-      case 1: // Integer
-        
+      case 0: // Null value
+        row.push(null);
         break;
-    
+      case 1: // Integer
+        const intValue = dataView.getBigInt64(i + arrayPointer, true);
+        row.push(intValue);
+        i += 8;
+        break;
+      case 2: // Float
+        row.push(dataView.getFloat64(i + arrayPointer, true));
+        i += 8;
+        break;
+      case 3: // string
+        const str_len = dataView.getUint32(i + arrayPointer, true);
+        i += 4;
+        const memSlice = memory.slice(i, i + str_len);
+        const str = new TextDecoder().decode(memSlice);
+        row.push(str);
+        i += str_len;
+        break;
+      case 4: // binary
+        const byte_len = dataView.getUint32(i, true);
+        i += 4;
+        row.push(memory.buffer.slice(i + arrayPointer, i + arrayPointer + byte_len));
+        i += len;
+        break;
       default:
+        console.error("Invalid colType: " + colType);
         break;
     }
+    colIndex += 1;
   }
+  addTableRow(row);
 }
 
 function readBuffer(writePointer, readPointer, length) {

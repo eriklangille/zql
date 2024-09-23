@@ -723,38 +723,45 @@ const Register = union(enum) {
     pub fn toBuf(self: Register, buffer: []u8) anyerror![]u8 {
         return switch (self) {
             .none => {
-                if (buffer.len == 0) return Allocator.Error.OutOfMemory;
-                buffer[0] = 0;
-                return buffer[1..];
+                if (buffer.len < 4) return Allocator.Error.OutOfMemory;
+                buffer[0..4].* = std.mem.toBytes(@as(u32, 0));
+                return buffer[0..4];
             },
             .int => {
-                if (buffer.len < 9) return Allocator.Error.OutOfMemory;
-                buffer[0] = 1;
-                buffer[1..9].* = std.mem.toBytes(self.int);
-                return buffer[9..];
+                if (buffer.len < 12) return Allocator.Error.OutOfMemory;
+                buffer[0..4].* = std.mem.toBytes(@as(u32, 1));
+                buffer[4..12].* = std.mem.toBytes(self.int);
+                return buffer[0..12];
             },
             .float => {
-                if (buffer.len < 9) return Allocator.Error.OutOfMemory;
-                buffer[0] = 2;
-                buffer[1..9].* = std.mem.toBytes(self.float);
-                return buffer[9..];
+                if (buffer.len < 12) return Allocator.Error.OutOfMemory;
+                buffer[0..4].* = std.mem.toBytes(@as(u32, 2));
+                buffer[4..12].* = std.mem.toBytes(self.float);
+                return buffer[0..12];
             },
             .str => {
-                if (buffer.len < self.str.len + 1) return Allocator.Error.OutOfMemory;
-                buffer[0] = 3;
-                return fmt.bufPrint(buffer, "{s}", .{self.str});
+                if (buffer.len < self.str.len + 8) return Allocator.Error.OutOfMemory;
+                buffer[0..4].* = std.mem.toBytes(@as(u32, 3));
+                const len = self.str.len;
+                buffer[4..8].* = std.mem.toBytes(len);
+                const fmt_slice = try fmt.bufPrint(buffer[8..], "{s}", .{self.str});
+                return buffer[0 .. 8 + fmt_slice.len];
             },
             .string => {
-                if (buffer.len < self.string.len + 1) return Allocator.Error.OutOfMemory;
-                buffer[0] = 3;
-                return fmt.bufPrint(buffer, "{s}", .{self.string.str()});
+                if (buffer.len < self.string.len + 8) return Allocator.Error.OutOfMemory;
+                buffer[0..4].* = std.mem.toBytes(@as(u32, 3));
+                const len = self.string.len;
+                buffer[4..8].* = std.mem.toBytes(len);
+                const fmt_slice = try fmt.bufPrint(buffer[8..], "{s}", .{self.string.str()});
+                return buffer[0 .. 8 + fmt_slice.len];
             },
             .binary => {
-                if (buffer.len < self.binary.len + 1) return Allocator.Error.OutOfMemory;
-                buffer[0] = 4;
+                if (buffer.len < self.binary.len + 8) return Allocator.Error.OutOfMemory;
+                buffer[0..4].* = std.mem.toBytes(@as(u32, 4));
                 const len = self.binary.len;
-                @memcpy(buffer[1..len], self.binary);
-                return buffer[len..];
+                buffer[4..8].* = std.mem.toBytes(len);
+                @memcpy(buffer[8..], self.binary);
+                return buffer[0 .. len + 8];
             },
         };
     }
@@ -1954,8 +1961,8 @@ const Vm = struct {
                     header = SQLiteBtHeader.from(buffer.?);
                     // TODO: refactor this mess
                     cell_size = header.?.getCellCount();
-                    debug("cell count: {d}", .{cell_size});
-                    if (cell_count != 0) {
+                    debug("cell size: {d}", .{cell_size});
+                    if (cell_size != 0) {
                         const addr = header.?.getCellAddr(buffer.?, cell_count);
                         debug("cell address: {x}", .{addr});
                         record = SQLiteRecord.from(buffer.?[addr..]);
@@ -1963,7 +1970,6 @@ const Vm = struct {
                     self.pc += 1;
                 },
                 .rewind => {
-                    // TODO: escape when table is empty
                     const end_inst = instruction.data.lhs;
                     if (record != null) {
                         col_value = record.?.next();
@@ -2008,12 +2014,14 @@ const Vm = struct {
                     const start_reg = instruction.data.lhs;
                     const end_reg = instruction.data.rhs;
 
-                    // TODO: callback method to handle these regs or smth. Right now we will simply log them to console
+                    // TODO: refactor this mess. Probably own struct for writing..
                     var i = start_reg;
+                    const len: u32 = end_reg - start_reg;
                     var write_buf: [256]u8 = undefined;
                     var row_buf: [512]u8 = undefined;
-                    var row_buf_written: u32 = 0;
+                    var row_buf_written: u32 = 4;
                     var write_count: u8 = 0;
+                    row_buf[0..4].* = std.mem.toBytes(len);
                     while (i < end_reg) : (i += 1) {
                         const cur_reg = self.reg_list.items[i - 1];
                         const written = cur_reg.toStr(@constCast(write_buf[write_count..])) catch write_buf[write_count..];
