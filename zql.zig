@@ -309,6 +309,7 @@ const Tokenizer = struct {
     const State = enum {
         asterisk,
         double_quote_word,
+        exclamation,
         float,
         identifier,
         int,
@@ -384,6 +385,9 @@ const Tokenizer = struct {
                         self.index += 1;
                         break;
                     },
+                    '!' => {
+                        state = .exclamation;
+                    },
                     '*' => {
                         token.type = .asterisk;
                         self.index += 1;
@@ -450,6 +454,16 @@ const Tokenizer = struct {
                         break;
                     },
                 },
+                .exclamation => switch (c) {
+                    '=' => {
+                        token.type = TokenType.ne;
+                        self.index += 1;
+                        break;
+                    },
+                    else => {
+                        token.type = TokenType.invalid;
+                    },
+                },
                 else => {
                     break;
                 },
@@ -500,16 +514,17 @@ const ConditionRef = struct {
         const element = element_list.get(self.index);
 
         switch (element.tag) {
-            .compare_eq_int, .compare_eq_str => return .{
+            .compare_eq_int, .compare_eq_str, .compare_ne_int, .compare_ne_str => return .{
                 .equality = switch (element.tag) {
                     .compare_eq_str, .compare_eq_float, .compare_eq_int => .compare_eq,
+                    .compare_ne_str, .compare_ne_float, .compare_ne_int => .compare_ne,
                     else => unreachable, // handled in different case
                 },
                 .lhs = .{ .column_id = element.data.lhs },
                 .rhs = switch (element.tag) {
-                    .compare_eq_str => .{ .str = element.value.str },
-                    .compare_eq_int => .{ .int = element.value.int },
-                    .compare_eq_float => .{ .float = element.value.float },
+                    .compare_eq_str, .compare_ne_str => .{ .str = element.value.str },
+                    .compare_eq_int, .compare_ne_int => .{ .int = element.value.int },
+                    .compare_eq_float, .compare_ne_float => .{ .float = element.value.float },
                     else => unreachable,
                 },
             },
@@ -1454,8 +1469,9 @@ const ASTGen = struct {
                     else => break,
                 },
                 .where_rhs => {
-                    debug("where rhs eq: {?}, col_index: {d}", .{ equality, col_index.? });
+                    debug("where_rhs eq: {?}, col_index: {d}", .{ equality, col_index.? });
                     if (equality == null or col_index == null) {
+                        debug("where_rhs missing", .{});
                         return Error.InvalidSyntax;
                     }
                     switch (token.tag) {
@@ -1831,7 +1847,11 @@ const InstGen = struct {
                         reg_count += 1;
                         switch (traversal.current_condition) {
                             .condition_or => {
-                                try self.eq(compare_reg, reg_count);
+                                if (cond.equality == .compare_eq) {
+                                    try self.eq(compare_reg, reg_count);
+                                } else {
+                                    try self.neq(compare_reg, reg_count);
+                                }
                                 try comparisons.append(self.gpa, self.inst_list.len - 1);
                             },
                             else => return Error.InvalidSyntax, // TODO: implement and clause
