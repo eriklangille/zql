@@ -16,12 +16,21 @@ let databaseFile = null;
  */
 
 async function loadZQL() {
+  /**
+   * Prints a string to the console from WebAssembly memory.
+   * @param {number} arrayPointer - The pointer to the start of the string in WebAssembly memory.
+   * @param {number} length - The length of the string to print.
+   */
   function print(arrayPointer, length) {
     const memory = new Uint8Array(instance.exports.memory.buffer, arrayPointer, length);
     const string = new TextDecoder().decode(memory);
     console.log(string);
   }
 
+  /**
+   * Adds a new row to the table with the given array of values.
+   * @param {Array} array - An array of values to be added as cells in the new row.
+   */
   function addTableRow(array) {
     const tableBody = document.querySelector("#myTable tbody");
     const tr = document.createElement("tr");
@@ -94,6 +103,26 @@ async function loadZQL() {
     memory.set(fileData.slice(readPointer, readPointer + length));
   }
 
+  async function exec(instance, filePromise, sqlStatement) {
+    const { malloc, runStatementWithFile, getStatementAddr } = instance.exports;
+    const dbFileBuffer = await filePromise;
+    const dbFile = new Uint8Array(dbFileBuffer.content);
+    console.log(dbFile);
+    const readBuffer = malloc(BUFFER_SIZE);
+
+    const encoder = new TextEncoder();
+    const sqlArray = encoder.encode(sqlStatement);
+    const sqlArrayTerminator = new Uint8Array(sqlArray.length + 1);
+    sqlArrayTerminator.set(sqlArray);
+    sqlArrayTerminator[sqlArray.length] = 0;
+    const sqlAddress = getStatementAddr();
+
+    const memory = new Uint8Array(instance.exports.memory.buffer);
+    memory.set(dbFile.slice(0, SQLITE_HEADER_SIZE), readBuffer);
+    memory.set(sqlArrayTerminator.slice(0, MAX_STATEMENT_LEN), sqlAddress);
+    runStatementWithFile(readBuffer, SQLITE_HEADER_SIZE);
+  }
+
   const results = await WebAssembly.instantiateStreaming(fetch('zql.wasm'), {
     env: {
       print: print,
@@ -103,8 +132,11 @@ async function loadZQL() {
   })
 
   instance = results.instance;
-  console.log(instance.exports);
-  return instance;
+  console.log('WASM Loaded, instance:', instance);
+
+  return {
+    exec: exec.bind(this, instance)
+  }
 }
 
 function clearTable() {
@@ -154,35 +186,22 @@ async function getFile(name) {
   return databaseFile;
 }
 
-async function handle(instance, filePromise) {
-  console.log('WASM Loaded, instance:', instance);
-  const { malloc, runStatementWithFile, getStatementAddr } = instance.exports;
-  const dbFileBuffer = await filePromise;
-  const dbFile = new Uint8Array(dbFileBuffer.content);
-  console.log(dbFile);
-  const inputSqlStatement = document.getElementById('statementInput');
-  const sqlStatement = inputSqlStatement.value;
-  console.log(`statementInput: ${sqlStatement}`);
-  const readBuffer = malloc(BUFFER_SIZE);
 
-  const encoder = new TextEncoder();
-  const sqlArray = encoder.encode(sqlStatement);
-  const sqlArrayTerminator = new Uint8Array(sqlArray.length + 1);
-  sqlArrayTerminator.set(sqlArray);
-  sqlArrayTerminator[sqlArray.length] = 0;
-  const sqlAddress = getStatementAddr();
-
-  const memory = new Uint8Array(instance.exports.memory.buffer);
-  memory.set(dbFile.slice(0, SQLITE_HEADER_SIZE), readBuffer);
-  memory.set(sqlArrayTerminator.slice(0, MAX_STATEMENT_LEN), sqlAddress);
-  runStatementWithFile(readBuffer, SQLITE_HEADER_SIZE);
+function getSQLInput() {
+    const inputSqlStatement = document.getElementById('statementInput');
+    const sqlStatement = inputSqlStatement.value;
+    console.log(`statementInput: ${sqlStatement}`);
+    return sqlStatement;
 }
 
 function main() {
   // loadZQL().then(instance => handle(instance, listenForInputFile()));
 
   // Get file using fetch
-  loadZQL().then(instance => handle(instance, getFile('test.db')));
+  loadZQL().then(zql => {
+    zql.exec(getFile('test.db'), getSQLInput());
+  });
+  // TODO: decouple file fetching from executing statements on that file
 }
 
 main();
