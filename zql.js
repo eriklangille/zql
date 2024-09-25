@@ -103,12 +103,19 @@ async function loadZQL() {
     memory.set(fileData.slice(readPointer, readPointer + length));
   }
 
-  async function exec(instance, filePromise, sqlStatement) {
+  async function load(instance, filePromise) {
     const { malloc, runStatementWithFile, getStatementAddr } = instance.exports;
     const dbFileBuffer = await filePromise;
     const dbFile = new Uint8Array(dbFileBuffer.content);
     console.log(dbFile);
-    const readBuffer = malloc(BUFFER_SIZE);
+
+    console.log(this.bufferAddress); // TODO: this is broken/doesn't work
+    const memory = new Uint8Array(instance.exports.memory.buffer);
+    memory.set(dbFile.slice(0, SQLITE_HEADER_SIZE), this.bufferAddress);
+  }
+  // TODO: make into class
+  async function exec(instance, sqlStatement) {
+    const { malloc, runStatementWithFile, getStatementAddr } = instance.exports;
 
     const encoder = new TextEncoder();
     const sqlArray = encoder.encode(sqlStatement);
@@ -118,9 +125,8 @@ async function loadZQL() {
     const sqlAddress = getStatementAddr();
 
     const memory = new Uint8Array(instance.exports.memory.buffer);
-    memory.set(dbFile.slice(0, SQLITE_HEADER_SIZE), readBuffer);
     memory.set(sqlArrayTerminator.slice(0, MAX_STATEMENT_LEN), sqlAddress);
-    runStatementWithFile(readBuffer, SQLITE_HEADER_SIZE);
+    runStatementWithFile(this.bufferAddress, SQLITE_HEADER_SIZE);
   }
 
   const results = await WebAssembly.instantiateStreaming(fetch('zql.wasm'), {
@@ -135,7 +141,9 @@ async function loadZQL() {
   console.log('WASM Loaded, instance:', instance);
 
   return {
-    exec: exec.bind(this, instance)
+    bufferAddress: instance.exports.malloc(BUFFER_SIZE),
+    exec: exec.bind(this, instance),
+    load: load.bind(this, instance),
   }
 }
 
@@ -199,7 +207,8 @@ function main() {
 
   // Get file using fetch
   loadZQL().then(zql => {
-    zql.exec(getFile('test.db'), getSQLInput());
+    // zql.exec(getFile('test.db'), getSQLInput());
+    zql.load(getFile('test.db')).then(zql.exec(getSQLInput()));
   });
   // TODO: decouple file fetching from executing statements on that file
 }
