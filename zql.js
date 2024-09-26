@@ -15,6 +15,7 @@ const MAX_STATEMENT_LEN = 512;
  */
 
 class ZqlDb {
+  rowListeners;
   #instance;
   #dbMemoryAddress;
   #dbFile;
@@ -25,6 +26,7 @@ class ZqlDb {
   * @param {WebAssembly.Instance} instance - The WebAssembly instance.
   */
   constructor () {
+    this.rowListeners = [];
     this.#instance = null;
     this.#dbMemoryAddress = null;
     this.#dbFile = null;
@@ -44,7 +46,7 @@ class ZqlDb {
     * Adds a new row to the table with the given array of values.
     * @param {Array} array - An array of values to be added as cells in the new row.
     */
-    function addTableRow(array) {
+    const addTableRow = (array) => {
       const tableBody = document.querySelector("#myTable tbody");
       const tr = document.createElement("tr");
       array.forEach(value => {
@@ -54,6 +56,7 @@ class ZqlDb {
       });
       tableBody.appendChild(tr);
     }
+    this.rowListeners.push(addTableRow);
 
     /**
     * Prints a string to the console from WebAssembly memory.
@@ -103,7 +106,13 @@ class ZqlDb {
         }
         colIndex += 1;
       }
-      addTableRow(row);
+      this.rowListeners.forEach(listener => {
+        try {
+          listener(row)
+        } catch (error) {
+          console.error(error);
+        }
+      });
     }
 
     /**
