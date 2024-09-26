@@ -6,116 +6,145 @@
 const BUFFER_SIZE = 1024 * 64; // 64 KiB
 const SQLITE_HEADER_SIZE = 100;
 const MAX_STATEMENT_LEN = 512;
-let instance = null;
-let databaseFile = null;
 
+// TODO: remove below. But it's an example on JSDoc Objects
 /**
  * @typedef {Object} DatabaseFile
  * @property {ArrayBuffer} content - The content of the file.
  * @property {boolean} isFetchResult - Whether the file was fetched from a server.
  */
 
-async function loadZQL() {
-  /**
-   * Prints a string to the console from WebAssembly memory.
-   * @param {number} arrayPointer - The pointer to the start of the string in WebAssembly memory.
-   * @param {number} length - The length of the string to print.
-   */
-  function print(arrayPointer, length) {
-    const memory = new Uint8Array(instance.exports.memory.buffer, arrayPointer, length);
-    const string = new TextDecoder().decode(memory);
-    console.log(string);
-  }
+class ZqlDb {
+  #instance;
+  #dbMemoryAddress;
+  #dbFile;
+  #env;
 
   /**
-   * Adds a new row to the table with the given array of values.
-   * @param {Array} array - An array of values to be added as cells in the new row.
-   */
-  function addTableRow(array) {
-    const tableBody = document.querySelector("#myTable tbody");
-    const tr = document.createElement("tr");
-    array.forEach(value => {
-      const td = document.createElement("td");
-      td.textContent = value;
-      tr.appendChild(td)
-    });
-    tableBody.appendChild(tr);
-  }
-
-  function renderRow(arrayPointer, length) {
-    const memory = new Uint8Array(instance.exports.memory.buffer, arrayPointer, length);
-    const dataView = new DataView(instance.exports.memory.buffer);
-    const colCount = dataView.getUint32(arrayPointer, true)
-    let i = 4;
-    let row = [];
-    let colIndex = 0;
-    while (colIndex <= colCount && i < length) {
-      const colType = dataView.getUint32(i + arrayPointer, true);
-      i += 4;
-      switch (colType) {
-        case 0: // Null value
-          row.push(null);
-          break;
-        case 1: // Integer
-          const intValue = dataView.getBigInt64(i + arrayPointer, true);
-          row.push(intValue);
-          i += 8;
-          break;
-        case 2: // Float
-          row.push(dataView.getFloat64(i + arrayPointer, true));
-          i += 8;
-          break;
-        case 3: // string
-          const str_len = dataView.getUint32(i + arrayPointer, true);
-          i += 4;
-          const memSlice = memory.slice(i, i + str_len);
-          const str = new TextDecoder().decode(memSlice);
-          row.push(str);
-          i += str_len;
-          break;
-        case 4: // binary
-          const byte_len = dataView.getUint32(i, true);
-          i += 4;
-          row.push(memory.buffer.slice(i + arrayPointer, i + arrayPointer + byte_len));
-          i += len;
-          break;
-        default:
-          console.error("Invalid colType: " + colType);
-          break;
-      }
-      colIndex += 1;
-    }
-    addTableRow(row);
-  }
-
-  /**
-  * Listens for a file input change event and resolves with the file data as a Uint8Array.
-  * @param {number} writePointer the address to write the memory
-  * @param {number} readPointer the address to read the memory from the file
-  * @param {number} length the number of bytes to read
+  * Creates a new ZqlDb instance.
+  * @param {WebAssembly.Instance} instance - The WebAssembly instance.
   */
-  function readBuffer(writePointer, readPointer, length) {
-    if (databaseFile == null || instance == null) return;
-    console.log('writePointer:', writePointer, 'readPointer:', readPointer, 'length:', length);
-    const memory = new Uint8Array(instance.exports.memory.buffer, writePointer, length);
-    const fileData = new Uint8Array(databaseFile.content);
-    console.log('Reading buffer from file:', fileData);
-    memory.set(fileData.slice(readPointer, readPointer + length));
+  constructor () {
+    this.#instance = null;
+    this.#dbMemoryAddress = null;
+    this.#dbFile = null;
+
+    /**
+    * Prints a string to the console from WebAssembly memory.
+    * @param {number} arrayPointer - The pointer to the start of the string in WebAssembly memory.
+    * @param {number} length - The length of the string to print.
+    */
+    const print = (arrayPointer, length) => {
+      const memory = new Uint8Array(this.#instance.exports.memory.buffer, arrayPointer, length);
+      const string = new TextDecoder().decode(memory);
+      console.log(string);
+    }
+
+    /**
+    * Adds a new row to the table with the given array of values.
+    * @param {Array} array - An array of values to be added as cells in the new row.
+    */
+    function addTableRow(array) {
+      const tableBody = document.querySelector("#myTable tbody");
+      const tr = document.createElement("tr");
+      array.forEach(value => {
+        const td = document.createElement("td");
+        td.textContent = value;
+        tr.appendChild(td)
+      });
+      tableBody.appendChild(tr);
+    }
+
+    /**
+    * Prints a string to the console from WebAssembly memory.
+    * @param {number} arrayPointer - The pointer to the start of the string in WebAssembly memory.
+    * @param {number} length - The length of the string to print.
+    */
+    const renderRow = (arrayPointer, length) => {
+      const memory = new Uint8Array(this.#instance.exports.memory.buffer, arrayPointer, length);
+      const dataView = new DataView(this.#instance.exports.memory.buffer);
+      const colCount = dataView.getUint32(arrayPointer, true)
+      let i = 4;
+      let row = [];
+      let colIndex = 0;
+      while (colIndex <= colCount && i < length) {
+        const colType = dataView.getUint32(i + arrayPointer, true);
+        i += 4;
+        switch (colType) {
+          case 0: // Null value
+            row.push(null);
+            break;
+          case 1: // Integer
+            const intValue = dataView.getBigInt64(i + arrayPointer, true);
+            row.push(intValue);
+            i += 8;
+            break;
+          case 2: // Float
+            row.push(dataView.getFloat64(i + arrayPointer, true));
+            i += 8;
+            break;
+          case 3: // string
+            const str_len = dataView.getUint32(i + arrayPointer, true);
+            i += 4;
+            const memSlice = memory.slice(i, i + str_len);
+            const str = new TextDecoder().decode(memSlice);
+            row.push(str);
+            i += str_len;
+            break;
+          case 4: // binary
+            const byte_len = dataView.getUint32(i, true);
+            i += 4;
+            row.push(memory.buffer.slice(i + arrayPointer, i + arrayPointer + byte_len));
+            i += len;
+            break;
+          default:
+            console.error("Invalid colType: " + colType);
+            break;
+        }
+        colIndex += 1;
+      }
+      addTableRow(row);
+    }
+
+    /**
+    * Listens for a file input change event and resolves with the file data as a Uint8Array.
+    * @param {number} writePointer the address to write the memory
+    * @param {number} readPointer the address to read the memory from the file
+    * @param {number} length the number of bytes to read
+    */
+    const readBuffer = (writePointer, readPointer, length) => {
+      if (this.#dbFile == null || this.#instance == null) return;
+      console.log('writePointer:', writePointer, 'readPointer:', readPointer, 'length:', length);
+      const memory = new Uint8Array(this.#instance.exports.memory.buffer, writePointer, length);
+      const fileData = new Uint8Array(this.#dbFile);
+      console.log('Reading buffer from file:', fileData);
+      memory.set(fileData.slice(readPointer, readPointer + length));
+    }
+
+    this.#env = {
+      print: print,
+      readBuffer: readBuffer,
+      renderRow: renderRow,
+    }
   }
 
-  async function load(instance, filePromise) {
-    const { malloc, runStatementWithFile, getStatementAddr } = instance.exports;
-    const dbFileBuffer = await filePromise;
-    const dbFile = new Uint8Array(dbFileBuffer.content);
-    console.log(dbFile);
+  async init() {
+    const results = await WebAssembly.instantiateStreaming(fetch('zql.wasm'), {
+      env: this.#env,
+    })
 
-    console.log(this.bufferAddress); // TODO: this is broken/doesn't work
-    const memory = new Uint8Array(instance.exports.memory.buffer);
-    memory.set(dbFile.slice(0, SQLITE_HEADER_SIZE), this.bufferAddress);
+    console.log('WASM Loaded, instance:', results.instance);
+    this.#instance = results.instance;
+    this.#dbMemoryAddress = results.instance.exports.malloc(BUFFER_SIZE);
   }
-  // TODO: make into class
-  async function exec(instance, sqlStatement) {
-    const { malloc, runStatementWithFile, getStatementAddr } = instance.exports;
+
+  /**
+  * Executes an SQL statement.
+  * @param {string} sqlStatement - The SQL statement to execute.
+  * @returns {Promise<void>}
+  */
+  async exec(sqlStatement) {
+    const { runStatementWithFile, getStatementAddr } = this.#instance.exports;
 
     const encoder = new TextEncoder();
     const sqlArray = encoder.encode(sqlStatement);
@@ -124,27 +153,32 @@ async function loadZQL() {
     sqlArrayTerminator[sqlArray.length] = 0;
     const sqlAddress = getStatementAddr();
 
-    const memory = new Uint8Array(instance.exports.memory.buffer);
+    const memory = new Uint8Array(this.#instance.exports.memory.buffer);
     memory.set(sqlArrayTerminator.slice(0, MAX_STATEMENT_LEN), sqlAddress);
-    runStatementWithFile(this.bufferAddress, SQLITE_HEADER_SIZE);
+    runStatementWithFile(this.#dbMemoryAddress, SQLITE_HEADER_SIZE);
   }
 
-  const results = await WebAssembly.instantiateStreaming(fetch('zql.wasm'), {
-    env: {
-      print: print,
-      readBuffer: readBuffer,
-      renderRow: renderRow,
-    }
-  })
+  /**
+  * Loads a database file into memory.
+  * @param {Promise<DatabaseFile>} filePromise - A promise that resolves to the database file.
+  * @returns {Promise<void>}
+  */
+  async loadFile(filePromise) {
+    const dbFileBuffer = await filePromise;
+    const dbFile = new Uint8Array(dbFileBuffer);
+    this.#dbFile = dbFile;
+    console.log(dbFile);
 
-  instance = results.instance;
-  console.log('WASM Loaded, instance:', instance);
-
-  return {
-    bufferAddress: instance.exports.malloc(BUFFER_SIZE),
-    exec: exec.bind(this, instance),
-    load: load.bind(this, instance),
+    const memory = new Uint8Array(this.#instance.exports.memory.buffer);
+    memory.set(dbFile.slice(0, SQLITE_HEADER_SIZE), this.#dbMemoryAddress);
+    console.log("DB loaded");
   }
+}
+
+async function loadZQL() {
+  const zql = new ZqlDb();
+  await zql.init();
+  return zql;
 }
 
 function clearTable() {
@@ -163,10 +197,7 @@ async function listenForInputFile() {
       const reader = new FileReader();
       reader.onload = (e) => {
         const readerResult = e.target.result;
-        databaseFile = {
-          content: readerResult,
-          isFetchResult: false,
-        };
+        databaseFile = readerResult;
         resolve(databaseFile);
       };
       reader.onerror = (e) => {
@@ -185,12 +216,7 @@ async function getFile(name) {
   }
 
   const arrayBuffer = await response.arrayBuffer();
-
-  databaseFile = {
-    content: arrayBuffer,
-    isFetchResult: true,
-  };
-
+  databaseFile = arrayBuffer;
   return databaseFile;
 }
 
@@ -203,14 +229,11 @@ function getSQLInput() {
 }
 
 function main() {
-  // loadZQL().then(instance => handle(instance, listenForInputFile()));
-
   // Get file using fetch
-  loadZQL().then(zql => {
-    // zql.exec(getFile('test.db'), getSQLInput());
-    zql.load(getFile('test.db')).then(zql.exec(getSQLInput()));
+  loadZQL().then(async (zql) => {
+    await zql.loadFile(getFile('test.db'));
+    await zql.exec(getSQLInput());
   });
-  // TODO: decouple file fetching from executing statements on that file
 }
 
 main();
