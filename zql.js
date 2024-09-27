@@ -237,11 +237,35 @@ function getSQLInput() {
     return sqlStatement;
 }
 
+function assert(condition, message) {
+  if (!condition) {
+    throw new Error(message || "Assertion failed");
+  }
+}
+
+async function runTests(zql) {
+  rows = [];
+  const testListener = (row) => {
+    rows.push(row);
+  };
+  zql.rowListeners.push(testListener);
+  rows.splice(0, rows.length); // clear array
+  await zql.exec("select * from example");
+  assert(rows.length == 3, "row length");
+  assert(rows[0][1] == "Alice", "row name");
+  console.log("tests passed!")
+}
+
 function main() {
-  // Get file using fetch
   loadZQL().then(async (zql) => {
-    await zql.loadFile(getFile('test.db'));
-    await zql.exec(getSQLInput());
+
+    const button = document.getElementById('test-button');
+    button.addEventListener('click', async () => {
+        await zql.loadFile(getFile('test.db'));
+        runTests(zql);
+    });
+
+    await zql.loadFile(listenForInputFile()).then(() => zql.exec(getSQLInput()));
   });
 }
 
