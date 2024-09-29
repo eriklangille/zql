@@ -81,4 +81,3 @@ loadZQL().then(async (zql) => {
     await zql.exec(getSQLInput());
 });
 
-

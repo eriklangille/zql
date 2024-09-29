@@ -23,7 +23,6 @@ class ZqlDb {
 
   /**
   * Creates a new ZqlDb instance.
-  * @param {WebAssembly.Instance} instance - The WebAssembly instance.
   */
   constructor () {
     this.rowListeners = [];
@@ -122,9 +121,10 @@ class ZqlDb {
   }
 
   async init() {
-    const results = await WebAssembly.instantiateStreaming(fetch('zql.wasm'), {
-      env: this.#env,
-    })
+    const results = await (typeof process === 'object'
+      ? WebAssembly.instantiate(await import('fs/promises').then(fs => fs.readFile('../zql.wasm')), { env: this.#env })
+      : WebAssembly.instantiateStreaming(fetch('./zql.wasm'), { env: this.#env })
+    );
 
     console.log('WASM Loaded, instance:', results.instance);
     this.#instance = results.instance;
