@@ -43,22 +43,6 @@ class ZqlDb {
     }
 
     /**
-    * Adds a new row to the table with the given array of values.
-    * @param {Array} array - An array of values to be added as cells in the new row.
-    */
-    const addTableRow = (array) => {
-      const tableBody = document.querySelector("#myTable tbody");
-      const tr = document.createElement("tr");
-      array.forEach(value => {
-        const td = document.createElement("td");
-        td.textContent = value;
-        tr.appendChild(td)
-      });
-      tableBody.appendChild(tr);
-    }
-    this.rowListeners.push(addTableRow);
-
-    /**
     * Prints a string to the console from WebAssembly memory.
     * @param {number} arrayPointer - The pointer to the start of the string in WebAssembly memory.
     * @param {number} length - The length of the string to print.
@@ -184,37 +168,10 @@ class ZqlDb {
   }
 }
 
-async function loadZQL() {
+export default async function loadZQL() {
   const zql = new ZqlDb();
   await zql.init();
   return zql;
-}
-
-function clearTable() {
-  const tableBody = document.querySelector("#myTable tbody");
-  tableBody.innerHTML = '';
-}
-
-/**
- * Listens for a file input change event and resolves with the file data as a Uint8Array.
- * @returns {Promise<DatabaseFile>} A promise that resolves with the file data as a Uint8Array.
- */
-async function listenForInputFile() {
-  return new Promise((resolve, reject) => {
-    document.getElementById('fileInput').addEventListener('change', (e) => {
-      const file = e.target.files[0];
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const readerResult = e.target.result;
-        databaseFile = readerResult;
-        resolve(databaseFile);
-      };
-      reader.onerror = (e) => {
-        reject(e);
-      };
-      reader.readAsArrayBuffer(file);
-    });
-  });
 }
 
 async function getFile(name) {
@@ -229,44 +186,3 @@ async function getFile(name) {
   return databaseFile;
 }
 
-
-function getSQLInput() {
-    const inputSqlStatement = document.getElementById('statementInput');
-    const sqlStatement = inputSqlStatement.value;
-    console.log(`statementInput: ${sqlStatement}`);
-    return sqlStatement;
-}
-
-function assert(condition, message) {
-  if (!condition) {
-    throw new Error(message || "Assertion failed");
-  }
-}
-
-async function runTests(zql) {
-  rows = [];
-  const testListener = (row) => {
-    rows.push(row);
-  };
-  zql.rowListeners.push(testListener);
-  rows.splice(0, rows.length); // clear array
-  await zql.exec("select * from example");
-  assert(rows.length == 3, "row length");
-  assert(rows[0][1] == "Alice", "row name");
-  console.log("tests passed!")
-}
-
-function main() {
-  loadZQL().then(async (zql) => {
-
-    const button = document.getElementById('test-button');
-    button.addEventListener('click', async () => {
-        await zql.loadFile(getFile('test.db'));
-        runTests(zql);
-    });
-
-    await zql.loadFile(listenForInputFile()).then(() => zql.exec(getSQLInput()));
-  });
-}
-
-main();
