@@ -22,7 +22,7 @@ loadZQL().then(async (zql) => {
     }
     zql.rowListeners.push(addTableRow);
 
-    await zql.loadFile(getFile('../test.db'));
+    await zql.loadFile(getFile('./test.db'));
     await zql.exec('select * from example;');
 });
 

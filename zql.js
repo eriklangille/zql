@@ -122,7 +122,10 @@ class ZqlDb {
 
   async init() {
     const results = await (typeof process === 'object'
-      ? WebAssembly.instantiate(await import('fs/promises').then(fs => fs.readFile('../zql.wasm')), { env: this.#env })
+      ? WebAssembly.instantiate(await import('fs/promises').then(async (fs) => {
+          const path = await import('path');
+          return fs.readFile(path.join(process.cwd(), './zql.wasm'));
+        }), { env: this.#env })
       : WebAssembly.instantiateStreaming(fetch('./zql.wasm'), { env: this.#env })
     );
 
