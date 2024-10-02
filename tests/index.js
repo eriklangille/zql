@@ -1,5 +1,6 @@
-import loadZQL from '../zql.js';
 import { promises as fs } from 'fs';
+import { DatabaseSync } from 'node:sqlite';
+import loadZQL from '../zql.js';
 
 async function getFile(name) {
   try {
@@ -10,7 +11,13 @@ async function getFile(name) {
   }
 }
 
-console.log("LOADING")
+console.log("Loading SQLite");
+const sql = new DatabaseSync('./test.db');
+const query = sql.prepare('SELECT * FROM example');
+
+console.log(query.all());
+
+console.log("Loading ZQL");
 
 loadZQL().then(async (zql) => {
     /**
