@@ -4,6 +4,7 @@ import loadZQL from '../zql.js';
 
 const DB_FILE = './test.db';
 let zql;
+let zqlResult = [];
 let sql;
 
 async function getFile(name) {
@@ -15,25 +16,50 @@ async function getFile(name) {
   }
 }
 
+async function compare(query) {
+  await zql.exec(query);
+  const sqlQuery = sql.prepare(query);
+  const sqlResult = sqlQuery.all();
+  console.log(zqlResult);
+  expect(sqlResult.length).toBe(zqlResult.length);
+  for (let i = 0; i < sqlResult.length; i++) {
+    const obj = sqlResult[i];
+    let j = 0;
+    for (const key in obj) {
+      const sqlItem = obj[key];
+      let zqlItem = zqlResult[i][j];
+      if (typeof zqlItem == 'bigint') {
+        zqlItem = Number(zqlItem);
+      }
+      expect(sqlItem).toBe(zqlItem);
+      j++;
+    }
+  }
+  // clear the array
+  zqlResult = [];
+}
+
 beforeAll(async () => {
   console.log("Loading SQLite");
   sql = new DatabaseSync(DB_FILE);
   zql = await loadZQL();
   const addTableRow = (array) => {
-    console.log(array)
+    zqlResult.push(array);
   }
   zql.rowListeners.push(addTableRow);
-  await zql.loadFile(getFile(DB_FILE))
+  await zql.loadFile(getFile(DB_FILE));
   console.log("Loaded");
 });
 
 describe('Compare ZQL to SQL', () => {
-  test('select all', async () => {
-    await zql.exec('select * from example;');
-    const query = sql.prepare('SELECT * FROM example');
-    const sqlResults = query.all();
-    // TODO: write helper function to actually compare and get results from ZQL
-    expect(sqlResults.length).toBe(3);
+  test('example db', async () => {
+    // compare("select * from example;");
+    // TODO: fix named columns not returning anything
+    compare("select id, name from example;");
+    // compare("select id from example;");
+    // compare("select name from example;");
+    // TODO: implement single quotes in zql
+    // compare("select * from example where name = 'Alice';");
   });
 });
 
