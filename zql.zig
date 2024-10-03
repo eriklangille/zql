@@ -1342,7 +1342,7 @@ const ASTGen = struct {
                         .comma => {},
                         .keyword_from => {
                             processed_columns = true;
-                            state = .from;
+                            state = .from_after;
                         },
                         else => {
                             break;
@@ -1358,7 +1358,8 @@ const ASTGen = struct {
                                 // the table. I think the allocated tables should be a different struct
                                 const sqlite_table = try self.db.getTable(self.gpa, table_name);
                                 table = try self.buildCreateTable(sqlite_table);
-                                state = .from_after;
+                                state = .select_second;
+                                self.index = column_list_index - 1;
                             }
                         },
                         .semicolon => {
