@@ -35,6 +35,322 @@ fn valFromSlice(comptime T: type, slice: []u8) T {
     return result.*;
 }
 
+// TODO: use meta.activeTag to get the active tag for tagged enum for comparing two tagged enums, such as Register
+
+const InternPool = struct {
+    items: MultiArrayList(Item),
+    extra: ArrayListUnmanaged(u32),
+    string_bytes: ArrayListUnmanaged(u8),
+
+    const Tag = enum(u8) {
+        table,
+        column,
+        instruction,
+        register,
+        condition,
+    };
+
+    const Item = struct {
+        tag: Tag,
+        data: Data,
+    };
+
+    const Index = enum(u32) {
+        _,
+        pub fn toOptional(dep: InternPool.Index) Optional {
+            return @enumFromInt(@intFromEnum(dep));
+        }
+        pub const Optional = enum(u32) {
+            none = maxInt(u32),
+            _,
+            pub fn unwrap(opt: Optional) ?InternPool.index {
+                return switch (opt) {
+                    .none => return null,
+                    _ => @enumFromInt(@intFromEnum(opt)),
+                };
+            }
+        };
+    };
+
+    /// An index into `strings` which might be `none`.
+    pub const OptionalString = enum(u32) {
+        /// This is distinct from `none` - it is a valid index that represents empty string.
+        empty = 0,
+        none = std.math.maxInt(u32),
+        _,
+
+        pub fn unwrap(string: OptionalString) ?String {
+            return if (string != .none) @enumFromInt(@intFromEnum(string)) else null;
+        }
+
+        pub fn toSlice(string: OptionalString, len: u64, ip: *const InternPool) ?[]const u8 {
+            return (string.unwrap() orelse return null).toSlice(len, ip);
+        }
+    };
+
+    const NullTerminatedString = enum(u32) {
+        /// An empty string.
+        empty = 0,
+        _,
+
+        const Self = @This();
+
+        fn unwrap(self: *const Self) u32 {
+            return @intFromEnum(self);
+        }
+
+        pub fn toString(self: NullTerminatedString) String {
+            return @enumFromInt(@intFromEnum(self));
+        }
+
+        pub fn slice(self: *const Self) [:0]const u8 {
+            const string = self.toString();
+            const index = string.unwrap();
+            const full_slice = string.sliceToEnd();
+            return string_bytes.items[index .. index + std.mem.indexOfScalar(u8, full_slice, 0).? :0];
+        }
+    };
+
+    const String = enum(u32) {
+        /// An empty string.
+        empty = 0,
+        _,
+
+        const Self = @This();
+
+        fn unwrap(self: *const Self) u32 {
+            return @intFromEnum(self);
+        }
+
+        pub fn toNullTerminatedString(self: *const Self, len: u64) NullTerminatedString {
+            assert(isNullTerminated(self, len));
+            return @enumFromInt(@intFromEnum(self));
+        }
+
+        pub fn slice(self: *const Self, len: u64) []const u8 {
+            const index = self.unwrap();
+            return string_bytes.items[index .. index + len];
+        }
+
+        fn isNullTerminated(self: *const Self, len: u64) bool {
+            const index = self.unwrap();
+            return string_bytes.items[index + len - 1] == 0;
+        }
+
+        pub fn initAssumeCapacity(chars: []const u8) Self {
+            const len: u32 = @intCast(string_bytes.items.len);
+            string_bytes.appendSliceAssumeCapacity(chars);
+            return Self{ .index = len, .len = chars.len };
+        }
+
+        pub fn ensureExtraCapacity(alloc: Allocator, additional_count: u32) !void {
+            try string_bytes.ensureUnusedCapacity(alloc, additional_count);
+        }
+
+        pub fn init(alloc: Allocator, chars: []const u8) !Self {
+            const len: u32 = @intCast(string_bytes.items.len);
+            try string_bytes.appendSlice(alloc, chars);
+            return @enumFromInt(len);
+        }
+
+        pub fn copySubstring(self: *const Self, alloc: Allocator, start_index: u32, end_index: u32) !Self {
+            try Self.ensureExtraCapacity(alloc, end_index - start_index);
+            return Self.initAssumeCapacity(self.slice()[start_index..end_index]);
+        }
+
+        pub fn sliceToEnd(self: *const Self) []const u8 {
+            const index = self.unwrap();
+            return string_bytes.items[index..];
+        }
+
+        pub fn initAddSentinel(alloc: Allocator, chars: []const u8) !Self {
+            const len: u32 = @intCast(string_bytes.items.len);
+            try string_bytes.appendSlice(alloc, chars);
+            try string_bytes.append(alloc, 0);
+            return @enumFromInt(len);
+        }
+    };
+
+    const Table = struct {
+        name: String,
+        columns: u64,
+        first_column: Index,
+    };
+
+    const Column = struct {
+        name: String,
+        tag: enum {
+            str,
+            integer,
+            float,
+        },
+        is_primary_key: bool,
+    };
+
+    const Instruction = union(enum) {
+        halt: void,
+        eq: Instruction.Equal,
+        neq: Instruction.Equal,
+
+        const Equal = struct {
+            lhs_reg: Index,
+            rhs_reg: Index,
+        };
+    };
+
+    const Register = union(enum) {
+        none,
+        int: i64,
+        float: f64,
+        string: String,
+        str: []u8,
+        binary: []u8,
+
+        pub fn fromColumn(column: SQLiteColumn) Register {
+            switch (column) {
+                .i8, .i16, .i24, .i32, .i48, .i64 => return .{ .int = column.getInt().? },
+                .value_0 => return .{ .int = 0 },
+                .value_1 => return .{ .int = 1 },
+                .f64 => return .{ .float = column.f64 },
+                .empty => return Register.none,
+                .invalid => {
+                    debug("invalid SQLiteColumn when converting to register", .{});
+                    return Register.none;
+                },
+                .blob => return .{ .binary = column.blob },
+                .text => return .{ .str = column.text },
+            }
+        }
+
+        pub fn tag(self: Register) type {
+            return std.meta.activeTag(self);
+        }
+
+        pub fn compare(self: Register, other: Register) bool {
+            if (self.tag() == other.tag()) {
+                return switch (self) {
+                    .none => true,
+                    .int => self.int == other.int,
+                    .float => self.float == other.float,
+                    .str => eql(u8, self.str, other.str),
+                    .string => eql(u8, self.string.str(), other.string.str()),
+                    .binary => unreachable, // TODO: implement
+                };
+            } else if (self.tag() == .str and other.tag() == .string) {
+                return eql(u8, self.string.str(), other.str);
+            } else if (self.tag() == .string and other.tag() == .str) {
+                return eql(u8, self.str, other.string.str());
+            }
+            return false;
+        }
+
+        pub fn toStr(self: Register, buffer: []u8) anyerror![]u8 {
+            return switch (self) {
+                .none => try fmt.bufPrint(buffer, "[null]", .{}),
+                .int => try fmt.bufPrint(buffer, "{d}", .{self.int}),
+                .float => try fmt.bufPrint(buffer, "{e}", .{self.float}),
+                .str => try fmt.bufPrint(buffer, "{s}", .{self.str}),
+                .string => try fmt.bufPrint(buffer, "{s}", .{self.string.str()}),
+                .binary => try fmt.bufPrint(buffer, "[binary]", .{}),
+            };
+        }
+
+        pub fn toBuf(self: Register, buffer: []u8) anyerror![]u8 {
+            return switch (self) {
+                .none => {
+                    if (buffer.len < 4) return Allocator.Error.OutOfMemory;
+                    buffer[0..4].* = std.mem.toBytes(@as(u32, 0));
+                    return buffer[0..4];
+                },
+                .int => {
+                    if (buffer.len < 12) return Allocator.Error.OutOfMemory;
+                    buffer[0..4].* = std.mem.toBytes(@as(u32, 1));
+                    buffer[4..12].* = std.mem.toBytes(self.int);
+                    return buffer[0..12];
+                },
+                .float => {
+                    if (buffer.len < 12) return Allocator.Error.OutOfMemory;
+                    buffer[0..4].* = std.mem.toBytes(@as(u32, 2));
+                    buffer[4..12].* = std.mem.toBytes(self.float);
+                    return buffer[0..12];
+                },
+                .str => {
+                    if (buffer.len < self.str.len + 8) return Allocator.Error.OutOfMemory;
+                    buffer[0..4].* = std.mem.toBytes(@as(u32, 3));
+                    const len = self.str.len;
+                    buffer[4..8].* = std.mem.toBytes(len);
+                    const fmt_slice = try fmt.bufPrint(buffer[8..], "{s}", .{self.str});
+                    return buffer[0 .. 8 + fmt_slice.len];
+                },
+                .string => {
+                    if (buffer.len < self.string.len + 8) return Allocator.Error.OutOfMemory;
+                    buffer[0..4].* = std.mem.toBytes(@as(u32, 3));
+                    const len = self.string.len;
+                    buffer[4..8].* = std.mem.toBytes(len);
+                    const fmt_slice = try fmt.bufPrint(buffer[8..], "{s}", .{self.string.str()});
+                    return buffer[0 .. 8 + fmt_slice.len];
+                },
+                .binary => {
+                    if (buffer.len < self.binary.len + 8) return Allocator.Error.OutOfMemory;
+                    buffer[0..4].* = std.mem.toBytes(@as(u32, 4));
+                    const len = self.binary.len;
+                    buffer[4..8].* = std.mem.toBytes(len);
+                    @memcpy(buffer[8..], self.binary);
+                    return buffer[0 .. len + 8];
+                },
+            };
+        }
+    };
+
+    const Condition = struct {
+        equality: Condition.Equality,
+        lhs: union(enum) {
+            column: Index, // Column index
+            condition: Index, // Condition index
+        },
+        rhs: union(enum) {
+            condition: Index,
+            str: String,
+            int: i64,
+            float: f64,
+        },
+
+        const Equality = union(u8) {
+            eq,
+            ne,
+            lt,
+            lte,
+            gt,
+            gte,
+        };
+    };
+
+    const Key = union(enum) {
+        table: Table,
+        column: Column,
+        instruction: Instruction,
+        register: Register,
+        condition: Condition,
+    };
+
+    fn extraData(ip: *InternPool, comptime T: type, index: u32) T {
+        const extra_items = ip.extra.items;
+        var result: T = undefined;
+
+        const fields = @typeInfo(T).@"struct".fields;
+        inline for (fields, index..) |field, extra_index| {
+            const extra_item = extra_items[extra_index];
+            @field(result, field.name) = switch (field.type) {
+                Index, String => @enumFromInt(extra_item),
+                u32 => @bitCast(extra_item),
+                else => @compileError("bad field type: " ++ @typeName(field.type)),
+            };
+        }
+
+        return result;
+    }
+};
+
 // SQLite stores the header in big-endian format
 const sqlite_header_size = 100;
 const SQLiteDbHeader = extern struct {
@@ -499,7 +815,7 @@ const ConditionRef = struct {
         },
         rhs: union(enum) {
             condition: ConditionRef,
-            str: String,
+            str: InternPool.String,
             int: i64,
             float: f64,
         },
@@ -602,7 +918,7 @@ const ElementType = enum {
 
 const Element = struct {
     value: union {
-        str: String,
+        str: InternPool.String,
         int: i64,
         float: f64,
     },
@@ -616,7 +932,7 @@ const Data = struct {
 };
 
 const TableStmt = struct {
-    name: String,
+    name: InternPool.String,
     first_column: u32,
     primary_column: u32,
     page: u32,
@@ -671,120 +987,9 @@ const Inst = struct {
     };
 };
 
-const Register = union(enum) {
-    none,
-    int: i64,
-    float: f64,
-    string: String,
-    str: []u8,
-    binary: []u8,
-
-    pub fn from_column(column: SQLiteColumn) Register {
-        switch (column) {
-            .i8, .i16, .i24, .i32, .i48, .i64 => return .{ .int = column.getInt().? },
-            .value_0 => return .{ .int = 0 },
-            .value_1 => return .{ .int = 1 },
-            .f64 => return .{ .float = column.f64 },
-            .empty => return Register.none,
-            .invalid => {
-                debug("invalid SQLiteColumn when converting to register", .{});
-                return Register.none;
-            },
-            .blob => return .{ .binary = column.blob },
-            .text => return .{ .str = column.text },
-        }
-    }
-
-    pub fn tag(self: Register) usize {
-        return switch (self) {
-            .none => 0,
-            .int => 1,
-            .float => 2,
-            .string => 3,
-            .str => 4,
-            .binary => 5,
-        };
-    }
-
-    pub fn compare(self: Register, other: Register) bool {
-        if (self.tag() == other.tag()) {
-            return switch (self) {
-                .none => true,
-                .int => self.int == other.int,
-                .float => self.float == other.float,
-                .str => eql(u8, self.str, other.str),
-                .string => eql(u8, self.string.str(), other.string.str()),
-                .binary => unreachable, // TODO: implement
-            };
-        } else if (self.tag() == 3 and other.tag() == 4) {
-            return eql(u8, self.string.str(), other.str);
-        } else if (self.tag() == 4 and other.tag() == 3) {
-            return eql(u8, self.str, other.string.str());
-        }
-        return false;
-    }
-
-    pub fn toStr(self: Register, buffer: []u8) anyerror![]u8 {
-        return switch (self) {
-            .none => try fmt.bufPrint(buffer, "[null]", .{}),
-            .int => try fmt.bufPrint(buffer, "{d}", .{self.int}),
-            .float => try fmt.bufPrint(buffer, "{e}", .{self.float}),
-            .str => try fmt.bufPrint(buffer, "{s}", .{self.str}),
-            .string => try fmt.bufPrint(buffer, "{s}", .{self.string.str()}),
-            .binary => try fmt.bufPrint(buffer, "[binary]", .{}),
-        };
-    }
-
-    pub fn toBuf(self: Register, buffer: []u8) anyerror![]u8 {
-        return switch (self) {
-            .none => {
-                if (buffer.len < 4) return Allocator.Error.OutOfMemory;
-                buffer[0..4].* = std.mem.toBytes(@as(u32, 0));
-                return buffer[0..4];
-            },
-            .int => {
-                if (buffer.len < 12) return Allocator.Error.OutOfMemory;
-                buffer[0..4].* = std.mem.toBytes(@as(u32, 1));
-                buffer[4..12].* = std.mem.toBytes(self.int);
-                return buffer[0..12];
-            },
-            .float => {
-                if (buffer.len < 12) return Allocator.Error.OutOfMemory;
-                buffer[0..4].* = std.mem.toBytes(@as(u32, 2));
-                buffer[4..12].* = std.mem.toBytes(self.float);
-                return buffer[0..12];
-            },
-            .str => {
-                if (buffer.len < self.str.len + 8) return Allocator.Error.OutOfMemory;
-                buffer[0..4].* = std.mem.toBytes(@as(u32, 3));
-                const len = self.str.len;
-                buffer[4..8].* = std.mem.toBytes(len);
-                const fmt_slice = try fmt.bufPrint(buffer[8..], "{s}", .{self.str});
-                return buffer[0 .. 8 + fmt_slice.len];
-            },
-            .string => {
-                if (buffer.len < self.string.len + 8) return Allocator.Error.OutOfMemory;
-                buffer[0..4].* = std.mem.toBytes(@as(u32, 3));
-                const len = self.string.len;
-                buffer[4..8].* = std.mem.toBytes(len);
-                const fmt_slice = try fmt.bufPrint(buffer[8..], "{s}", .{self.string.str()});
-                return buffer[0 .. 8 + fmt_slice.len];
-            },
-            .binary => {
-                if (buffer.len < self.binary.len + 8) return Allocator.Error.OutOfMemory;
-                buffer[0..4].* = std.mem.toBytes(@as(u32, 4));
-                const len = self.binary.len;
-                buffer[4..8].* = std.mem.toBytes(len);
-                @memcpy(buffer[8..], self.binary);
-                return buffer[0 .. len + 8];
-            },
-        };
-    }
-};
-
 const SQLiteDbTable = struct {
     page: u32,
-    sql: String,
+    sql: InternPool.String,
 };
 
 const SQLiteRecord = struct {
@@ -1040,7 +1245,7 @@ const Db = struct {
                         debug("page_index: {d}", .{page_index});
                         if (record.next()) |sql_col| {
                             if (sql_col != SQLiteColumn.text) return Error.InvalidBinary;
-                            const sql_str = try String.initAddSentinel(alloc, sql_col.text, 0);
+                            const sql_str = try InternPool.String.initAddSentinel(alloc, sql_col.text, 0);
                             return SQLiteDbTable{
                                 .page = page_index,
                                 .sql = sql_str,
@@ -1148,7 +1353,7 @@ const ASTGen = struct {
         self.element_list.items(.tag)[index] = tag;
     }
 
-    fn replaceNameAtIndex(self: *ASTGen, index: u32, name: String) void {
+    fn replaceNameAtIndex(self: *ASTGen, index: u32, name: InternPool.String) void {
         self.element_list.items(.value)[index] = .{
             .str = name,
         };
@@ -1176,7 +1381,7 @@ const ASTGen = struct {
         try tokenizer.ingest(self.gpa, self.token_list);
 
         var state: State = .create;
-        var name: ?String = null;
+        var name: ?InternPool.String = null;
         var tag: ?ElementType = null;
         var primary_key: PrimaryKeyState = PrimaryKeyState.unfilled;
         var col_count: u32 = 0;
@@ -1479,7 +1684,7 @@ const ASTGen = struct {
                         .double_quote_word => {
                             const string_literal = ASTGen.getTokenSource(self.source, token);
                             debug("where_rhs literal: {s}", .{string_literal});
-                            const value = try String.init(self.gpa, string_literal[1 .. string_literal.len - 1]);
+                            const value = try InternPool.String.init(self.gpa, string_literal[1 .. string_literal.len - 1]);
                             expr_prev_index = expr_index;
                             expr_index = try self.addElement(.{
                                 .value = .{ .str = value },
@@ -1555,32 +1760,10 @@ const ASTGen = struct {
     }
 };
 
-const Column = struct {
-    name: String,
-    tag: enum {
-        str,
-        integer,
-        float,
-    },
-    is_primary_key: bool,
-
-    pub fn fromElement(element: Element) Column {
-        return .{
-            .name = element.value.str,
-            .tag = switch (element.tag) {
-                .text => .str,
-                .integer => .integer,
-                else => unreachable, // Only column types should be used
-            },
-            .is_primary_key = element.data.rhs == 1,
-        };
-    }
-};
-
 const TableMetadataReader = struct {
     element_list: *ElementList,
     index: u32,
-    name: String,
+    name: InternPool.String,
 
     pub fn from(element_list: *ElementList, table_stmt: *const TableStmt) TableMetadataReader {
         return .{
@@ -1590,13 +1773,13 @@ const TableMetadataReader = struct {
         };
     }
 
-    pub fn next(self: *TableMetadataReader) ?Column {
+    pub fn next(self: *TableMetadataReader) ?InternPool.Column {
         if (self.index >= self.element_list.len or self.index == maxInt(u32)) {
             return null;
         }
         const element = self.element_list.get(self.index);
         self.index = element.data.lhs;
-        return Column.fromElement(element);
+        return InternPool.Column.fromElement(element);
     }
 };
 
@@ -1773,7 +1956,7 @@ const InstGen = struct {
         });
     }
 
-    fn string(self: *InstGen, str: String, store_reg: u32) Error!void {
+    fn string(self: *InstGen, str: InternPool.String, store_reg: u32) Error!void {
         const extra_index = try self.addExtra(str);
         _ = try self.addInst(.{ .opcode = .string, .data = .{ .lhs = store_reg, .rhs = extra_index } });
     }
@@ -1923,7 +2106,7 @@ const Vm = struct {
     gpa: Allocator,
     db: Db,
     inst_list: InstList.Slice,
-    reg_list: ArrayListUnmanaged(Register),
+    reg_list: ArrayListUnmanaged(InternPool.Register),
     pc: u32,
 
     const Cursor = struct {
@@ -1941,14 +2124,14 @@ const Vm = struct {
         };
     }
 
-    fn reg(self: *Vm, index: u32, register: Register) Error!void {
+    fn reg(self: *Vm, index: u32, register: InternPool.Register) Error!void {
         debug("reg index: {d}, len: {d}", .{ index, self.reg_list.items.len });
         // registers start at 1, not 0
         if (index - 1 == self.reg_list.items.len) {
             try self.reg_list.append(self.gpa, register);
         } else {
             while (index > self.reg_list.items.len) {
-                try self.reg_list.append(self.gpa, Register.none);
+                try self.reg_list.append(self.gpa, InternPool.Register.none);
             }
             self.reg_list.items[index - 1] = register;
         }
@@ -2007,7 +2190,7 @@ const Vm = struct {
                 .row_id => {
                     assert(record != null);
                     debug("row_id SQLiteColumn: {d}", .{record.?.row_id});
-                    try self.reg(instruction.data.rhs, Register{ .int = @intCast(record.?.row_id) });
+                    try self.reg(instruction.data.rhs, InternPool.Register{ .int = @intCast(record.?.row_id) });
                     self.pc += 1;
                 },
                 .column => {
@@ -2025,7 +2208,7 @@ const Vm = struct {
                     col_value = record.?.next();
                     col_count += 1;
                     assert(col_value != null);
-                    try self.reg(store_reg, Register.from_column(col_value.?));
+                    try self.reg(store_reg, InternPool.Register.fromColumn(col_value.?));
                     col_value = record.?.next();
                     debug("col_value: {?}", .{col_value});
                     col_count += 1;
@@ -2124,53 +2307,6 @@ const Vm = struct {
 };
 
 const MinimizedToken = struct { tag: TokenType, start: u32 };
-const String = struct {
-    index: u32,
-    len: u32,
-
-    const Self = @This();
-
-    pub fn str(self: *const Self) []const u8 {
-        return string_bytes.items[self.index .. self.index + self.len];
-    }
-
-    pub fn strSentinel(self: *const Self) [:0]const u8 {
-        assert(hasSentinel(self, 0));
-        return string_bytes.items[self.index .. self.index + self.len - 1 :0];
-    }
-
-    pub fn hasSentinel(self: *const Self, sentinel: u8) bool {
-        return string_bytes.items[self.index + self.len - 1] == sentinel;
-    }
-
-    pub fn initAssumeCapacity(chars: []const u8) Self {
-        const len: u32 = @intCast(string_bytes.items.len);
-        string_bytes.appendSliceAssumeCapacity(chars);
-        return Self{ .index = len, .len = chars.len };
-    }
-
-    pub fn ensureExtraCapacity(alloc: Allocator, additional_count: u32) !void {
-        try string_bytes.ensureUnusedCapacity(alloc, additional_count);
-    }
-
-    pub fn init(alloc: Allocator, chars: []const u8) !Self {
-        const len: u32 = @intCast(string_bytes.items.len);
-        try string_bytes.appendSlice(alloc, chars);
-        return Self{ .index = len, .len = chars.len };
-    }
-
-    pub fn copySubstring(self: *const Self, alloc: Allocator, start_index: u32, end_index: u32) !Self {
-        try String.ensureExtraCapacity(alloc, end_index - start_index);
-        return String.initAssumeCapacity(self.str()[start_index..end_index]);
-    }
-
-    pub fn initAddSentinel(alloc: Allocator, chars: []const u8, comptime sentinel: u8) !Self {
-        const len: u32 = @intCast(string_bytes.items.len);
-        try string_bytes.appendSlice(alloc, chars);
-        try string_bytes.append(alloc, sentinel);
-        return Self{ .index = len, .len = chars.len + 1 };
-    }
-};
 
 // TODO: put all these into a self-contained structure like how the Zig compiler does with InternPool
 // Then only return the filled out structures, not the data oriented design ones
