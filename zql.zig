@@ -9,7 +9,6 @@ const fmt = std.fmt;
 const heap = std.heap;
 const io = std.io;
 const maxInt = std.math.maxInt;
-const meta = std.meta;
 const MultiArrayList = std.MultiArrayList;
 const panic = std.debug.panic;
 const StaticStringMap = std.StaticStringMapWithEql;
@@ -35,24 +34,57 @@ fn valFromSlice(comptime T: type, slice: []u8) T {
     return result.*;
 }
 
-// TODO: use meta.activeTag to get the active tag for tagged enum for comparing two tagged enums, such as Register
+const PackedU64 = packed struct {
+    a: u32,
+    b: u32,
+
+    pub fn unwrap(self: PackedU64) u64 {
+        return @bitCast(self);
+    }
+
+    pub fn init(ty: anytype) PackedU64 {
+        const type_size = @sizeOf(ty);
+        comptime assert(type_size == @sizeOf(PackedU64) or type_size == u32);
+        return @bitCast(ty);
+    }
+};
 
 const InternPool = struct {
     items: MultiArrayList(Item),
+    instructions: MultiArrayList(Inst),
     extra: ArrayListUnmanaged(u32),
     string_bytes: ArrayListUnmanaged(u8),
 
     const Tag = enum(u8) {
         table,
         column,
-        instruction,
-        register,
-        condition,
+        register_none,
+        register_int,
+        register_float,
+        register_str,
+        register_string,
+        register_binary,
+        condition_or,
+        condition_and,
+        condition_lte_int,
+        condition_lte_float,
+        condition_lt_int,
+        condition_lt_float,
+        condition_gt_int,
+        condition_gt_float,
+        condition_gte_int,
+        condition_gte_float,
+        condition_eq_int,
+        condition_eq_float,
+        condition_eq_string,
+        condition_ne_int,
+        condition_ne_float,
+        condition_ne_string,
     };
 
     const Item = struct {
         tag: Tag,
-        data: Data,
+        data: u32,
     };
 
     const Index = enum(u32) {
@@ -63,7 +95,7 @@ const InternPool = struct {
         pub const Optional = enum(u32) {
             none = maxInt(u32),
             _,
-            pub fn unwrap(opt: Optional) ?InternPool.index {
+            pub fn unwrap(opt: Optional) ?InternPool.Index {
                 return switch (opt) {
                     .none => return null,
                     _ => @enumFromInt(@intFromEnum(opt)),
@@ -83,8 +115,8 @@ const InternPool = struct {
             return if (string != .none) @enumFromInt(@intFromEnum(string)) else null;
         }
 
-        pub fn toSlice(string: OptionalString, len: u64, ip: *const InternPool) ?[]const u8 {
-            return (string.unwrap() orelse return null).toSlice(len, ip);
+        pub fn slice(string: OptionalString, len: u64, ip: *const InternPool) ?[]const u8 {
+            return (string.unwrap() orelse return null).slice(len, ip);
         }
     };
 
@@ -193,8 +225,8 @@ const InternPool = struct {
         neq: Instruction.Equal,
 
         const Equal = struct {
-            lhs_reg: Index,
-            rhs_reg: Index,
+            lhs_reg: Index.Optional,
+            rhs_reg: Index.Optional,
         };
     };
 
@@ -222,6 +254,7 @@ const InternPool = struct {
             }
         }
 
+        // TODO: validate that this works
         pub fn tag(self: Register) type {
             return std.meta.activeTag(self);
         }
@@ -310,12 +343,14 @@ const InternPool = struct {
         },
         rhs: union(enum) {
             condition: Index,
-            str: String,
+            string: String,
             int: i64,
             float: f64,
         },
 
         const Equality = union(u8) {
+            @"or",
+            @"and",
             eq,
             ne,
             lt,
@@ -323,15 +358,34 @@ const InternPool = struct {
             gt,
             gte,
         };
+
+        const Repr = struct {
+            lhs: u32,
+            rhs_0: u32,
+            rhs_1: u32,
+        };
     };
 
     const Key = union(enum) {
         table: Table,
         column: Column,
-        instruction: Instruction,
         register: Register,
         condition: Condition,
     };
+
+    fn addExtra(ip: *InternPool, alloc: Allocator, item: anytype) Allocator.Error!u32 {
+        const fields = @typeInfo(@TypeOf(item)).@"struct".fields;
+        ip.extra.ensureUnusedCapacity(alloc, fields.len);
+        const result: u32 = ip.extra.items.len;
+        inline for (fields) |field| {
+            extra.appendAssumeCapacity(switch (field.type) {
+                Index, String => @intFromEnum(@field(item, field.name)),
+                u32 => @bitCast(@field(item, field.name)),
+                else => @compileError("bad field type: " ++ @typeName(field.type)),
+            });
+        }
+        return result;
+    }
 
     fn extraData(ip: *InternPool, comptime T: type, index: u32) T {
         const extra_items = ip.extra.items;
@@ -349,6 +403,111 @@ const InternPool = struct {
 
         return result;
     }
+
+    // TODO: figure out if this needs to be a getOrPut. Then we need to refactor to use a hashmap with they keys instead of a simple array
+    pub fn put(ip: *InternPool, alloc: Allocator, key: Key) Allocator.Error!Index {
+        const index: u32 = ip.items.items.len;
+        try ip.items.ensureUnusedCapacity(alloc, 1);
+        switch (key) {
+            .condition => {
+                const cond = key.condition;
+                const lhs: u32 = switch (cond.lhs) {
+                    .condition, .column => |col_cond| @intFromEnum(col_cond),
+                };
+                const rhs: PackedU64 = switch (cond.rhs) {
+                    .string => |cond_string| .{ .a = @intFromEnum(cond_string), .b = 0 },
+                    .int => |cond_int| PackedU64.init(cond_int),
+                    .float => |cond_float| PackedU64.init(cond_float),
+                    .condition => |cond_index| .{ .a = @intFromEnum(cond_index), .b = 0 },
+                };
+                const extra_index = try ip.addExtra(alloc, Condition.Repr{
+                    .lhs = lhs,
+                    .rhs_0 = rhs.a,
+                    .rhs_1 = rhs.b,
+                });
+                const tag: Tag = switch (cond.equality) {
+                    .eq => switch (cond.rhs) {
+                        .string => .condition_eq_string,
+                        .int => .condition_eq_int,
+                        .float => .condition_eq_float,
+                    },
+                    .ne => switch (cond.rhs) {
+                        .string => .condition_ne_string,
+                        .int => .condition_eq_int,
+                        .float => .condition_eq_float,
+                    },
+                    .lt => switch (cond.rhs) {
+                        .int => .condition_lt_int,
+                        .float => .condition_lt_float,
+                    },
+                    .lte => switch (cond.rhs) {
+                        .int => .condition_lte_int,
+                        .float => .condition_lte_float,
+                    },
+                    .gt => switch (cond.rhs) {
+                        .int => .condition_gt_int,
+                        .float => .condition_gt_float,
+                    },
+                    .gte => switch (cond.rhs) {
+                        .int => .condition_gte_int,
+                        .float => .condition_gte_float,
+                    },
+                    .@"or" => .condition_or,
+                    .@"and" => .condition_and,
+                };
+                ip.items.appendAssumeCapacity(.{ .tag = tag, .data = extra_index });
+            },
+            else => unreachable, // TODO: add
+        }
+        return @enumFromInt(index);
+    }
+
+    pub fn indexToKey(ip: *InternPool, index: Index) Key {
+        const item = ip.items.get(index);
+        switch (item.tag) {
+            .condition_or,
+            .condition_and,
+            .condition_lte_int,
+            .condition_lte_float,
+            .condition_lt_int,
+            .condition_lt_float,
+            .condition_gt_int,
+            .condition_gt_float,
+            .condition_gte_int,
+            .condition_gte_float,
+            .condition_eq_int,
+            .condition_eq_float,
+            .condition_eq_string,
+            .condition_ne_int,
+            .condition_ne_float,
+            .condition_ne_string,
+            => {
+                const extra_data: Condition.Repr = ip.extraData(Condition.Repr, item.data);
+                const lhs_index: Index = @enumFromInt(extra_data.lhs);
+                const rhs: PackedU64 = .{ .a = extra_data.rhs_0, .b = extra_data.rhs_1 };
+                const result: Condition = switch (item.tag) {
+                    .condition_or => .{ .equality = .@"or", .lhs = .{ .condition = lhs_index }, .rhs = .{ .condition = @enumFromInt(rhs.a) } },
+                    .condition_and => .{ .equality = .@"and", .lhs = .{ .condition = lhs_index }, .rhs = .{ .condition = @enumFromInt(rhs.a) } },
+                    .condition_lte_int => .{ .equality = .lte, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
+                    .condition_lt_int => .{ .equality = .lt, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
+                    .condition_gte_int => .{ .equality = .gte, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
+                    .condition_gt_int => .{ .equality = .gt, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
+                    .condition_eq_int => .{ .equality = .eq, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
+                    .condition_ne_int => .{ .equality = .ne, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
+                    .condition_lte_float => .{ .equality = .lte, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
+                    .condition_lt_float => .{ .equality = .lt, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
+                    .condition_gte_float => .{ .equality = .gte, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
+                    .condition_gt_float => .{ .equality = .gt, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
+                    .condition_eq_float => .{ .equality = .eq, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
+                    .condition_ne_float => .{ .equality = .ne, .lhs = .{ .column = lhs_index }, .rhs = .{ .string = @enumFromInt(rhs.a) } },
+                    .condition_eq_string => .{ .equality = .eq, .lhs = .{ .column = lhs_index }, .rhs = .{ .string = @enumFromInt(rhs.a) } },
+                };
+                return result;
+            },
+        }
+    }
+
+    // pub fn update(ip: *InternPool, index: Index, key: Key) void {}
 };
 
 // SQLite stores the header in big-endian format
@@ -1883,7 +2042,7 @@ const InstGen = struct {
     }
 
     fn addExtra(self: *InstGen, extra_data: anytype) Allocator.Error!u32 {
-        const fields = meta.fields(@TypeOf(extra_data));
+        const fields = std.meta.fields(@TypeOf(extra_data));
         try extra.ensureUnusedCapacity(self.gpa, fields.len);
         const extra_index: u32 = @intCast(extra.items.len);
         extra.items.len += fields.len;
