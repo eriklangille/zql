@@ -205,18 +205,33 @@ const InternPool = struct {
 
     const Table = struct {
         name: String,
-        columns: u64,
+        page: u32,
         first_column: Index,
     };
 
     const Column = struct {
         name: String,
-        tag: enum {
-            str,
+        next_column: Index.Optional,
+        tag: enum(u3) {
+            text,
             integer,
-            float,
+            real,
+            null,
+            blob,
         },
         is_primary_key: bool,
+
+        const Repr = struct {
+            name: u32,
+            next_column: u32,
+            flags: Flags,
+        };
+
+        const Flags = packed struct {
+            tag: u3,
+            is_primary_key: bool,
+            _: u28,
+        };
     };
 
     const Instruction = union(enum) {
@@ -457,7 +472,17 @@ const InternPool = struct {
                 };
                 ip.items.appendAssumeCapacity(.{ .tag = tag, .data = extra_index });
             },
-            else => unreachable, // TODO: add
+            .column => {
+                const col = key.column;
+                const flags: Column.Flags = .{ .tag = col.tag, .is_primary_key = col.is_primary_key };
+                const extra_index = try ip.addExtra(alloc, Column.Repr{
+                    .name = col.name,
+                    .next_column = @intFromEnum(col.next_column),
+                    .flags = flags,
+                });
+                ip.items.appendAssumeCapacity(.{ .tag = .column, .data = extra_index });
+            },
+            else => unreachable, // TODO: add other key types
         }
         return @enumFromInt(index);
     }
@@ -499,9 +524,15 @@ const InternPool = struct {
                     .condition_gte_float => .{ .equality = .gte, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
                     .condition_gt_float => .{ .equality = .gt, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
                     .condition_eq_float => .{ .equality = .eq, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
-                    .condition_ne_float => .{ .equality = .ne, .lhs = .{ .column = lhs_index }, .rhs = .{ .string = @enumFromInt(rhs.a) } },
+                    .condition_ne_float => .{ .equality = .ne, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
                     .condition_eq_string => .{ .equality = .eq, .lhs = .{ .column = lhs_index }, .rhs = .{ .string = @enumFromInt(rhs.a) } },
+                    .condition_ne_string => .{ .equality = .ne, .lhs = .{ .column = lhs_index }, .rhs = .{ .string = @enumFromInt(rhs.a) } },
                 };
+                return result;
+            },
+            .column => {
+                const extra_data = ip.extraData(Column.Repr, item.data);
+                const result: Column = .{ .name = extra_data.name, .tag = @enumFromInt(extra_data.flags.tag), .is_primary_key = extra_data.flags.is_primary_key };
                 return result;
             },
         }
