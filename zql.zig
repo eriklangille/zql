@@ -55,6 +55,13 @@ const InternPool = struct {
     extra: ArrayListUnmanaged(u32),
     string_bytes: ArrayListUnmanaged(u8),
 
+    pub fn deinit(ip: *InternPool, alloc: Allocator) void {
+        ip.items.deinit(alloc);
+        ip.instructions.deinit(alloc);
+        ip.extra.deinit(alloc);
+        ip.string_bytes.deinit(alloc);
+    }
+
     const Tag = enum(u8) {
         table,
         column,
@@ -204,13 +211,19 @@ const InternPool = struct {
     };
 
     const Table = struct {
-        name: String,
+        name: NullTerminatedString,
         page: u32,
         first_column: Index,
+
+        const Repr = struct {
+            name: u32,
+            page: u32,
+            first_column: u32,
+        };
     };
 
     const Column = struct {
-        name: String,
+        name: NullTerminatedString,
         next_column: Index.Optional,
         tag: enum(u3) {
             text,
@@ -224,7 +237,7 @@ const InternPool = struct {
         const Repr = struct {
             name: u32,
             next_column: u32,
-            flags: Flags,
+            flags: u32,
         };
 
         const Flags = packed struct {
@@ -249,9 +262,14 @@ const InternPool = struct {
         none,
         int: i64,
         float: f64,
-        string: String,
+        string: StringLen,
         str: []u8, // TODO: consider removing these, and make all bytes be interned
         binary: []u8,
+
+        const StringLen = struct {
+            string: String,
+            len: u32,
+        };
 
         const Repr = struct {
             @"0": u32,
@@ -394,15 +412,21 @@ const InternPool = struct {
     };
 
     fn addExtra(ip: *InternPool, alloc: Allocator, item: anytype) Allocator.Error!u32 {
+        const len = ip.extra.items.len;
+        return try ip.insertExtra(alloc, item, len);
+    }
+
+    fn insertExtra(ip: *InternPool, alloc: Allocator, item: anytype, index: u32) Allocator.Error!u32 {
         const fields = @typeInfo(@TypeOf(item)).@"struct".fields;
-        ip.extra.ensureUnusedCapacity(alloc, fields.len);
+        ip.extra.appendNTimes(alloc, 0, fields.len);
         const result: u32 = ip.extra.items.len;
-        inline for (fields) |field| {
-            extra.appendAssumeCapacity(switch (field.type) {
+        inline for (fields, 0..) |field, i| {
+            extra.items[index + i] = switch (field.type) {
                 Index, String => @intFromEnum(@field(item, field.name)),
-                u32 => @bitCast(@field(item, field.name)),
+                u32,
+                => @bitCast(@field(item, field.name)),
                 else => @compileError("bad field type: " ++ @typeName(field.type)),
-            });
+            };
         }
         return result;
     }
@@ -424,9 +448,79 @@ const InternPool = struct {
         return result;
     }
 
-    // TODO: figure out if this needs to be a getOrPut. Then we need to refactor to use a hashmap with they keys instead of a simple array
+    fn extraSize(item: Item) u32 {
+        switch (item.tag) {
+            .condition_or,
+            .condition_and,
+            .condition_lte_int,
+            .condition_lte_float,
+            .condition_lt_int,
+            .condition_lt_float,
+            .condition_gt_int,
+            .condition_gt_float,
+            .condition_gte_int,
+            .condition_gte_float,
+            .condition_eq_int,
+            .condition_eq_float,
+            .condition_eq_string,
+            .condition_ne_int,
+            .condition_ne_float,
+            .condition_ne_string,
+            => {
+                return @sizeOf(Condition.Repr);
+            },
+            .register_none,
+            .register_int,
+            .register_float,
+            .register_str,
+            .register_string,
+            .register_binary,
+            => {
+                return @sizeOf(Register.Repr);
+            },
+            .table => {
+                return @sizeOf(Table.Repr);
+            },
+            .column => {
+                return @sizeOf(Column.Repr);
+            },
+        }
+    }
+
+    fn itemPlaceAt(ip: *InternPool, index: u32, item: Item) void {
+        const len: u32 = ip.items.items.len;
+        if (len == index) {
+            return ip.items.appendAssumeCapacity(item);
+        } else {
+            ip.items.set(index, item);
+        }
+    }
+
+    fn extraPlaceAt(ip: *InternPool, alloc: Allocator, item: Item, data: anytype) void {
+        comptime assert(@sizeOf(data) == InternPool.extraSize(item));
+        const len: u32 = ip.extra.items.len;
+        const index = item.data;
+        if (len == index) {
+            return try ip.addExtra(alloc, data);
+        } else {
+            return try ip.insertExtra(alloc, data, index);
+        }
+    }
+
     pub fn put(ip: *InternPool, alloc: Allocator, key: Key) Allocator.Error!Index {
         const index: u32 = ip.items.items.len;
+        return try ip.putAtIndex(alloc, key, index);
+    }
+
+    pub fn update(ip: *InternPool, alloc: Allocator, index: Index, updated_key: Key) Allocator.Error!void {
+        return try ip.putAtIndex(alloc, updated_key, index);
+    }
+
+    // TODO: figure out if this needs to be a getOrPut. Then we need to refactor to use a hashmap with they keys instead of a simple array
+    fn putAtIndex(ip: *InternPool, alloc: Allocator, key: Key, index: u32) Allocator.Error!Index {
+        const len = ip.items.len;
+        const end = len == index;
+        var item: ?Item = if (end) null else ip.items.get(index);
         try ip.items.ensureUnusedCapacity(alloc, 1);
         switch (key) {
             .condition => {
@@ -440,11 +534,6 @@ const InternPool = struct {
                     .float => |cond_float| PackedU64.init(cond_float),
                     .condition => |cond_index| .{ .a = @intFromEnum(cond_index), .b = 0 },
                 };
-                const extra_index = try ip.addExtra(alloc, Condition.Repr{
-                    .lhs = lhs,
-                    .rhs_0 = rhs.a,
-                    .rhs_1 = rhs.b,
-                });
                 const tag: Tag = switch (cond.equality) {
                     .eq => switch (cond.rhs) {
                         .string => .condition_eq_string,
@@ -475,17 +564,40 @@ const InternPool = struct {
                     .@"or" => .condition_or,
                     .@"and" => .condition_and,
                 };
-                ip.items.appendAssumeCapacity(.{ .tag = tag, .data = extra_index });
+                if (item == null) {
+                    item = .{ .tag = tag, .data = len };
+                }
+                _ = try ip.extraPlaceAt(alloc, item.?, Condition.Repr{
+                    .lhs = lhs,
+                    .rhs_0 = rhs.a,
+                    .rhs_1 = rhs.b,
+                });
+                ip.itemPlaceAt(index, item.?);
             },
             .column => {
                 const col = key.column;
                 const flags: Column.Flags = .{ .tag = col.tag, .is_primary_key = col.is_primary_key };
-                const extra_index = try ip.addExtra(alloc, Column.Repr{
+                if (item == null) {
+                    item = .{ .tag = .column, .data = len };
+                }
+                _ = try ip.extraPlaceAt(alloc, item.?, Column.Repr{
                     .name = col.name,
                     .next_column = @intFromEnum(col.next_column),
-                    .flags = flags,
+                    .flags = @bitCast(flags),
                 });
-                ip.items.appendAssumeCapacity(.{ .tag = .column, .data = extra_index });
+                ip.itemPlaceAt(index, item);
+            },
+            .table => {
+                const tbl = key.table;
+                if (item == null) {
+                    item = .{ .tag = .table, .data = len };
+                }
+                _ = try ip.extraPlaceAt(alloc, item.?, Table.Repr{
+                    .name = tbl.name,
+                    .page = tbl.page,
+                    .first_column = tbl.first_column,
+                });
+                ip.itemPlaceAt(index, item);
             },
             .register_str,
             .register_none,
@@ -498,7 +610,7 @@ const InternPool = struct {
                 const pack: PackedU64 = switch (register) {
                     .int => |reg| PackedU64.init(reg),
                     .float => |reg| PackedU64.init(reg),
-                    .string => |reg| PackedU64{ .a = @intFromEnum(reg), .b = 0 },
+                    .string => |reg| PackedU64{ .a = @intFromEnum(reg.string), .b = reg.len },
                     .none => PackedU64{ .a = 0, .b = 0 },
                     .str => |reg| PackedU64{
                         .a = @bitCast(reg.ptr),
@@ -517,8 +629,11 @@ const InternPool = struct {
                     .binary => .register_binary,
                     .none => .register_none,
                 };
-                const extra_index = try ip.addExtra(alloc, Register.Repr{ .@"0" = pack.a, .@"1" = pack.b });
-                ip.items.appendAssumeCapacity(.{ .tag = tag, .data = extra_index });
+                if (item == null) {
+                    item = .{ .tag = tag, .data = len };
+                }
+                _ = try ip.extraPlaceAt(alloc, item.?, Register.Repr{ .@"0" = pack.a, .@"1" = pack.b });
+                ip.itemPlaceAt(index, item);
             },
             else => unreachable, // TODO: add other key types
         }
@@ -573,6 +688,11 @@ const InternPool = struct {
                 const result: Column = .{ .name = extra_data.name, .tag = @enumFromInt(extra_data.flags.tag), .is_primary_key = extra_data.flags.is_primary_key };
                 return result;
             },
+            .table => {
+                const extra_data = ip.extraData(Table.Repr, item.data);
+                const result: Table = .{ .name = extra_data.name, .page = extra_data.page, .first_column = extra_data.first_column };
+                return result;
+            },
             .register_string,
             .register_str,
             .register_binary,
@@ -585,7 +705,7 @@ const InternPool = struct {
                 }
                 const extra_data = ip.extraData(Register.Repr, item.data);
                 const result: Register = switch (item.tag) {
-                    .register_string => .{ .string = @enumFromInt(extra_data.@"0") },
+                    .register_string => .{ .string = .{ .string = @enumFromInt(extra_data.@"0"), .len = extra_data.@"1" } },
                     .register_str => .{ .str = .{ .pointer = @bitCast(extra_data.@"0"), .len = @bitCast(extra_data.@"1") } },
                     .register_binary => .{ .binary = .{ .pointer = @bitCast(extra_data.@"0"), .len = @bitCast(extra_data.@"1") } },
                     .register_int => .{ .int = @bitCast(PackedU64.init(extra_data).unwrap()) },
@@ -595,8 +715,6 @@ const InternPool = struct {
             },
         }
     }
-
-    // pub fn update(ip: *InternPool, index: Index, key: Key) void {}
 };
 
 // SQLite stores the header in big-endian format
