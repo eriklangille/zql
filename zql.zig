@@ -250,8 +250,13 @@ const InternPool = struct {
         int: i64,
         float: f64,
         string: String,
-        str: []u8,
+        str: []u8, // TODO: consider removing these, and make all bytes be interned
         binary: []u8,
+
+        const Repr = struct {
+            @"0": u32,
+            @"1": u32,
+        };
 
         pub fn fromColumn(column: SQLiteColumn) Register {
             switch (column) {
@@ -482,6 +487,39 @@ const InternPool = struct {
                 });
                 ip.items.appendAssumeCapacity(.{ .tag = .column, .data = extra_index });
             },
+            .register_str,
+            .register_none,
+            .register_float,
+            .register_string,
+            .register_binary,
+            .register_int,
+            => {
+                const register: Register = key.register;
+                const pack: PackedU64 = switch (register) {
+                    .int => |reg| PackedU64.init(reg),
+                    .float => |reg| PackedU64.init(reg),
+                    .string => |reg| PackedU64{ .a = @intFromEnum(reg), .b = 0 },
+                    .none => PackedU64{ .a = 0, .b = 0 },
+                    .str => |reg| PackedU64{
+                        .a = @bitCast(reg.ptr),
+                        .b = @bitCast(reg.len),
+                    },
+                    .binary => |reg| PackedU64{
+                        .a = @bitCast(reg.ptr),
+                        .b = @bitCast(reg.len),
+                    },
+                };
+                const tag: Tag = switch (register) {
+                    .int => .register_int,
+                    .float => .register_float,
+                    .str => .register_str,
+                    .string => .register_string,
+                    .binary => .register_binary,
+                    .none => .register_none,
+                };
+                const extra_index = try ip.addExtra(alloc, Register.Repr{ .@"0" = pack.a, .@"1" = pack.b });
+                ip.items.appendAssumeCapacity(.{ .tag = tag, .data = extra_index });
+            },
             else => unreachable, // TODO: add other key types
         }
         return @enumFromInt(index);
@@ -533,6 +571,26 @@ const InternPool = struct {
             .column => {
                 const extra_data = ip.extraData(Column.Repr, item.data);
                 const result: Column = .{ .name = extra_data.name, .tag = @enumFromInt(extra_data.flags.tag), .is_primary_key = extra_data.flags.is_primary_key };
+                return result;
+            },
+            .register_string,
+            .register_str,
+            .register_binary,
+            .register_int,
+            .register_none,
+            .register_float,
+            => {
+                if (item.tag == .register_none) {
+                    return Register.none;
+                }
+                const extra_data = ip.extraData(Register.Repr, item.data);
+                const result: Register = switch (item.tag) {
+                    .register_string => .{ .string = @enumFromInt(extra_data.@"0") },
+                    .register_str => .{ .str = .{ .pointer = @bitCast(extra_data.@"0"), .len = @bitCast(extra_data.@"1") } },
+                    .register_binary => .{ .binary = .{ .pointer = @bitCast(extra_data.@"0"), .len = @bitCast(extra_data.@"1") } },
+                    .register_int => .{ .int = @bitCast(PackedU64.init(extra_data).unwrap()) },
+                    .register_float => .{ .float = @bitCast(PackedU64.init(extra_data).unwrap()) },
+                };
                 return result;
             },
         }
