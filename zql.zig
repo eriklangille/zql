@@ -94,6 +94,19 @@ const InternPool = struct {
         data: u32,
     };
 
+    const Opcode = enum(u8) {
+        eq,
+        neq,
+        row_id,
+        goto,
+        halt,
+    };
+
+    const InstItem = struct {
+        opcode: Opcode,
+        data: u32,
+    };
+
     const Index = enum(u32) {
         _,
         pub fn toOptional(dep: InternPool.Index) Optional {
@@ -247,14 +260,52 @@ const InternPool = struct {
         };
     };
 
+    pub fn addInst(ip: *InternPool, alloc: Allocator, key: Instruction) InstIndex {
+        const index = ip.instructions.items.len;
+        try ip.instructions.append(alloc, key);
+        return @enumFromInt(index);
+    }
+
+    const InstIndex = enum(u32) {
+        none = std.math.maxInt(u32),
+        _,
+        pub fn unwrap(opt: InstIndex) ?u32 {
+            return switch (opt) {
+                .none => return null,
+                _ => @intFromEnum(InstIndex),
+            };
+        }
+    };
+
     const Instruction = union(enum) {
+        init: InstIndex,
         halt: void,
         eq: Instruction.Equal,
         neq: Instruction.Equal,
+        goto: Instruction,
+        row_id: RowId,
+        rewind: Rewind,
 
         const Equal = struct {
             lhs_reg: Index.Optional,
             rhs_reg: Index.Optional,
+        };
+
+        // Store in register P2 an integer which is the key of the table entry that P1 is currently point to.
+        // P1 can be either an ordinary table or a virtual table. There used to be a separate OP_VRowid opcode for use with virtual tables,
+        // but this one opcode now works for both table types.
+        const RowId = struct {
+            read_cursor: u32,
+            store_reg: Index.Optional,
+        };
+
+        // The next use of the Rowid or Column or Next instruction for P1 will refer to the first entry in the database table or index.
+        // If the table or index is empty, jump immediately to P2. If the table or index is not empty, fall through to the following instruction.
+        // If P2 is zero, that is an assertion that the P1 table is never empty and hence the jump will never be taken.
+        // This opcode leaves the cursor configured to move in forward order, from the beginning toward the end. In other words, the cursor is configured to use Next, not Prev.
+        const Rewind = struct {
+            index: InstIndex,
+            end_inst: InstIndex,
         };
     };
 
@@ -263,7 +314,7 @@ const InternPool = struct {
         int: i64,
         float: f64,
         string: StringLen,
-        str: []u8, // TODO: consider removing these, and make all bytes be interned
+        str: []u8, // TODO: consider removing these, and make all bytes be interned. Or use a 32 bit index instead of a pointer
         binary: []u8,
 
         const StringLen = struct {
