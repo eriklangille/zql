@@ -232,7 +232,7 @@ const InternPool = struct {
         pub fn copySubstringNullTerminate(self: Self, alloc: Allocator, start_index: u32, end_index: u32, ip: *InternPool) !NullTerminatedString {
             try Self.ensureExtraCapacity(alloc, end_index - start_index + 1, ip);
             const len: u32 = @intCast(ip.string_bytes.items.len);
-            const chars = self.slice(end_index - start_index + 1, ip)[start_index..end_index];
+            const chars = self.slice(end_index - start_index, ip);
             ip.string_bytes.appendSliceAssumeCapacity(chars);
             ip.string_bytes.appendAssumeCapacity(0);
             return @enumFromInt(len);
@@ -822,6 +822,7 @@ const InternPool = struct {
     // TODO: figure out if this needs to be a getOrPut. Then we need to refactor to use a hashmap with they keys instead of a simple array
     fn putAtIndex(ip: *InternPool, alloc: Allocator, key: Key, index: u32) Allocator.Error!Index {
         const len = ip.items.len;
+        const extra_len = ip.extra.items.len;
         const end = len == index;
         var item: ?Item = if (end) null else ip.items.get(index);
         try ip.items.ensureUnusedCapacity(alloc, 1);
@@ -874,7 +875,7 @@ const InternPool = struct {
                     .@"and" => .condition_and,
                 };
                 if (item == null) {
-                    item = .{ .tag = tag, .data = len };
+                    item = .{ .tag = tag, .data = extra_len };
                 }
                 _ = try ip.extraPlaceAt(alloc, item.?, Condition.Repr{
                     .lhs = lhs,
@@ -887,7 +888,7 @@ const InternPool = struct {
                 const col = key.column;
                 const flags: Column.Flags = .{ .tag = @intFromEnum(col.tag), .is_primary_key = col.is_primary_key, .id = @truncate(col.id) };
                 if (item == null) {
-                    item = .{ .tag = .column, .data = len };
+                    item = .{ .tag = .column, .data = extra_len };
                 }
                 _ = try ip.extraPlaceAt(alloc, item.?, Column.Repr{
                     .name = col.name,
@@ -899,7 +900,7 @@ const InternPool = struct {
             .table => {
                 const tbl = key.table;
                 if (item == null) {
-                    item = .{ .tag = .table, .data = len };
+                    item = .{ .tag = .table, .data = extra_len };
                 }
                 _ = try ip.extraPlaceAt(alloc, item.?, Table.Repr{
                     .name = tbl.name,
@@ -918,6 +919,7 @@ const InternPool = struct {
     }
 
     pub fn indexToKey(ip: *InternPool, index: Index) Key {
+        debug("indexToKey: {d} len: {d}", .{ @intFromEnum(index), ip.items.len });
         const item = ip.items.get(@intFromEnum(index));
         switch (item.tag) {
             .condition_or,
@@ -1879,7 +1881,6 @@ const ASTGen = struct {
         var col_count: u32 = 0;
         var col_index: ?InternPool.Index = null;
         var table_index: ?InternPool.Index = null;
-        var primary_key_index: u32 = 0;
 
         // TODO: errdefer dealloc elements of partially allocated table
 
@@ -1922,7 +1923,6 @@ const ASTGen = struct {
                         .word => {
                             const token_end = ASTGen.getTokenEnd(sql_str.slice(self.ip), token);
                             name = try sql_str.toString().copySubstringNullTerminate(self.gpa, token.start, token_end, self.ip);
-                            col_count += 1;
                             state = .table_col_type;
                         },
                         else => return Error.InvalidSyntax,
@@ -1949,14 +1949,18 @@ const ASTGen = struct {
                                 .tag = tag.?,
                                 .is_primary_key = primary_key == PrimaryKeyState.current,
                             } });
-                            if (col_count != 0) {
-                                var data = self.ip.indexToKey(col_index.?);
+                            col_count += 1;
+                            if (col_index == null) {
+                                var data = self.ip.indexToKey(table_index.?);
                                 data.table.first_column = new_index.toOptional();
                                 try self.ip.update(self.gpa, table_index.?, data);
+                            } else {
+                                var data = self.ip.indexToKey(col_index.?);
+                                data.column.next_column = new_index.toOptional();
+                                try self.ip.update(self.gpa, col_index.?, data);
                             }
                             col_index = new_index;
                             if (primary_key == PrimaryKeyState.current) {
-                                primary_key_index = col_count - 1;
                                 primary_key = PrimaryKeyState.filled;
                             }
                             if (token.tag == TokenType.comma) {
