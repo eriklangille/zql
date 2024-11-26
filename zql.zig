@@ -232,7 +232,7 @@ const InternPool = struct {
         pub fn copySubstringNullTerminate(self: Self, alloc: Allocator, start_index: u32, end_index: u32, ip: *InternPool) !NullTerminatedString {
             try Self.ensureExtraCapacity(alloc, end_index - start_index + 1, ip);
             const len: u32 = @intCast(ip.string_bytes.items.len);
-            const chars = self.slice(end_index - start_index, ip);
+            const chars = self.slice(end_index, ip)[start_index..end_index];
             ip.string_bytes.appendSliceAssumeCapacity(chars);
             ip.string_bytes.appendAssumeCapacity(0);
             return @enumFromInt(len);
@@ -290,6 +290,7 @@ const InternPool = struct {
         var col_count: u32 = 0;
         while (col_index_optional.unwrap()) |col_index| {
             const col_key = ip.indexToKey(col_index).column;
+            debug("columnFromName: {s} == {s}", .{ col_key.name.slice(ip), col_name });
             if (eql(u8, col_key.name.slice(ip), col_name)) {
                 return .{ .index = col_index, .count = col_count };
             }
@@ -324,6 +325,7 @@ const InternPool = struct {
     pub fn setInst(ip: *InternPool, index: InstIndex, key: Instruction) void {
         const opcode = key.opcode();
         const index_int: u32 = @intFromEnum(index);
+        debug("setInst: {}, index: {d}, size: {d}", .{ opcode, index_int, key.size() });
         switch (key.size()) {
             0 => {
                 ip.instructions.set(index_int, .{ .opcode = opcode, .data = 0 });
@@ -354,6 +356,9 @@ const InternPool = struct {
                     .row_id => |extra_data| {
                         ip.insertExtra(extra_index, extra_data);
                     },
+                    .result_row => |extra_data| {
+                        ip.insertExtra(extra_index, extra_data);
+                    },
                     .column => |extra_data| {
                         ip.insertExtra(extra_index, extra_data);
                     },
@@ -382,6 +387,7 @@ const InternPool = struct {
             return null; // TODO: throw an error instead?
         }
         const item = ip.instructions.get(unwrap.?);
+        debug("getInst: {d}", .{item.data});
         switch (item.opcode) {
             .init => return .{ .init = @enumFromInt(item.data) },
             .halt => return Instruction.halt,
@@ -402,6 +408,10 @@ const InternPool = struct {
                 const extra_data = ip.extraData(Instruction.RowId, item.data);
                 return .{ .row_id = extra_data };
             },
+            .result_row => {
+                const extra_data = ip.extraData(Instruction.ResultRow, item.data);
+                return .{ .result_row = extra_data };
+            },
             .column => {
                 const extra_data = ip.extraData(Instruction.Column, item.data);
                 return .{ .column = extra_data };
@@ -412,6 +422,7 @@ const InternPool = struct {
             },
             .transaction => {
                 const extra_data = ip.extraData(Instruction.Transaction.Repr, item.data);
+                debug("getInst transaction: ", .{});
                 return .{ .transaction = extra_data.unpack() };
             },
             .string => {
@@ -467,15 +478,15 @@ const InternPool = struct {
                 .eq => .eq,
                 .neq => .neq,
                 .goto => .goto,
-                .rewind => .rewind,
                 .row_id => .row_id,
+                .rewind => .rewind,
+                .column => .column,
                 .open_read => .open_read,
                 .result_row => .result_row,
                 .next => .next,
                 .transaction => .transaction,
                 .string => .string,
                 .integer => .integer,
-                else => unreachable, // TODO: add rest of instructions
             };
         }
 
@@ -550,18 +561,17 @@ const InternPool = struct {
         // and that the current process needs to reread the schema. If the schema cookie in P3 differs from the schema cookie in the database header
         // or if the schema generation counter in P4 differs from the current generation counter, then an SQLITE_SCHEMA error is raised and
         // execution halts. The sqlite3_step() wrapper function might then reprepare the statement and rerun it from the beginning.
-        // TODO: make this take 32 bits instead of 64 - get rid of bool
         const Transaction = struct {
             database_id: u32,
             write: bool,
-            // TODO: schema validation
+            // TODO: transaction schema validation
 
             const Repr = struct {
                 db_write: u32,
 
                 pub fn unpack(self: Repr) Transaction {
                     return .{
-                        .database_id = @bitCast(self.db_write >> 1),
+                        .database_id = self.db_write >> 1,
                         .write = self.db_write & 1 == 1,
                     };
                 }
@@ -1886,6 +1896,7 @@ const ASTGen = struct {
 
         while (index < self.token_list.len) : (index += 1) {
             const token: MinimizedToken = self.token_list.get(index);
+            debug("buildCreateTable token: {}", .{token});
             switch (state) {
                 .create => {
                     if (token.tag == .keyword_create) {
@@ -1906,6 +1917,7 @@ const ASTGen = struct {
                         .word => {
                             const token_end = ASTGen.getTokenEnd(sql_str.slice(self.ip), token);
                             const table_name = try sql_str.toString().copySubstringNullTerminate(self.gpa, token.start, token_end, self.ip);
+                            debug("table_name: {s}", .{table_name.slice(self.ip)});
                             table_index = try self.ip.put(self.gpa, .{ .table = .{
                                 .name = table_name,
                                 .page = sqlite_table.page,
@@ -2278,24 +2290,26 @@ const ASTGen = struct {
 
 const TableMetadataReader = struct {
     ip: *InternPool,
+    table: InternPool.Table,
     index: InternPool.Index.Optional,
 
     pub fn from(intern_pool: *InternPool, table_index: InternPool.Index) TableMetadataReader {
+        const table = intern_pool.indexToKey(table_index).table;
         return .{
             .ip = intern_pool,
-            .index = table_index.toOptional(),
+            .table = table,
+            .index = table.first_column,
         };
     }
 
     pub fn next(self: *TableMetadataReader) ?struct { col: InternPool.Column, index: InternPool.Index } {
-        const new_index = self.index.unwrap();
-        if (new_index == null) {
-            return null;
+        const result_index_opt = self.index.unwrap();
+        if (result_index_opt) |result_index| {
+            const element = self.ip.indexToKey(result_index).column;
+            self.index = element.next_column;
+            return .{ .col = element, .index = result_index };
         }
-        // TODO: assert that this is a column key
-        const element = self.ip.indexToKey(new_index.?).column;
-        self.index = element.next_column;
-        return .{ .col = element, .index = new_index.? };
+        return null;
     }
 };
 
