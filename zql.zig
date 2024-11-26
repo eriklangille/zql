@@ -43,17 +43,25 @@ const PackedU64 = packed struct {
     }
 
     pub fn init(ty: anytype) PackedU64 {
-        const type_size = @sizeOf(ty);
-        comptime assert(type_size == @sizeOf(PackedU64) or type_size == u32);
+        comptime assert(@sizeOf(@TypeOf(ty)) == @sizeOf(PackedU64));
         return @bitCast(ty);
     }
 };
 
 const InternPool = struct {
     items: MultiArrayList(Item),
-    instructions: MultiArrayList(Inst),
+    instructions: MultiArrayList(InstItem),
     extra: ArrayListUnmanaged(u32),
     string_bytes: ArrayListUnmanaged(u8),
+
+    pub fn init() InternPool {
+        return .{
+            .items = .{},
+            .instructions = .{},
+            .extra = .{},
+            .string_bytes = .{},
+        };
+    }
 
     pub fn deinit(ip: *InternPool, alloc: Allocator) void {
         ip.items.deinit(alloc);
@@ -65,12 +73,7 @@ const InternPool = struct {
     const Tag = enum(u8) {
         table,
         column,
-        register_none,
-        register_int,
-        register_float,
-        register_str,
-        register_string,
-        register_binary,
+        cursor,
         condition_or,
         condition_and,
         condition_lte_int,
@@ -100,6 +103,15 @@ const InternPool = struct {
         row_id,
         goto,
         halt,
+        open_read,
+        init,
+        string,
+        integer,
+        result_row,
+        next,
+        rewind,
+        column,
+        transaction,
     };
 
     const InstItem = struct {
@@ -155,11 +167,18 @@ const InternPool = struct {
             return @enumFromInt(@intFromEnum(self));
         }
 
-        pub fn slice(self: *const Self) [:0]const u8 {
+        pub fn slice(self: *const Self, ip: *InternPool) [:0]const u8 {
             const string = self.toString();
             const index = string.unwrap();
-            const full_slice = string.sliceToEnd();
-            return string_bytes.items[index .. index + std.mem.indexOfScalar(u8, full_slice, 0).? :0];
+            const full_slice = string.sliceToEnd(ip);
+            return ip.string_bytes.items[index .. index + std.mem.indexOfScalar(u8, full_slice, 0).? :0];
+        }
+
+        pub fn initAddSentinel(alloc: Allocator, chars: []const u8, ip: *InternPool) !Self {
+            const len: u32 = @intCast(ip.string_bytes.items.len);
+            try ip.string_bytes.appendSlice(alloc, chars);
+            try ip.string_bytes.append(alloc, 0);
+            return @enumFromInt(len);
         }
     };
 
@@ -170,100 +189,241 @@ const InternPool = struct {
 
         const Self = @This();
 
-        fn unwrap(self: *const Self) u32 {
+        fn unwrap(self: Self) u32 {
             return @intFromEnum(self);
         }
 
-        pub fn toNullTerminatedString(self: *const Self, len: u64) NullTerminatedString {
+        pub fn toNullTerminatedString(self: Self, len: u64) NullTerminatedString {
             assert(isNullTerminated(self, len));
             return @enumFromInt(@intFromEnum(self));
         }
 
-        pub fn slice(self: *const Self, len: u64) []const u8 {
+        pub fn slice(self: Self, len: u64, ip: *InternPool) []const u8 {
             const index = self.unwrap();
-            return string_bytes.items[index .. index + len];
+            return ip.string_bytes.items[index .. index + @as(u32, @intCast(len))];
         }
 
-        fn isNullTerminated(self: *const Self, len: u64) bool {
+        fn isNullTerminated(self: Self, len: u64, ip: *InternPool) bool {
             const index = self.unwrap();
-            return string_bytes.items[index + len - 1] == 0;
+            return ip.string_bytes.items[index + len - 1] == 0;
         }
 
-        pub fn initAssumeCapacity(chars: []const u8) Self {
-            const len: u32 = @intCast(string_bytes.items.len);
-            string_bytes.appendSliceAssumeCapacity(chars);
-            return Self{ .index = len, .len = chars.len };
-        }
-
-        pub fn ensureExtraCapacity(alloc: Allocator, additional_count: u32) !void {
-            try string_bytes.ensureUnusedCapacity(alloc, additional_count);
-        }
-
-        pub fn init(alloc: Allocator, chars: []const u8) !Self {
-            const len: u32 = @intCast(string_bytes.items.len);
-            try string_bytes.appendSlice(alloc, chars);
+        pub fn initAssumeCapacity(chars: []const u8, ip: *InternPool) Self {
+            const len: u32 = @intCast(ip.string_bytes.items.len);
+            ip.string_bytes.appendSliceAssumeCapacity(chars);
             return @enumFromInt(len);
         }
 
-        pub fn copySubstring(self: *const Self, alloc: Allocator, start_index: u32, end_index: u32) !Self {
+        pub fn ensureExtraCapacity(alloc: Allocator, additional_count: u32, ip: *InternPool) !void {
+            try ip.string_bytes.ensureUnusedCapacity(alloc, additional_count);
+        }
+
+        pub fn init(alloc: Allocator, chars: []const u8, ip: *InternPool) !Self {
+            const len: u32 = @intCast(ip.string_bytes.items.len);
+            try ip.string_bytes.appendSlice(alloc, chars);
+            return @enumFromInt(len);
+        }
+
+        pub fn copySubstring(self: Self, alloc: Allocator, start_index: u32, end_index: u32, ip: *InternPool) !Self {
             try Self.ensureExtraCapacity(alloc, end_index - start_index);
-            return Self.initAssumeCapacity(self.slice()[start_index..end_index]);
+            return Self.initAssumeCapacity(self.slice(end_index - start_index + 1, ip)[start_index..end_index], ip);
         }
 
-        pub fn sliceToEnd(self: *const Self) []const u8 {
-            const index = self.unwrap();
-            return string_bytes.items[index..];
-        }
-
-        pub fn initAddSentinel(alloc: Allocator, chars: []const u8) !Self {
-            const len: u32 = @intCast(string_bytes.items.len);
-            try string_bytes.appendSlice(alloc, chars);
-            try string_bytes.append(alloc, 0);
+        pub fn copySubstringNullTerminate(self: Self, alloc: Allocator, start_index: u32, end_index: u32, ip: *InternPool) !NullTerminatedString {
+            try Self.ensureExtraCapacity(alloc, end_index - start_index + 1, ip);
+            const len: u32 = @intCast(ip.string_bytes.items.len);
+            const chars = self.slice(end_index - start_index + 1, ip)[start_index..end_index];
+            ip.string_bytes.appendSliceAssumeCapacity(chars);
+            ip.string_bytes.appendAssumeCapacity(0);
             return @enumFromInt(len);
+        }
+
+        pub fn sliceToEnd(self: Self, ip: *InternPool) []const u8 {
+            const index = self.unwrap();
+            return ip.string_bytes.items[index..];
         }
     };
 
     const Table = struct {
         name: NullTerminatedString,
         page: u32,
-        first_column: Index,
+        first_column: Index.Optional,
 
         const Repr = struct {
-            name: u32,
+            name: NullTerminatedString,
             page: u32,
-            first_column: u32,
+            first_column: Index.Optional,
         };
     };
 
     const Column = struct {
         name: NullTerminatedString,
+        id: u32,
         next_column: Index.Optional,
-        tag: enum(u3) {
+        tag: Column.Tag,
+        is_primary_key: bool,
+
+        const Tag = enum(u3) {
             text,
             integer,
             real,
             null,
             blob,
-        },
-        is_primary_key: bool,
+        };
 
         const Repr = struct {
-            name: u32,
-            next_column: u32,
+            name: NullTerminatedString,
+            next_column: Index.Optional,
             flags: u32,
         };
 
         const Flags = packed struct {
             tag: u3,
             is_primary_key: bool,
-            _: u28,
+            id: u28, // If more flags are necessary, this can be shortened
         };
     };
 
-    pub fn addInst(ip: *InternPool, alloc: Allocator, key: Instruction) InstIndex {
-        const index = ip.instructions.items.len;
-        try ip.instructions.append(alloc, key);
-        return @enumFromInt(index);
+    pub fn columnFromName(ip: *InternPool, table: Index, col_name: []const u8) ?struct { index: InternPool.Index, count: u32 } {
+        const table_key = ip.indexToKey(table).table;
+        var col_index_optional = table_key.first_column;
+        var col_count: u32 = 0;
+        while (col_index_optional.unwrap()) |col_index| {
+            const col_key = ip.indexToKey(col_index).column;
+            if (eql(u8, col_key.name.slice(ip), col_name)) {
+                return .{ .index = col_index, .count = col_count };
+            }
+            col_count += 1;
+            col_index_optional = col_key.next_column;
+        }
+        return null;
+    }
+
+    pub fn peekInst(ip: *InternPool) InstIndex {
+        const len = ip.instructions.len;
+        if (len == 0) {
+            return InstIndex.none;
+        }
+        return @enumFromInt(len);
+    }
+
+    pub fn addInst(ip: *InternPool, alloc: Allocator, key: Instruction) Allocator.Error!InstIndex {
+        const index: u32 = try ip.instructions.addOne(alloc);
+        // Each data index in extra is 4 bytes. So we bit shift to the right by 2 (4 bytes) to determine how many 32 bit extra indices we need.
+        const size: u32 = key.size() >> 2;
+        if (size > 1) {
+            const extra_index: u32 = ip.extra.items.len;
+            try ip.extra.appendNTimes(alloc, 0, size);
+            ip.instructions.insertAssumeCapacity(index, .{ .opcode = key.opcode(), .data = extra_index });
+        }
+        const index_enum: InstIndex = @enumFromInt(index);
+        ip.setInst(index_enum, key);
+        return index_enum;
+    }
+
+    pub fn setInst(ip: *InternPool, index: InstIndex, key: Instruction) void {
+        const opcode = key.opcode();
+        const index_int: u32 = @intFromEnum(index);
+        switch (key.size()) {
+            0 => {
+                ip.instructions.set(index_int, .{ .opcode = opcode, .data = 0 });
+            },
+            4 => {
+                switch (key) {
+                    .init => |init_inst| {
+                        ip.instructions.set(index_int, .{ .opcode = opcode, .data = @intFromEnum(init_inst) });
+                    },
+                    .goto => |goto_inst| {
+                        ip.instructions.set(index_int, .{ .opcode = opcode, .data = @intFromEnum(goto_inst) });
+                    },
+                    .open_read => |table_index| {
+                        ip.instructions.set(index_int, .{ .opcode = opcode, .data = @intFromEnum(table_index) });
+                    },
+                    else => unreachable, // Not a 4 byte payload instruction
+                }
+            },
+            else => {
+                const extra_index: u32 = ip.instructions.get(index_int).data;
+                switch (key) {
+                    .eq, .neq => |extra_data| {
+                        ip.insertExtra(extra_index, extra_data);
+                    },
+                    .rewind => |extra_data| {
+                        ip.insertExtra(extra_index, extra_data);
+                    },
+                    .row_id => |extra_data| {
+                        ip.insertExtra(extra_index, extra_data);
+                    },
+                    .column => |extra_data| {
+                        ip.insertExtra(extra_index, extra_data);
+                    },
+                    .next => |extra_data| {
+                        ip.insertExtra(extra_index, extra_data);
+                    },
+                    .transaction => |extra_data| {
+                        ip.insertExtra(extra_index, extra_data.pack());
+                    },
+                    .string => |extra_data| {
+                        ip.insertExtra(extra_index, extra_data);
+                    },
+                    .integer => |extra_int| {
+                        ip.insertExtra(extra_index, extra_int.pack());
+                    },
+                    else => unreachable,
+                }
+                ip.instructions.set(index_int, .{ .opcode = opcode, .data = extra_index });
+            },
+        }
+    }
+
+    pub fn getInst(ip: *InternPool, index: InstIndex) ?Instruction {
+        const unwrap = index.unwrap();
+        if (unwrap == null) {
+            return null; // TODO: throw an error instead?
+        }
+        const item = ip.instructions.get(unwrap.?);
+        switch (item.opcode) {
+            .init => return .{ .init = @enumFromInt(item.data) },
+            .halt => return Instruction.halt,
+            .eq => {
+                const extra_data = ip.extraData(Instruction.Equal, item.data);
+                return .{ .eq = extra_data };
+            },
+            .neq => {
+                const extra_data = ip.extraData(Instruction.Equal, item.data);
+                return .{ .neq = extra_data };
+            },
+            .goto => return .{ .goto = @enumFromInt(item.data) },
+            .rewind => {
+                const extra_data = ip.extraData(Instruction.Rewind, item.data);
+                return .{ .rewind = extra_data };
+            },
+            .row_id => {
+                const extra_data = ip.extraData(Instruction.RowId, item.data);
+                return .{ .row_id = extra_data };
+            },
+            .column => {
+                const extra_data = ip.extraData(Instruction.Column, item.data);
+                return .{ .column = extra_data };
+            },
+            .next => {
+                const extra_data = ip.extraData(Instruction.Next, item.data);
+                return .{ .next = extra_data };
+            },
+            .transaction => {
+                const extra_data = ip.extraData(Instruction.Transaction.Repr, item.data);
+                return .{ .transaction = extra_data.unpack() };
+            },
+            .string => {
+                const extra_data = ip.extraData(Instruction.String, item.data);
+                return .{ .string = extra_data };
+            },
+            .integer => {
+                const extra_data = ip.extraData(Instruction.Integer.Repr, item.data);
+                return .{ .integer = extra_data.unpack() };
+            },
+            else => unreachable, // TODO: add rest of instructions
+        }
     }
 
     const InstIndex = enum(u32) {
@@ -272,7 +432,14 @@ const InternPool = struct {
         pub fn unwrap(opt: InstIndex) ?u32 {
             return switch (opt) {
                 .none => return null,
-                _ => @intFromEnum(InstIndex),
+                _ => @intFromEnum(opt),
+            };
+        }
+
+        pub fn increment(opt: InstIndex) InstIndex {
+            return switch (opt) {
+                .none => @enumFromInt(0),
+                else => @enumFromInt(@intFromEnum(opt) + 1),
             };
         }
     };
@@ -282,21 +449,64 @@ const InternPool = struct {
         halt: void,
         eq: Instruction.Equal,
         neq: Instruction.Equal,
-        goto: Instruction,
-        row_id: RowId,
-        rewind: Rewind,
+        goto: InstIndex,
+        row_id: Instruction.RowId,
+        rewind: Instruction.Rewind,
+        column: Instruction.Column,
+        open_read: Index, // Table Index
+        result_row: Instruction.ResultRow,
+        next: Instruction.Next,
+        transaction: Instruction.Transaction,
+        string: Instruction.String,
+        integer: Instruction.Integer,
+
+        fn opcode(inst: Instruction) Opcode {
+            return switch (inst) {
+                .init => .init,
+                .halt => .halt,
+                .eq => .eq,
+                .neq => .neq,
+                .goto => .goto,
+                .rewind => .rewind,
+                .row_id => .row_id,
+                .open_read => .open_read,
+                .result_row => .result_row,
+                .next => .next,
+                .transaction => .transaction,
+                .string => .string,
+                .integer => .integer,
+                else => unreachable, // TODO: add rest of instructions
+            };
+        }
+
+        fn size(inst: Instruction) u32 {
+            return switch (inst) {
+                .halt => 0,
+                .init, .goto, .open_read => 4,
+                .eq, .neq => @sizeOf(Instruction.Equal),
+                .row_id => @sizeOf(Instruction.RowId),
+                .result_row => @sizeOf(Instruction.ResultRow),
+                .rewind => @sizeOf(Instruction.Rewind),
+                .column => @sizeOf(Instruction.Column),
+                .next => @sizeOf(Instruction.Next),
+                .transaction => @sizeOf(Instruction.Transaction),
+                .string => @sizeOf(Instruction.String),
+                .integer => @sizeOf(Instruction.Integer),
+            };
+        }
 
         const Equal = struct {
-            lhs_reg: Index.Optional,
-            rhs_reg: Index.Optional,
+            lhs_reg: Register.Index,
+            rhs_reg: Register.Index,
+            jump: InstIndex,
         };
 
         // Store in register P2 an integer which is the key of the table entry that P1 is currently point to.
         // P1 can be either an ordinary table or a virtual table. There used to be a separate OP_VRowid opcode for use with virtual tables,
         // but this one opcode now works for both table types.
         const RowId = struct {
-            read_cursor: u32,
-            store_reg: Index.Optional,
+            read_cursor: Index,
+            store_reg: Register.Index,
         };
 
         // The next use of the Rowid or Column or Next instruction for P1 will refer to the first entry in the database table or index.
@@ -304,124 +514,101 @@ const InternPool = struct {
         // If P2 is zero, that is an assertion that the P1 table is never empty and hence the jump will never be taken.
         // This opcode leaves the cursor configured to move in forward order, from the beginning toward the end. In other words, the cursor is configured to use Next, not Prev.
         const Rewind = struct {
-            index: InstIndex,
+            table: Index,
             end_inst: InstIndex,
         };
-    };
 
-    const Register = union(enum) {
-        none,
-        int: i64,
-        float: f64,
-        string: StringLen,
-        str: []u8, // TODO: consider removing these, and make all bytes be interned. Or use a 32 bit index instead of a pointer
-        binary: []u8,
-
-        const StringLen = struct {
-            string: String,
-            len: u32,
+        // Interpret the data that cursor P1 points to as a structure built using the MakeRecord instruction. Extract the P2-th column from this record.
+        // If there are less than (P2+1) values in the record, extract a NULL.
+        // The value extracted is stored in register P3.
+        // If the record contains fewer than P2 fields, then extract a NULL. Or, if the P4 argument is a P4_MEM use the value of the P4 argument as the result.
+        const Column = struct {
+            cursor: Index,
+            store_reg: Register.Index,
+            col: Index,
         };
 
-        const Repr = struct {
-            @"0": u32,
-            @"1": u32,
+        // The registers P1 through P1+P2-1 contain a single row of results. This opcode causes the sqlite3_step() call to terminate with an SQLITE_ROW return code
+        // and it sets up the sqlite3_stmt structure to provide access to the r(P1)..r(P1+P2-1) values as the result row.
+        const ResultRow = struct {
+            start_reg: Register.Index,
+            end_reg: Register.Index,
         };
 
-        pub fn fromColumn(column: SQLiteColumn) Register {
-            switch (column) {
-                .i8, .i16, .i24, .i32, .i48, .i64 => return .{ .int = column.getInt().? },
-                .value_0 => return .{ .int = 0 },
-                .value_1 => return .{ .int = 1 },
-                .f64 => return .{ .float = column.f64 },
-                .empty => return Register.none,
-                .invalid => {
-                    debug("invalid SQLiteColumn when converting to register", .{});
-                    return Register.none;
-                },
-                .blob => return .{ .binary = column.blob },
-                .text => return .{ .str = column.text },
-            }
-        }
+        const Next = struct {
+            cursor: Index,
+            success_jump: InstIndex,
+        };
 
-        // TODO: validate that this works
-        pub fn tag(self: Register) type {
-            return std.meta.activeTag(self);
-        }
+        // Begin a transaction on database P1 if a transaction is not already active. If P2 is non-zero, then a write-transaction is started,
+        // or if a read-transaction is already active, it is upgraded to a write-transaction. If P2 is zero, then a read-transaction is started.
+        // If P2 is 2 or more then an exclusive transaction is started.
+        // P1 is the index of the database file on which the transaction is started. Index 0 is the main database file and index 1 is the file
+        // used for temporary tables. Indices of 2 or more are used for attached databases.
+        // If P5!=0 then this opcode also checks the schema cookie against P3 and the schema generation counter against P4.
+        // The cookie changes its value whenever the database schema changes. This operation is used to detect when that the cookie has changed
+        // and that the current process needs to reread the schema. If the schema cookie in P3 differs from the schema cookie in the database header
+        // or if the schema generation counter in P4 differs from the current generation counter, then an SQLITE_SCHEMA error is raised and
+        // execution halts. The sqlite3_step() wrapper function might then reprepare the statement and rerun it from the beginning.
+        // TODO: make this take 32 bits instead of 64 - get rid of bool
+        const Transaction = struct {
+            database_id: u32,
+            write: bool,
+            // TODO: schema validation
 
-        pub fn compare(self: Register, other: Register) bool {
-            if (self.tag() == other.tag()) {
-                return switch (self) {
-                    .none => true,
-                    .int => self.int == other.int,
-                    .float => self.float == other.float,
-                    .str => eql(u8, self.str, other.str),
-                    .string => eql(u8, self.string.str(), other.string.str()),
-                    .binary => unreachable, // TODO: implement
+            const Repr = struct {
+                db_write: u32,
+
+                pub fn unpack(self: Repr) Transaction {
+                    return .{
+                        .database_id = @bitCast(self.db_write >> 1),
+                        .write = self.db_write & 1 == 1,
+                    };
+                }
+            };
+
+            pub fn pack(self: Transaction) Repr {
+                var db_write = self.database_id << 1;
+                db_write |= if (self.write) 1 else 0;
+                return .{
+                    .db_write = db_write,
                 };
-            } else if (self.tag() == .str and other.tag() == .string) {
-                return eql(u8, self.string.str(), other.str);
-            } else if (self.tag() == .string and other.tag() == .str) {
-                return eql(u8, self.str, other.string.str());
             }
-            return false;
-        }
+        };
 
-        pub fn toStr(self: Register, buffer: []u8) anyerror![]u8 {
-            return switch (self) {
-                .none => try fmt.bufPrint(buffer, "[null]", .{}),
-                .int => try fmt.bufPrint(buffer, "{d}", .{self.int}),
-                .float => try fmt.bufPrint(buffer, "{e}", .{self.float}),
-                .str => try fmt.bufPrint(buffer, "{s}", .{self.str}),
-                .string => try fmt.bufPrint(buffer, "{s}", .{self.string.str()}),
-                .binary => try fmt.bufPrint(buffer, "[binary]", .{}),
-            };
-        }
+        const String = struct {
+            string: NullTerminatedString,
+            store_reg: Register.Index,
+        };
 
-        pub fn toBuf(self: Register, buffer: []u8) anyerror![]u8 {
-            return switch (self) {
-                .none => {
-                    if (buffer.len < 4) return Allocator.Error.OutOfMemory;
-                    buffer[0..4].* = std.mem.toBytes(@as(u32, 0));
-                    return buffer[0..4];
-                },
-                .int => {
-                    if (buffer.len < 12) return Allocator.Error.OutOfMemory;
-                    buffer[0..4].* = std.mem.toBytes(@as(u32, 1));
-                    buffer[4..12].* = std.mem.toBytes(self.int);
-                    return buffer[0..12];
-                },
-                .float => {
-                    if (buffer.len < 12) return Allocator.Error.OutOfMemory;
-                    buffer[0..4].* = std.mem.toBytes(@as(u32, 2));
-                    buffer[4..12].* = std.mem.toBytes(self.float);
-                    return buffer[0..12];
-                },
-                .str => {
-                    if (buffer.len < self.str.len + 8) return Allocator.Error.OutOfMemory;
-                    buffer[0..4].* = std.mem.toBytes(@as(u32, 3));
-                    const len = self.str.len;
-                    buffer[4..8].* = std.mem.toBytes(len);
-                    const fmt_slice = try fmt.bufPrint(buffer[8..], "{s}", .{self.str});
-                    return buffer[0 .. 8 + fmt_slice.len];
-                },
-                .string => {
-                    if (buffer.len < self.string.len + 8) return Allocator.Error.OutOfMemory;
-                    buffer[0..4].* = std.mem.toBytes(@as(u32, 3));
-                    const len = self.string.len;
-                    buffer[4..8].* = std.mem.toBytes(len);
-                    const fmt_slice = try fmt.bufPrint(buffer[8..], "{s}", .{self.string.str()});
-                    return buffer[0 .. 8 + fmt_slice.len];
-                },
-                .binary => {
-                    if (buffer.len < self.binary.len + 8) return Allocator.Error.OutOfMemory;
-                    buffer[0..4].* = std.mem.toBytes(@as(u32, 4));
-                    const len = self.binary.len;
-                    buffer[4..8].* = std.mem.toBytes(len);
-                    @memcpy(buffer[8..], self.binary);
-                    return buffer[0 .. len + 8];
-                },
+        const Integer = struct {
+            int: i64,
+            store_reg: Register.Index,
+
+            const Repr = struct {
+                int_0: u32,
+                int_1: u32,
+                store_reg: Register.Index,
+
+                pub fn unpack(self: Repr) Integer {
+                    const packed_int: PackedU64 = .{ .a = self.int_0, .b = self.int_1 };
+                    const unpack_int: i64 = @bitCast(packed_int.unwrap());
+                    return .{
+                        .int = unpack_int,
+                        .store_reg = self.store_reg,
+                    };
+                }
             };
-        }
+
+            pub fn pack(self: Integer) Repr {
+                const packed_int = PackedU64.init(self.int);
+                return .{
+                    .store_reg = self.store_reg,
+                    .int_0 = packed_int.a,
+                    .int_1 = packed_int.b,
+                };
+            }
+        };
     };
 
     const Condition = struct {
@@ -431,13 +618,13 @@ const InternPool = struct {
             condition: Index, // Condition index
         },
         rhs: union(enum) {
-            condition: Index,
-            string: String,
+            condition: Index.Optional,
+            string: NullTerminatedString,
             int: i64,
             float: f64,
         },
 
-        const Equality = union(u8) {
+        const Equality = enum(u8) {
             @"or",
             @"and",
             eq,
@@ -455,42 +642,111 @@ const InternPool = struct {
         };
     };
 
+    const Cursor = struct {
+        index: u32,
+    };
+
     const Key = union(enum) {
         table: Table,
         column: Column,
-        register: Register,
         condition: Condition,
+        cursor: Cursor,
     };
+
+    pub fn dump(ip: *InternPool, index: Index.Optional) void {
+        const buf: [512]u8 = undefined;
+        var fbs = io.fixedBufferStream(@constCast(&buf));
+        _ = ip.bufWrite(@constCast(&fbs), index) catch null;
+        const slice = fbs.getWritten();
+        print(slice.ptr, slice.len);
+    }
+
+    fn bufWrite(ip: *InternPool, buffer: *FixedBufferStream([]u8), index: Index.Optional) anyerror!void {
+        if (index.unwrap() == null) {
+            _ = try buffer.write("NULL");
+            return;
+        }
+        const key: Key = ip.indexToKey(index.unwrap().?);
+        switch (key) {
+            .condition => |condition_data| {
+                switch (condition_data.lhs) {
+                    .column => |column| {
+                        switch (condition_data.equality) {
+                            .eq => _ = try buffer.write("(EQ "),
+                            .ne => _ = try buffer.write("(NE "),
+                            .lt => _ = try buffer.write("(LT "),
+                            .lte => _ = try buffer.write("(LTE "),
+                            .gt => _ = try buffer.write("(GT "),
+                            .gte => _ = try buffer.write("(GTE "),
+                            else => unreachable, // Not a column equality
+                        }
+                        switch (condition_data.rhs) {
+                            .int => |int_value| try fmt.format(buffer.writer().any(), "COL_{d}, {d})", .{ @intFromEnum(column), int_value }),
+                            .float => |float_value| try fmt.format(buffer.writer().any(), "COL_{d}, {e})", .{ @intFromEnum(column), float_value }),
+                            .string => |str_value| try fmt.format(buffer.writer().any(), "COL_{d}, {s})", .{ @intFromEnum(column), str_value.slice(ip) }),
+                            else => unreachable,
+                        }
+                    },
+                    .condition => |condition_lhs| {
+                        switch (condition_data.equality) {
+                            .@"and" => _ = try buffer.write("(AND "),
+                            .@"or" => _ = try buffer.write("(OR "),
+                            else => unreachable, // Not a condition equality
+                        }
+                        switch (condition_data.rhs) {
+                            .condition => |condition_rhs| {
+                                try ip.bufWrite(buffer, condition_lhs.toOptional());
+                                _ = try buffer.write(", ");
+                                try ip.bufWrite(buffer, condition_rhs);
+                                _ = try buffer.write(")");
+                            },
+                            else => unreachable, // Can only compare condition to another condition
+                        }
+                    },
+                }
+            },
+            else => unreachable, // TODO: implement dump for other key types
+        }
+    }
 
     fn addExtra(ip: *InternPool, alloc: Allocator, item: anytype) Allocator.Error!u32 {
         const len = ip.extra.items.len;
-        return try ip.insertExtra(alloc, item, len);
+        // Each data index in extra is 4 bytes. So we bit shift to the right by 2 (4 bytes) to determine how many 32 bit (4 byte) extra indices we need.
+        const size: u32 = @sizeOf(@TypeOf(item)) >> 2;
+        try ip.extra.appendNTimes(alloc, 0, size);
+        ip.insertExtra(len, item);
+        return len;
     }
 
-    fn insertExtra(ip: *InternPool, alloc: Allocator, item: anytype, index: u32) Allocator.Error!u32 {
-        const fields = @typeInfo(@TypeOf(item)).@"struct".fields;
-        ip.extra.appendNTimes(alloc, 0, fields.len);
-        const result: u32 = ip.extra.items.len;
+    fn insertExtra(ip: *InternPool, index: u32, item: anytype) void {
+        // const fields = @typeInfo(@TypeOf(item)).@"struct".fields;
+        const fields = @typeInfo(@TypeOf(item)).Struct.fields;
         inline for (fields, 0..) |field, i| {
-            extra.items[index + i] = switch (field.type) {
-                Index, String => @intFromEnum(@field(item, field.name)),
+            ip.extra.items[index + i] = switch (field.type) {
+                Index, Index.Optional, Register.Index, InstIndex, NullTerminatedString, String => @intFromEnum(@field(item, field.name)),
                 u32,
                 => @bitCast(@field(item, field.name)),
                 else => @compileError("bad field type: " ++ @typeName(field.type)),
             };
         }
-        return result;
     }
 
     fn extraData(ip: *InternPool, comptime T: type, index: u32) T {
         const extra_items = ip.extra.items;
         var result: T = undefined;
 
-        const fields = @typeInfo(T).@"struct".fields;
+        // const fields = @typeInfo(T).@"struct".fields;
+        const fields = @typeInfo(T).Struct.fields;
         inline for (fields, index..) |field, extra_index| {
             const extra_item = extra_items[extra_index];
             @field(result, field.name) = switch (field.type) {
-                Index, String => @enumFromInt(extra_item),
+                Index,
+                Index.Optional,
+                InstIndex,
+                Register.Index,
+                String,
+                NullTerminatedString,
+                => @enumFromInt(extra_item),
                 u32 => @bitCast(extra_item),
                 else => @compileError("bad field type: " ++ @typeName(field.type)),
             };
@@ -520,26 +776,20 @@ const InternPool = struct {
             => {
                 return @sizeOf(Condition.Repr);
             },
-            .register_none,
-            .register_int,
-            .register_float,
-            .register_str,
-            .register_string,
-            .register_binary,
-            => {
-                return @sizeOf(Register.Repr);
-            },
             .table => {
                 return @sizeOf(Table.Repr);
             },
             .column => {
                 return @sizeOf(Column.Repr);
             },
+            .cursor => {
+                return @sizeOf(Cursor);
+            },
         }
     }
 
     fn itemPlaceAt(ip: *InternPool, index: u32, item: Item) void {
-        const len: u32 = ip.items.items.len;
+        const len: u32 = ip.items.len;
         if (len == index) {
             return ip.items.appendAssumeCapacity(item);
         } else {
@@ -547,24 +797,26 @@ const InternPool = struct {
         }
     }
 
-    fn extraPlaceAt(ip: *InternPool, alloc: Allocator, item: Item, data: anytype) void {
-        comptime assert(@sizeOf(data) == InternPool.extraSize(item));
+    fn extraPlaceAt(ip: *InternPool, alloc: Allocator, item: Item, data: anytype) Allocator.Error!u32 {
+        // TODO: see if I can fix this comptime assert
+        // comptime assert(@sizeOf(@TypeOf(data)) == InternPool.extraSize(item));
         const len: u32 = ip.extra.items.len;
         const index = item.data;
         if (len == index) {
             return try ip.addExtra(alloc, data);
         } else {
-            return try ip.insertExtra(alloc, data, index);
+            ip.insertExtra(index, data);
+            return index;
         }
     }
 
     pub fn put(ip: *InternPool, alloc: Allocator, key: Key) Allocator.Error!Index {
-        const index: u32 = ip.items.items.len;
+        const index: u32 = ip.items.len;
         return try ip.putAtIndex(alloc, key, index);
     }
 
     pub fn update(ip: *InternPool, alloc: Allocator, index: Index, updated_key: Key) Allocator.Error!void {
-        return try ip.putAtIndex(alloc, updated_key, index);
+        _ = try ip.putAtIndex(alloc, updated_key, @intFromEnum(index));
     }
 
     // TODO: figure out if this needs to be a getOrPut. Then we need to refactor to use a hashmap with they keys instead of a simple array
@@ -590,27 +842,33 @@ const InternPool = struct {
                         .string => .condition_eq_string,
                         .int => .condition_eq_int,
                         .float => .condition_eq_float,
+                        .condition => unreachable,
                     },
                     .ne => switch (cond.rhs) {
                         .string => .condition_ne_string,
                         .int => .condition_eq_int,
                         .float => .condition_eq_float,
+                        .condition => unreachable,
                     },
                     .lt => switch (cond.rhs) {
                         .int => .condition_lt_int,
                         .float => .condition_lt_float,
+                        else => unreachable,
                     },
                     .lte => switch (cond.rhs) {
                         .int => .condition_lte_int,
                         .float => .condition_lte_float,
+                        else => unreachable,
                     },
                     .gt => switch (cond.rhs) {
                         .int => .condition_gt_int,
                         .float => .condition_gt_float,
+                        else => unreachable,
                     },
                     .gte => switch (cond.rhs) {
                         .int => .condition_gte_int,
                         .float => .condition_gte_float,
+                        else => unreachable,
                     },
                     .@"or" => .condition_or,
                     .@"and" => .condition_and,
@@ -627,16 +885,16 @@ const InternPool = struct {
             },
             .column => {
                 const col = key.column;
-                const flags: Column.Flags = .{ .tag = col.tag, .is_primary_key = col.is_primary_key };
+                const flags: Column.Flags = .{ .tag = @intFromEnum(col.tag), .is_primary_key = col.is_primary_key, .id = @truncate(col.id) };
                 if (item == null) {
                     item = .{ .tag = .column, .data = len };
                 }
                 _ = try ip.extraPlaceAt(alloc, item.?, Column.Repr{
                     .name = col.name,
-                    .next_column = @intFromEnum(col.next_column),
+                    .next_column = col.next_column,
                     .flags = @bitCast(flags),
                 });
-                ip.itemPlaceAt(index, item);
+                ip.itemPlaceAt(index, item.?);
             },
             .table => {
                 const tbl = key.table;
@@ -648,51 +906,19 @@ const InternPool = struct {
                     .page = tbl.page,
                     .first_column = tbl.first_column,
                 });
-                ip.itemPlaceAt(index, item);
+                ip.itemPlaceAt(index, item.?);
             },
-            .register_str,
-            .register_none,
-            .register_float,
-            .register_string,
-            .register_binary,
-            .register_int,
-            => {
-                const register: Register = key.register;
-                const pack: PackedU64 = switch (register) {
-                    .int => |reg| PackedU64.init(reg),
-                    .float => |reg| PackedU64.init(reg),
-                    .string => |reg| PackedU64{ .a = @intFromEnum(reg.string), .b = reg.len },
-                    .none => PackedU64{ .a = 0, .b = 0 },
-                    .str => |reg| PackedU64{
-                        .a = @bitCast(reg.ptr),
-                        .b = @bitCast(reg.len),
-                    },
-                    .binary => |reg| PackedU64{
-                        .a = @bitCast(reg.ptr),
-                        .b = @bitCast(reg.len),
-                    },
-                };
-                const tag: Tag = switch (register) {
-                    .int => .register_int,
-                    .float => .register_float,
-                    .str => .register_str,
-                    .string => .register_string,
-                    .binary => .register_binary,
-                    .none => .register_none,
-                };
-                if (item == null) {
-                    item = .{ .tag = tag, .data = len };
-                }
-                _ = try ip.extraPlaceAt(alloc, item.?, Register.Repr{ .@"0" = pack.a, .@"1" = pack.b });
-                ip.itemPlaceAt(index, item);
+            .cursor => {
+                const cursor = key.cursor;
+                item = .{ .tag = .cursor, .data = cursor.index };
+                ip.itemPlaceAt(index, item.?);
             },
-            else => unreachable, // TODO: add other key types
         }
         return @enumFromInt(index);
     }
 
     pub fn indexToKey(ip: *InternPool, index: Index) Key {
-        const item = ip.items.get(index);
+        const item = ip.items.get(@intFromEnum(index));
         switch (item.tag) {
             .condition_or,
             .condition_and,
@@ -731,38 +957,30 @@ const InternPool = struct {
                     .condition_ne_float => .{ .equality = .ne, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
                     .condition_eq_string => .{ .equality = .eq, .lhs = .{ .column = lhs_index }, .rhs = .{ .string = @enumFromInt(rhs.a) } },
                     .condition_ne_string => .{ .equality = .ne, .lhs = .{ .column = lhs_index }, .rhs = .{ .string = @enumFromInt(rhs.a) } },
+                    else => unreachable, // Only handling conditions
                 };
-                return result;
+                return .{ .condition = result };
             },
             .column => {
                 const extra_data = ip.extraData(Column.Repr, item.data);
-                const result: Column = .{ .name = extra_data.name, .tag = @enumFromInt(extra_data.flags.tag), .is_primary_key = extra_data.flags.is_primary_key };
-                return result;
+                const flags: Column.Flags = @bitCast(extra_data.flags);
+                const result: Column = .{
+                    .name = extra_data.name,
+                    .next_column = extra_data.next_column,
+                    .tag = @enumFromInt(flags.tag),
+                    .id = flags.id,
+                    .is_primary_key = flags.is_primary_key,
+                };
+                return .{ .column = result };
             },
             .table => {
                 const extra_data = ip.extraData(Table.Repr, item.data);
                 const result: Table = .{ .name = extra_data.name, .page = extra_data.page, .first_column = extra_data.first_column };
-                return result;
+                return .{ .table = result };
             },
-            .register_string,
-            .register_str,
-            .register_binary,
-            .register_int,
-            .register_none,
-            .register_float,
-            => {
-                if (item.tag == .register_none) {
-                    return Register.none;
-                }
-                const extra_data = ip.extraData(Register.Repr, item.data);
-                const result: Register = switch (item.tag) {
-                    .register_string => .{ .string = .{ .string = @enumFromInt(extra_data.@"0"), .len = extra_data.@"1" } },
-                    .register_str => .{ .str = .{ .pointer = @bitCast(extra_data.@"0"), .len = @bitCast(extra_data.@"1") } },
-                    .register_binary => .{ .binary = .{ .pointer = @bitCast(extra_data.@"0"), .len = @bitCast(extra_data.@"1") } },
-                    .register_int => .{ .int = @bitCast(PackedU64.init(extra_data).unwrap()) },
-                    .register_float => .{ .float = @bitCast(PackedU64.init(extra_data).unwrap()) },
-                };
-                return result;
+            .cursor => {
+                const result: Cursor = .{ .index = item.data };
+                return .{ .cursor = result };
             },
         }
     }
@@ -1212,110 +1430,11 @@ const Tokenizer = struct {
     }
 };
 
-const ConditionRef = struct {
-    // ConditionRef uses Element struct, value is val, tag is type of comparison, and data lhs rhs is the left right linked
-    // expressions for and or. Literal comparison has the column id in the lhs
-    index: u32,
-
-    pub const ConditionEquality = enum(u32) {
-        condition_and,
-        condition_or,
-        compare_eq,
-        compare_ne,
-    };
-
-    pub const Condition = struct {
-        equality: ConditionEquality,
-        lhs: union(enum) {
-            column_id: u32,
-            condition: ConditionRef,
-        },
-        rhs: union(enum) {
-            condition: ConditionRef,
-            str: InternPool.String,
-            int: i64,
-            float: f64,
-        },
-    };
-
-    pub fn init(index: u32) ConditionRef {
-        return .{ .index = index };
-    }
-
-    pub fn unwrap(self: ConditionRef, element_list: *ElementList) ?Condition {
-        if (self.index >= element_list.len) return null;
-        const element = element_list.get(self.index);
-
-        switch (element.tag) {
-            .compare_eq_int, .compare_eq_str, .compare_ne_int, .compare_ne_str => return .{
-                .equality = switch (element.tag) {
-                    .compare_eq_str, .compare_eq_float, .compare_eq_int => .compare_eq,
-                    .compare_ne_str, .compare_ne_float, .compare_ne_int => .compare_ne,
-                    else => unreachable, // handled in different case
-                },
-                .lhs = .{ .column_id = element.data.lhs },
-                .rhs = switch (element.tag) {
-                    .compare_eq_str, .compare_ne_str => .{ .str = element.value.str },
-                    .compare_eq_int, .compare_ne_int => .{ .int = element.value.int },
-                    .compare_eq_float, .compare_ne_float => .{ .float = element.value.float },
-                    else => unreachable,
-                },
-            },
-            .compare_or, .compare_and => return .{
-                .equality = switch (element.tag) {
-                    .compare_and => .condition_and,
-                    .compare_or => .condition_or,
-                    else => unreachable,
-                },
-                .lhs = .{ .condition = .{ .index = element.data.lhs } },
-                .rhs = .{ .condition = .{ .index = element.data.rhs } },
-            },
-            else => unreachable, // TODO: implement other types
-        }
-    }
-
-    pub fn dump(self: *ConditionRef, element_list: *ElementList) void {
-        const buf: [500]u8 = undefined;
-        var fbs = io.fixedBufferStream(@constCast(&buf));
-        _ = self.bufWrite(@constCast(&fbs), element_list, self.index) catch null;
-        const slice = fbs.getWritten();
-        print(slice.ptr, slice.len);
-    }
-
-    fn bufWrite(self: *ConditionRef, buffer: *FixedBufferStream([]u8), element_list: *ElementList, index: u32) anyerror!void {
-        if (index == maxInt(u32)) {
-            _ = try buffer.write("NULL");
-            return;
-        }
-        const item: Element = element_list.get(index);
-        switch (item.tag) {
-            .compare_and, .compare_or => {
-                switch (item.tag) {
-                    .compare_and => _ = try buffer.write("(AND "),
-                    .compare_or => _ = try buffer.write("(OR "),
-                    else => _ = try buffer.write("( "),
-                }
-                try self.bufWrite(buffer, element_list, item.data.lhs);
-                _ = try buffer.write(", ");
-                try self.bufWrite(buffer, element_list, item.data.rhs);
-                _ = try buffer.write(")");
-            },
-            .compare_eq_int => {
-                try fmt.format(buffer.writer().any(), "(EQ COL_{d}, {d})", .{ item.data.lhs, item.value.int });
-            },
-            .compare_eq_str => {
-                try fmt.format(buffer.writer().any(), "(EQ COL_{d}, {s})", .{ item.data.lhs, item.value.str.str() });
-            },
-            .compare_ne_float, .compare_ne_int, .compare_ne_str => {}, // TODO: formatting for rest of expr types
-            else => {},
-        }
-    }
-};
-
+// TODO: replace with internpool key
 const SelectStmt = struct {
     columns: u64, // Each bit represents one column in the table TODO: support tables with more than 64 columns
-    table: TableStmt,
-    where: ?ConditionRef,
+    table: InternPool.Index, // table index
+    where: InternPool.Index.Optional, // Optional condition index
 };
 
 const ElementType = enum {
@@ -1348,36 +1467,6 @@ const Data = struct {
     rhs: u32,
 };
 
-const TableStmt = struct {
-    name: InternPool.String,
-    first_column: u32,
-    primary_column: u32,
-    page: u32,
-
-    pub fn getPrimaryKey(self: *TableStmt) u32 {
-        return self.primary_column;
-    }
-
-    // TODO: benchmark to see if a hash table or getting the slices of the element list will speed this up
-    pub fn getColumnIndex(self: *const TableStmt, list: *ElementList, name: []const u8) ?u32 {
-        var index: u32 = self.first_column;
-        var col_count: u32 = 0;
-        while (index < list.len) : (col_count += 1) {
-            const col = list.get(index);
-            if (eql(u8, name, col.value.str.str())) {
-                return col_count;
-            }
-            index = col.data.lhs;
-        }
-        return null;
-    }
-
-    pub fn from(elem: Element, primary: u32) TableStmt {
-        assert(elem.tag == ElementType.table);
-        return .{ .name = elem.value.str, .first_column = elem.data.lhs, .primary_column = primary, .page = elem.data.rhs };
-    }
-};
-
 const Inst = struct {
     // In SQLite, Instructions have 6 properties: opcode, p1: u32, p2: u32, p3: u32, p4: u64 (optional?), and p5: u16.
     // For our Zig implementation, we will do a data struct with two u32 values
@@ -1406,7 +1495,7 @@ const Inst = struct {
 
 const SQLiteDbTable = struct {
     page: u32,
-    sql: InternPool.String,
+    sql: InternPool.NullTerminatedString,
 };
 
 const SQLiteRecord = struct {
@@ -1600,7 +1689,7 @@ const Db = struct {
         const header: *SQLiteDbHeader = @alignCast(@ptrCast(buffer[0..sqlite_header_size]));
         const page_size = header.getPageSize();
         debug("page_size: {d}", .{page_size});
-        return Db{
+        return .{
             .cursor = 0,
             .buffer = buffer,
             .page_size = page_size,
@@ -1633,7 +1722,7 @@ const Db = struct {
     //   sql text
     // );
 
-    pub fn getTable(self: *Db, alloc: Allocator, table_name: []const u8) Error!SQLiteDbTable {
+    pub fn getTable(self: *Db, alloc: Allocator, table_name: []const u8, ip: *InternPool) Error!SQLiteDbTable {
         // the first page contains the buffer (first 100 bytes), so we have a 0 offset to allocate the first page
         // TODO: buffer management
         readBuffer(self.buffer.ptr, 0, self.page_size);
@@ -1662,8 +1751,8 @@ const Db = struct {
                         debug("page_index: {d}", .{page_index});
                         if (record.next()) |sql_col| {
                             if (sql_col != SQLiteColumn.text) return Error.InvalidBinary;
-                            const sql_str = try InternPool.String.initAddSentinel(alloc, sql_col.text, 0);
-                            return SQLiteDbTable{
+                            const sql_str = try InternPool.NullTerminatedString.initAddSentinel(alloc, sql_col.text, ip);
+                            return .{
                                 .page = page_index,
                                 .sql = sql_str,
                             };
@@ -1686,8 +1775,8 @@ const Db = struct {
 const ASTGen = struct {
     index: usize,
     gpa: Allocator,
+    ip: *InternPool,
     token_list: *TokenList,
-    element_list: *ElementList,
     source: [:0]u8,
     db: Db,
 
@@ -1713,10 +1802,10 @@ const ASTGen = struct {
         where_rhs,
     };
 
-    pub fn from(
+    pub fn init(
         gpa: Allocator,
         token_list: *TokenList,
-        element_list: *ElementList,
+        intern_pool: *InternPool,
         source: [:0]u8,
         db: Db,
     ) Error!ASTGen {
@@ -1724,7 +1813,7 @@ const ASTGen = struct {
             .index = 0,
             .gpa = gpa,
             .token_list = token_list,
-            .element_list = element_list,
+            .ip = intern_pool,
             .source = source,
             .db = db,
         };
@@ -1743,20 +1832,6 @@ const ASTGen = struct {
         var tokenizer = Tokenizer.from(buffer, min_token.start);
         const token = tokenizer.next();
         return token.location.end;
-    }
-
-    fn addElement(self: *ASTGen, elem: Element) Allocator.Error!u32 {
-        const result = @as(u32, @intCast(self.element_list.len));
-        try self.element_list.append(self.gpa, elem);
-        return result;
-    }
-
-    fn getElement(self: *ASTGen, index: u32) Element {
-        return self.element_list.get(index);
-    }
-
-    fn getElementData(self: *ASTGen, index: u32) Data {
-        return self.element_list.items(.data)[index];
     }
 
     fn replaceDataAtIndex(self: *ASTGen, index: u32, data: Data) void {
@@ -1782,7 +1857,7 @@ const ASTGen = struct {
         return result;
     }
 
-    fn buildCreateTable(self: *ASTGen, sqlite_table: SQLiteDbTable) Error!TableStmt {
+    fn buildCreateTable(self: *ASTGen, sqlite_table: SQLiteDbTable) Error!InternPool.Index {
         const PrimaryKeyState = enum {
             unfilled,
             current,
@@ -1794,16 +1869,16 @@ const ASTGen = struct {
         // We can also use the function call to push/pop index from stack instead of using an internal index
         var index = self.token_list.len;
         const sql_str = sqlite_table.sql;
-        var tokenizer = Tokenizer.from(sql_str.strSentinel(), 0);
+        var tokenizer = Tokenizer.from(sql_str.slice(self.ip), 0);
         try tokenizer.ingest(self.gpa, self.token_list);
 
         var state: State = .create;
-        var name: ?InternPool.String = null;
-        var tag: ?ElementType = null;
+        var name: ?InternPool.NullTerminatedString = null;
+        var tag: ?InternPool.Column.Tag = null;
         var primary_key: PrimaryKeyState = PrimaryKeyState.unfilled;
         var col_count: u32 = 0;
-        var col_index: u32 = 0;
-        var table_index: ?u32 = null;
+        var col_index: ?InternPool.Index = null;
+        var table_index: ?InternPool.Index = null;
         var primary_key_index: u32 = 0;
 
         // TODO: errdefer dealloc elements of partially allocated table
@@ -1828,13 +1903,13 @@ const ASTGen = struct {
                 .table_name => {
                     switch (token.tag) {
                         .word => {
-                            const token_end = ASTGen.getTokenEnd(sql_str.strSentinel(), token);
-                            const table_name = try sql_str.copySubstring(self.gpa, token.start, token_end);
-                            table_index = try self.addElement(.{
-                                .value = .{ .str = table_name },
-                                .tag = ElementType.table,
-                                .data = .{ .lhs = maxInt(u32), .rhs = sqlite_table.page },
-                            });
+                            const token_end = ASTGen.getTokenEnd(sql_str.slice(self.ip), token);
+                            const table_name = try sql_str.toString().copySubstringNullTerminate(self.gpa, token.start, token_end, self.ip);
+                            table_index = try self.ip.put(self.gpa, .{ .table = .{
+                                .name = table_name,
+                                .page = sqlite_table.page,
+                                .first_column = InternPool.Index.Optional.none,
+                            } });
                         },
                         .lparen => {
                             state = .table_col_name;
@@ -1845,8 +1920,8 @@ const ASTGen = struct {
                 .table_col_name => {
                     switch (token.tag) {
                         .word => {
-                            const token_end = ASTGen.getTokenEnd(sql_str.strSentinel(), token);
-                            name = try sql_str.copySubstring(self.gpa, token.start, token_end);
+                            const token_end = ASTGen.getTokenEnd(sql_str.slice(self.ip), token);
+                            name = try sql_str.toString().copySubstringNullTerminate(self.gpa, token.start, token_end, self.ip);
                             col_count += 1;
                             state = .table_col_type;
                         },
@@ -1855,8 +1930,8 @@ const ASTGen = struct {
                 },
                 .table_col_type => {
                     tag = switch (token.tag) {
-                        .keyword_integer => ElementType.integer,
-                        .keyword_text => ElementType.text,
+                        .keyword_integer => .integer,
+                        .keyword_text => .text,
                         else => return Error.InvalidSyntax,
                     };
                     state = .table_next;
@@ -1867,14 +1942,18 @@ const ASTGen = struct {
                     }
                     switch (token.tag) {
                         .comma, .rparen => {
-                            const rhs: u32 = if (primary_key == PrimaryKeyState.current) 1 else 0;
-                            const new_index = try self.addElement(.{
-                                .value = .{ .str = name.? },
+                            const new_index = try self.ip.put(self.gpa, .{ .column = .{
+                                .name = name.?,
+                                .next_column = InternPool.Index.Optional.none,
+                                .id = col_count,
                                 .tag = tag.?,
-                                .data = .{ .lhs = maxInt(u32), .rhs = rhs },
-                            });
-                            const data = self.getElementData(col_index);
-                            self.replaceDataAtIndex(col_index, .{ .lhs = new_index, .rhs = data.rhs });
+                                .is_primary_key = primary_key == PrimaryKeyState.current,
+                            } });
+                            if (col_count != 0) {
+                                var data = self.ip.indexToKey(col_index.?);
+                                data.table.first_column = new_index.toOptional();
+                                try self.ip.update(self.gpa, table_index.?, data);
+                            }
                             col_index = new_index;
                             if (primary_key == PrimaryKeyState.current) {
                                 primary_key_index = col_count - 1;
@@ -1905,7 +1984,7 @@ const ASTGen = struct {
                     }
                 },
                 .end => {
-                    return TableStmt.from(self.element_list.get(table_index.?), primary_key_index);
+                    return table_index.?;
                 },
                 else => unreachable,
             }
@@ -1917,10 +1996,10 @@ const ASTGen = struct {
     fn buildSelectStatement(self: *ASTGen) Error!SelectStmt {
         var state: State = .select_first;
         var columns: u64 = 0;
-        var table: ?TableStmt = null;
+        var table: ?InternPool.Index = null;
         var column_list_index: u32 = maxInt(u32);
         var processed_columns: bool = false;
-        var where: ?ConditionRef = null;
+        var where: InternPool.Index.Optional = InternPool.Index.Optional.none;
         while (self.index < self.token_list.len) : (self.index += 1) {
             const token = self.token_list.get(self.index);
             switch (state) {
@@ -1950,9 +2029,9 @@ const ASTGen = struct {
                         .word => {
                             const col_name = ASTGen.getTokenSource(self.source, token);
                             if (table) |tbl| {
-                                const is_col_index: ?u32 = tbl.getColumnIndex(self.element_list, col_name);
-                                if (is_col_index) |col_index| {
-                                    columns |= (@as(u64, 1) << @truncate(col_index));
+                                const is_col = self.ip.columnFromName(tbl, col_name);
+                                if (is_col) |col_result| {
+                                    columns |= (@as(u64, 1) << @truncate(col_result.count));
                                 } else {
                                     debug("Could not find column: {s}", .{col_name});
                                     break;
@@ -1978,7 +2057,7 @@ const ASTGen = struct {
                                 const table_name = ASTGen.getTokenSource(self.source, token);
                                 // TODO: return the table sql string if not allocated. If it is allocated, then it should return
                                 // the table. I think the allocated tables should be a different struct
-                                const sqlite_table = try self.db.getTable(self.gpa, table_name);
+                                const sqlite_table = try self.db.getTable(self.gpa, table_name, self.ip);
                                 table = try self.buildCreateTable(sqlite_table);
                                 state = .select_second;
                                 self.index = column_list_index - 1;
@@ -2001,7 +2080,7 @@ const ASTGen = struct {
                     switch (token.tag) {
                         .keyword_where => {
                             where = try self.buildWhereClause(table.?);
-                            where.?.dump(self.element_list);
+                            self.ip.dump(where);
                         },
                         else => break,
                     }
@@ -2021,21 +2100,21 @@ const ASTGen = struct {
         }
         debug("table: {}", .{table.?});
 
-        return SelectStmt{
+        return .{
             .columns = columns,
             .table = table.?,
             .where = where,
         };
     }
 
-    pub fn buildWhereClause(self: *ASTGen, table: TableStmt) Error!?ConditionRef {
+    pub fn buildWhereClause(self: *ASTGen, table: InternPool.Index) Error!InternPool.Index.Optional {
         var state: State = .where;
         var equality: ?TokenType = null;
-        var col_index: ?u32 = null;
+        var col_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
         var last_element_andor = false;
-        var expr_index: ?u32 = null;
-        var expr_prev_index: ?u32 = null;
-        var expr_first_index: ?u32 = null;
+        var expr_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
+        var expr_prev_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
+        var expr_first_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
         while (self.index < self.token_list.len) : (self.index += 1) {
             const token = self.token_list.get(self.index);
             switch (state) {
@@ -2046,28 +2125,37 @@ const ASTGen = struct {
                 .where_lhs => switch (token.tag) {
                     .word => {
                         const column_name = ASTGen.getTokenSource(self.source, token);
-                        col_index = table.getColumnIndex(self.element_list, column_name);
+                        const col_optional = self.ip.columnFromName(table, column_name);
+                        if (col_optional) |col| {
+                            col_index = col.index.toOptional();
+                        } else {
+                            break;
+                        }
                         state = .where_equality;
                     },
                     .keyword_and, .keyword_or => {
-                        if (last_element_andor or expr_index == null) {
+                        if (last_element_andor or expr_index.unwrap() == null) {
                             break;
                         }
                         const replace_first_expr = expr_first_index == expr_index;
                         const expr_prev_temp_index = expr_index;
-                        expr_index = try self.addElement(.{
-                            .value = undefined,
-                            .tag = switch (token.tag) {
-                                .keyword_and => ElementType.compare_and,
-                                .keyword_or => ElementType.compare_or,
-                                else => break,
+                        const new_index = try self.ip.put(self.gpa, .{
+                            .condition = .{
+                                .lhs = .{ .condition = expr_index.unwrap().? },
+                                .equality = switch (token.tag) {
+                                    .keyword_and => .@"and",
+                                    .keyword_or => .@"or",
+                                    else => unreachable, // and or conditions
+                                },
+                                .rhs = .{ .condition = InternPool.Index.Optional.none },
                             },
-                            .data = .{ .lhs = expr_index.?, .rhs = maxInt(u32) },
                         });
+                        expr_index = new_index.toOptional();
                         last_element_andor = true;
-                        if (expr_prev_index) |expr| {
-                            const data = self.getElementData(expr);
-                            self.replaceDataAtIndex(expr, .{ .lhs = data.lhs, .rhs = expr_index.? });
+                        if (expr_prev_index.unwrap()) |expr| {
+                            var key = self.ip.indexToKey(expr);
+                            key.condition.rhs = .{ .condition = expr_index };
+                            try self.ip.update(self.gpa, expr, key);
                         }
                         expr_prev_index = expr_prev_temp_index;
                         if (replace_first_expr) {
@@ -2078,8 +2166,8 @@ const ASTGen = struct {
                         if (last_element_andor) {
                             break;
                         }
-                        if (expr_first_index) |index| {
-                            return .{ .index = index };
+                        if (expr_first_index.unwrap()) |index| {
+                            return index.toOptional();
                         }
                         break;
                     },
@@ -2092,8 +2180,8 @@ const ASTGen = struct {
                     else => break,
                 },
                 .where_rhs => {
-                    debug("where_rhs eq: {?}, col_index: {d}", .{ equality, col_index.? });
-                    if (equality == null or col_index == null) {
+                    debug("where_rhs eq: {?}, col_index: {d}", .{ equality, @intFromEnum(col_index) });
+                    if (equality == null or col_index.unwrap() == null) {
                         debug("where_rhs missing", .{});
                         return Error.InvalidSyntax;
                     }
@@ -2101,43 +2189,50 @@ const ASTGen = struct {
                         .double_quote_word => {
                             const string_literal = ASTGen.getTokenSource(self.source, token);
                             debug("where_rhs literal: {s}", .{string_literal});
-                            const value = try InternPool.String.init(self.gpa, string_literal[1 .. string_literal.len - 1]);
+                            const value = try InternPool.NullTerminatedString.initAddSentinel(self.gpa, string_literal[1 .. string_literal.len - 1], self.ip);
                             expr_prev_index = expr_index;
-                            expr_index = try self.addElement(.{
-                                .value = .{ .str = value },
-                                .tag = switch (equality.?) {
-                                    .eq => ElementType.compare_eq_str,
-                                    .ne => ElementType.compare_ne_str,
-                                    else => return Error.InvalidSyntax,
+                            const new_index = try self.ip.put(self.gpa, .{
+                                .condition = .{
+                                    .lhs = .{ .column = col_index.unwrap().? },
+                                    .equality = switch (equality.?) {
+                                        .eq => .eq,
+                                        .ne => .ne,
+                                        else => return Error.InvalidSyntax,
+                                    },
+                                    .rhs = .{ .string = value },
                                 },
-                                .data = .{ .lhs = col_index.?, .rhs = maxInt(u32) },
                             });
+                            expr_index = new_index.toOptional();
                         },
                         .integer => {
                             const slice = ASTGen.getTokenSource(self.source, token);
                             const value = fmt.parseInt(i64, slice, 10) catch break;
                             expr_prev_index = expr_index;
-                            expr_index = try self.addElement(.{
-                                .value = .{ .int = value },
-                                .tag = switch (equality.?) {
-                                    .eq => ElementType.compare_eq_int,
-                                    .ne => ElementType.compare_ne_int,
-                                    else => return Error.InvalidSyntax,
+                            const new_index = try self.ip.put(self.gpa, .{
+                                .condition = .{
+                                    .lhs = .{ .column = col_index.unwrap().? },
+                                    .equality = switch (equality.?) {
+                                        .eq => .eq,
+                                        .ne => .ne,
+                                        else => return Error.InvalidSyntax,
+                                    },
+                                    .rhs = .{ .int = value },
                                 },
-                                .data = .{ .lhs = col_index.?, .rhs = maxInt(u32) },
                             });
+                            expr_index = new_index.toOptional();
                         },
                         else => break,
                     }
                     last_element_andor = false;
-                    if (expr_prev_index) |expr| {
-                        const data = self.getElementData(expr);
-                        self.replaceDataAtIndex(expr, .{ .lhs = data.lhs, .rhs = expr_index.? });
+                    if (expr_prev_index.unwrap()) |expr| {
+                        var key = self.ip.indexToKey(expr);
+                        key.condition.rhs = .{ .condition = expr_index.unwrap().?.toOptional() };
+                        try self.ip.update(self.gpa, expr, key);
                     } else {
                         expr_first_index = expr_index;
                     }
                     equality = null;
-                    col_index = null;
+                    col_index = InternPool.Index.Optional.none;
                     state = .where_lhs;
                 },
                 else => break,
@@ -2165,7 +2260,7 @@ const ASTGen = struct {
                 },
                 .select_first => {
                     const select = try self.buildSelectStatement();
-                    debug("built statement: select({d}, {d})", .{ select.columns, select.table.page });
+                    debug("built statement: select({d}, {d})", .{ select.columns, select.table });
                     return select;
                 },
                 else => {
@@ -2178,66 +2273,71 @@ const ASTGen = struct {
 };
 
 const TableMetadataReader = struct {
-    element_list: *ElementList,
-    index: u32,
-    name: InternPool.String,
+    ip: *InternPool,
+    index: InternPool.Index.Optional,
 
-    pub fn from(element_list: *ElementList, table_stmt: *const TableStmt) TableMetadataReader {
+    pub fn from(intern_pool: *InternPool, table_index: InternPool.Index) TableMetadataReader {
         return .{
-            .element_list = element_list,
-            .index = table_stmt.first_column,
-            .name = table_stmt.name,
+            .ip = intern_pool,
+            .index = table_index.toOptional(),
         };
     }
 
-    pub fn next(self: *TableMetadataReader) ?InternPool.Column {
-        if (self.index >= self.element_list.len or self.index == maxInt(u32)) {
+    pub fn next(self: *TableMetadataReader) ?struct { col: InternPool.Column, index: InternPool.Index } {
+        const new_index = self.index.unwrap();
+        if (new_index == null) {
             return null;
         }
-        const element = self.element_list.get(self.index);
-        self.index = element.data.lhs;
-        return InternPool.Column.fromElement(element);
+        // TODO: assert that this is a column key
+        const element = self.ip.indexToKey(new_index.?).column;
+        self.index = element.next_column;
+        return .{ .col = element, .index = new_index.? };
     }
 };
 
 const ConditionTraversal = struct {
-    element_list: *ElementList,
-    index: u32,
-    current_condition: ConditionRef.ConditionEquality,
-    stack: ArrayListUnmanaged(u32),
-    last_pop: ConditionRef,
+    ip: *InternPool,
+    index: InternPool.Index.Optional,
+    current_condition: InternPool.Condition.Equality,
+    stack: ArrayListUnmanaged(InternPool.Index.Optional),
+    last_pop: InternPool.Index.Optional,
 
-    pub fn init(element_list: *ElementList, index: u32) ConditionTraversal {
+    pub fn init(intern_pool: *InternPool, index: InternPool.Index) ConditionTraversal {
         return .{
-            .element_list = element_list,
-            .index = index,
-            .current_condition = .condition_or,
+            .ip = intern_pool,
+            .index = index.toOptional(),
+            .current_condition = .@"or",
             .stack = .{},
-            .last_pop = .{ .index = maxInt(u32) },
+            .last_pop = InternPool.Index.Optional.none,
         };
     }
 
-    pub fn next(self: *ConditionTraversal, alloc: Allocator) Allocator.Error!?ConditionRef.Condition {
-        var curr_ref: ConditionRef = .{ .index = self.index };
-        debug("next condition: {d}", .{curr_ref.index});
+    pub fn next(self: *ConditionTraversal, alloc: Allocator) Allocator.Error!?InternPool.Condition {
+        debug("next condition: {d}", .{self.index});
         while (true) {
-            if (curr_ref.unwrap(self.element_list)) |cond| {
+            if (self.index.unwrap() != null) {
+                const cond: InternPool.Condition = self.ip.indexToKey(self.index.unwrap().?).condition;
                 switch (cond.equality) {
-                    .condition_or, .condition_and => {
-                        try self.stack.append(alloc, curr_ref.index);
-                        curr_ref = cond.lhs.condition;
+                    .@"or", .@"and" => {
+                        try self.stack.append(alloc, self.index);
+                        self.index = cond.lhs.condition.toOptional();
                         self.current_condition = cond.equality;
                     },
-                    .compare_eq, .compare_ne => {
-                        self.index = maxInt(u32);
+                    .eq, .ne => {
+                        self.index = InternPool.Index.Optional.none;
                         return cond;
                     },
+                    else => unreachable, // TODO: lt/gt
                 }
             } else {
                 if (self.stack.items.len == 0) return null;
-                self.last_pop = .{ .index = self.stack.pop() };
-                debug("last pop: {d}", .{self.last_pop.index});
-                curr_ref = self.last_pop.unwrap(self.element_list).?.rhs.condition;
+                self.last_pop = self.stack.pop();
+                debug("last pop: {d}", .{self.last_pop.unwrap().?});
+                self.index = self.last_pop;
+                if (self.last_pop.unwrap()) |pop| {
+                    const key = self.ip.indexToKey(pop).condition;
+                    self.index = key.rhs.condition;
+                }
             }
         }
         return null;
@@ -2254,211 +2354,111 @@ const Stmt = union(enum) {
 
 const InstGen = struct {
     gpa: Allocator,
-    element_list: *ElementList,
-    inst_list: *InstList,
+    ip: *InternPool,
     statement: Stmt,
     db: Db,
-    cursor_count: u8, // TODO: this count probably isn't necessary
 
-    pub fn from(
+    pub fn init(
         gpa: Allocator,
-        element_list: *ElementList,
-        inst_list: *InstList,
+        intern_pool: *InternPool,
         db: Db,
         statement: Stmt,
     ) Error!InstGen {
         return InstGen{
             .gpa = gpa,
-            .element_list = element_list,
-            .inst_list = inst_list,
+            .ip = intern_pool,
             .statement = statement,
             .db = db,
-            .cursor_count = 0,
         };
     }
 
-    fn addInst(self: *InstGen, inst: Inst) Allocator.Error!u32 {
-        const result = @as(u32, @intCast(self.inst_list.len));
-        try self.inst_list.append(self.gpa, inst);
-        return result;
-    }
-
-    fn replaceDataAtIndex(self: *InstGen, index: u32, data: Data) void {
-        self.inst_list.items(.data)[index] = data;
-    }
-
-    fn replaceOpcodeAtIndex(self: *InstGen, index: u32, opcode: Inst.Opcode) void {
-        self.inst_list.items(.opcode)[index] = opcode;
-    }
-
-    fn getDataAtIndex(self: *InstGen, index: u32) Data {
-        return self.inst_list.items(.data)[index];
-    }
-
-    fn getOpcodeAtIndex(self: *InstGen, index: u32) Inst.Opcode {
-        return self.inst_list.items(.opcode)[index];
-    }
-
-    fn addExtra(self: *InstGen, extra_data: anytype) Allocator.Error!u32 {
-        const fields = std.meta.fields(@TypeOf(extra_data));
-        try extra.ensureUnusedCapacity(self.gpa, fields.len);
-        const extra_index: u32 = @intCast(extra.items.len);
-        extra.items.len += fields.len;
-        var i = extra_index;
-        inline for (fields) |field| {
-            extra.items[i] = @field(extra_data, field.name);
-            i += 1;
+    fn eqReplaceJump(self: *InstGen, index: InternPool.InstIndex, jump_address: InternPool.InstIndex) void {
+        var inst = self.ip.getInst(index).?;
+        switch (inst) {
+            .eq => {
+                inst.eq.jump = jump_address;
+            },
+            .neq => {
+                inst.neq.jump = jump_address;
+            },
+            else => unreachable, // Replace jump only on eq instructions
         }
-        return extra_index;
+        self.ip.setInst(index, inst);
     }
 
-    fn markInst(self: *InstGen, opcode: Inst.Opcode) Error!u32 {
-        return try self.addInst(.{ .opcode = opcode, .data = .{ .lhs = 0, .rhs = 0 } });
+    fn eqNegate(self: *InstGen, index: InternPool.InstIndex) void {
+        const old_inst = self.ip.getInst(index).?;
+        const new_inst: InternPool.Instruction = switch (old_inst) {
+            .eq => |data| .{ .neq = data },
+            .neq => |data| .{ .eq = data },
+            else => unreachable, // Can only negate eq/ne opcodes
+        };
+        self.ip.setInst(index, new_inst);
     }
 
-    fn instInit(self: *InstGen, index: u32, start_inst: u32) void {
-        self.replaceDataAtIndex(index, .{ .lhs = start_inst, .rhs = 0 });
-    }
-
-    fn openRead(self: *InstGen, index: u32, table_index: u32) void {
-        self.replaceDataAtIndex(index, .{ .lhs = table_index, .rhs = 0 });
-        self.cursor_count += 1;
-    }
-
-    // The next use of the Rowid or Column or Next instruction for P1 will refer to the first entry in the database table or index.
-    // If the table or index is empty, jump immediately to P2. If the table or index is not empty, fall through to the following instruction.
-    // If P2 is zero, that is an assertion that the P1 table is never empty and hence the jump will never be taken.
-    // This opcode leaves the cursor configured to move in forward order, from the beginning toward the end. In other words, the cursor is configured to use Next, not Prev.
-    fn rewind(self: *InstGen, index: u32, end_inst: u32) void {
-        self.replaceDataAtIndex(index, .{ .lhs = end_inst, .rhs = 0 });
-    }
-
-    // Store in register P2 an integer which is the key of the table entry that P1 is currently point to.
-    // P1 can be either an ordinary table or a virtual table. There used to be a separate OP_VRowid opcode for use with virtual tables,
-    // but this one opcode now works for both table types.
-    fn rowId(self: *InstGen, read_cursor: u32, store_reg: u32) Error!void {
-        _ = try self.addInst(.{ .opcode = .row_id, .data = .{ .lhs = read_cursor, .rhs = store_reg } });
-    }
-
-    // Interpret the data that cursor P1 points to as a structure built using the MakeRecord instruction. Extract the P2-th column from this record.
-    // If there are less than (P2+1) values in the record, extract a NULL.
-    // The value extracted is stored in register P3.
-    // If the record contains fewer than P2 fields, then extract a NULL. Or, if the P4 argument is a P4_MEM use the value of the P4 argument as the result.
-    fn column(self: *InstGen, read_cursor: u32, store_reg: u32, col_num: u32) Error!void {
-        const extra_index = try self.addExtra(.{ .store_reg = store_reg, .col_num = col_num });
-        _ = try self.addInst(.{ .opcode = .column, .data = .{ .lhs = read_cursor, .rhs = extra_index } });
-    }
-
-    fn eq(self: *InstGen, lhs_reg: u32, rhs_reg: u32) Error!void {
-        const extra_index = try self.addExtra(.{ .lhs_reg = lhs_reg, .rhs_reg = rhs_reg });
-        _ = try self.addInst(.{ .opcode = .eq, .data = .{ .lhs = 0, .rhs = extra_index } });
-    }
-
-    fn neq(self: *InstGen, lhs_reg: u32, rhs_reg: u32) Error!void {
-        const extra_index = try self.addExtra(.{ .lhs_reg = lhs_reg, .rhs_reg = rhs_reg });
-        _ = try self.addInst(.{ .opcode = .neq, .data = .{ .lhs = 0, .rhs = extra_index } });
-    }
-
-    fn eqReplaceJump(self: *InstGen, index: u32, jump_address: u32) void {
-        const data = self.getDataAtIndex(index);
-        self.replaceDataAtIndex(index, .{ .lhs = jump_address, .rhs = data.rhs });
-    }
-
-    fn eqNegate(self: *InstGen, index: u32) void {
-        const opcode = self.getOpcodeAtIndex(index);
-        self.replaceOpcodeAtIndex(index, switch (opcode) {
-            .neq => .eq,
-            .eq => .neq,
-            else => opcode,
-        });
-    }
-
-    fn string(self: *InstGen, str: InternPool.String, store_reg: u32) Error!void {
-        const extra_index = try self.addExtra(str);
-        _ = try self.addInst(.{ .opcode = .string, .data = .{ .lhs = store_reg, .rhs = extra_index } });
-    }
-
-    fn integer(self: *InstGen, int: i64, store_reg: u32) Error!void {
-        const uint: u64 = @intCast(int);
-        const extra_index = try self.addExtra(.{ .upper = @as(u32, @truncate(uint >> 8)), .lower = @as(u32, @truncate(uint)) });
-        _ = try self.addInst(.{ .opcode = .int, .data = .{ .lhs = store_reg, .rhs = extra_index } });
-    }
-
-    // The registers P1 through P1+P2-1 contain a single row of results. This opcode causes the sqlite3_step() call to terminate with an SQLITE_ROW return code
-    // and it sets up the sqlite3_stmt structure to provide access to the r(P1)..r(P1+P2-1) values as the result row.
-    fn resultRow(self: *InstGen, reg_index_start: u32, reg_index_end: u32) Error!void {
-        _ = try self.addInst(.{ .opcode = .result_row, .data = .{ .lhs = reg_index_start, .rhs = reg_index_end } });
-    }
-
-    fn next(self: *InstGen, cursor: u32, success_jump: u32) Error!void {
-        _ = try self.addInst(.{ .opcode = .next, .data = .{ .lhs = cursor, .rhs = success_jump } });
-    }
-
-    fn halt(self: *InstGen) Error!void {
-        _ = try self.addInst(.{ .opcode = .halt, .data = .{ .lhs = 0, .rhs = 0 } });
-    }
-
-    // Begin a transaction on database P1 if a transaction is not already active. If P2 is non-zero, then a write-transaction is started,
-    // or if a read-transaction is already active, it is upgraded to a write-transaction. If P2 is zero, then a read-transaction is started.
-    // If P2 is 2 or more then an exclusive transaction is started.
-    // P1 is the index of the database file on which the transaction is started. Index 0 is the main database file and index 1 is the file
-    // used for temporary tables. Indices of 2 or more are used for attached databases.
-    // If P5!=0 then this opcode also checks the schema cookie against P3 and the schema generation counter against P4.
-    // The cookie changes its value whenever the database schema changes. This operation is used to detect when that the cookie has changed
-    // and that the current process needs to reread the schema. If the schema cookie in P3 differs from the schema cookie in the database header
-    // or if the schema generation counter in P4 differs from the current generation counter, then an SQLITE_SCHEMA error is raised and
-    // execution halts. The sqlite3_step() wrapper function might then reprepare the statement and rerun it from the beginning.
-    fn transaction(self: *InstGen, database_id: u32, write: bool) Error!void {
-        const write_int: u32 = if (write) 1 else 0;
-        _ = try self.addInst(.{ .opcode = .transaction, .data = .{ .lhs = database_id, .rhs = write_int } });
-    }
-
-    fn goto(self: *InstGen, inst_jump: u32) Error!void {
-        _ = try self.addInst(.{ .opcode = .goto, .data = .{ .lhs = inst_jump, .rhs = 0 } });
+    fn addInst(self: *InstGen, key: InternPool.Instruction) Allocator.Error!InternPool.InstIndex {
+        return try self.ip.addInst(self.gpa, key);
     }
 
     pub fn buildInstructions(self: *InstGen) Error!void {
         switch (self.statement) {
             Stmt.select => {
                 const select = self.statement.select;
-                const page_index: u32 = select.table.page - 1;
-                debug("page_index: {d}", .{page_index});
+                const table = self.ip.indexToKey(select.table).table;
+                // const page_index: u32 = select.table.page - 1;
+                debug("page_index: {d}", .{table.page});
 
-                const cursor = 0;
+                const cursor = try self.ip.put(self.gpa, .{ .cursor = .{ .index = 0 } });
 
-                const init_index = try self.markInst(.init);
-                const open_read_index = try self.markInst(.open_read);
-                const rewind_index = try self.markInst(.rewind);
-                const rewind_start = self.inst_list.len;
+                const init_index = try self.addInst(.{ .init = InternPool.InstIndex.none });
+                // const init_index = try self.markInst(.init);
+                const open_read_index = try self.addInst(.{ .open_read = select.table });
+                // const open_read_index = try self.markInst(.open_read);
+                const rewind_index = try self.addInst(.{ .rewind = .{ .table = select.table, .end_inst = InternPool.InstIndex.none } });
+                // const rewind_index = try self.markInst(.rewind);
+                const rewind_start = self.ip.peekInst();
 
-                var col_count: u32 = 0;
-                var reg_count: u32 = 1;
-                var reader = TableMetadataReader.from(self.element_list, &select.table);
+                var reg_count = Register.Index.first;
+                var reader = TableMetadataReader.from(self.ip, select.table);
                 const where_clause = select.where;
                 const compare_reg = reg_count;
-                var final_comparison: u32 = 0;
-                if (where_clause) |ref| {
-                    var traversal = ConditionTraversal.init(self.element_list, ref.index);
+                // const compare_reg = try self.ip.put(self.gpa, .{ .register = InternPool.Register.none });
+                var final_comparison: InternPool.InstIndex = InternPool.InstIndex.none;
+                if (where_clause.unwrap()) |ref| {
+                    var traversal = ConditionTraversal.init(self.ip, ref);
                     defer traversal.deint(self.gpa);
-                    var comparisons: ArrayListUnmanaged(u32) = .{};
-                    var columns_start = self.inst_list.len;
+                    var comparisons: ArrayListUnmanaged(InternPool.InstIndex) = .{};
                     defer comparisons.deinit(self.gpa);
+                    var columns_start = self.ip.peekInst();
                     while (try traversal.next(self.gpa)) |cond| {
-                        try self.column(cursor, compare_reg, cond.lhs.column_id);
-                        reg_count += 1;
+                        _ = try self.addInst(.{ .column = .{
+                            .cursor = cursor,
+                            .store_reg = compare_reg,
+                            .col = cond.lhs.column,
+                        } });
+                        reg_count = reg_count.increment();
                         switch (traversal.current_condition) {
-                            .condition_or => {
-                                if (cond.equality == .compare_eq) {
-                                    try self.eq(compare_reg, reg_count);
+                            .@"or" => {
+                                try comparisons.append(self.gpa, self.ip.peekInst());
+                                // TODO: add other conditions (lt/lte/gt/gte)
+                                if (cond.equality == .eq) {
+                                    _ = try self.addInst(.{ .eq = .{
+                                        .lhs_reg = compare_reg,
+                                        .rhs_reg = reg_count,
+                                        .jump = InternPool.InstIndex.none,
+                                    } });
                                 } else {
-                                    try self.neq(compare_reg, reg_count);
+                                    _ = try self.addInst(.{ .neq = .{
+                                        .lhs_reg = compare_reg,
+                                        .rhs_reg = reg_count,
+                                        .jump = InternPool.InstIndex.none,
+                                    } });
                                 }
-                                try comparisons.append(self.gpa, self.inst_list.len - 1);
                             },
                             else => return Error.InvalidSyntax, // TODO: implement and clause
                         }
                     } else {
-                        columns_start = self.inst_list.len;
+                        columns_start = self.ip.peekInst();
                     }
                     for (comparisons.items, 0..) |value, i| {
                         if (i == comparisons.items.len - 1) {
@@ -2469,95 +2469,315 @@ const InstGen = struct {
                         }
                     }
                 }
-                var output_count: u32 = reg_count;
-                while (reader.next()) |col| {
+
+                var output_count = reg_count.increment();
+                var col_count: u32 = 0;
+                while (reader.next()) |col_result| {
+                    const col = col_result.col;
+                    const col_i = col_result.index;
                     // TODO: support more than 64 columns
                     if (select.columns & (@as(u64, 0x1) << @truncate(col_count)) > 0) {
                         if (col.is_primary_key and col.tag == .integer) {
                             // rowId reads for a integer primary key row. If this isn't explicitly noted as a primary key,
                             // then column instruction is used instead.
-                            try self.rowId(cursor, output_count + 1);
+                            _ = try self.addInst(.{ .row_id = .{
+                                .read_cursor = cursor,
+                                .store_reg = output_count,
+                            } });
+                            // try self.rowId(cursor, output_count);
                         } else {
-                            try self.column(cursor, output_count + 1, col_count);
+                            _ = try self.addInst(.{ .column = .{
+                                .cursor = cursor,
+                                .store_reg = output_count,
+                                .col = col_i,
+                            } });
+                            // try self.column(cursor, output_count, col_count);
                         }
-                        output_count += 1;
+                        output_count = output_count.increment();
                     }
                     col_count += 1;
                 }
                 debug("columns: {b}", .{select.columns});
 
                 debug("output count: {d}", .{output_count});
-                try self.resultRow(reg_count + 1, output_count + 1);
-                try self.next(cursor, rewind_start);
-                const next_index = self.inst_list.len - 1;
-                try self.halt();
-                const halt_index = self.inst_list.len - 1;
+                _ = try self.addInst(.{ .result_row = .{
+                    .start_reg = reg_count,
+                    .end_reg = output_count.increment(),
+                } });
+                // try self.resultRow(reg_count, output_count.increment());
+                const next_index = try self.addInst(.{ .next = .{ .cursor = cursor, .success_jump = rewind_start } });
+                // try self.next(cursor, rewind_start);
+                const halt_index = try self.addInst(InternPool.Instruction.halt);
+                // try self.halt();
                 // TODO: support multiples databases, writing to tables
-                try self.transaction(0, false);
-                const transaction_index = self.inst_list.len - 1;
-                if (where_clause) |where| {
+                const transaction_index = try self.addInst(.{ .transaction = .{ .database_id = 0, .write = false } });
+                // try self.transaction(0, false);
+                if (where_clause.unwrap()) |where| {
                     self.eqReplaceJump(final_comparison, next_index);
-                    var traversal = ConditionTraversal.init(self.element_list, where.index);
-                    var store_reg = compare_reg + 1;
+                    var traversal = ConditionTraversal.init(self.ip, where);
+                    var store_reg = compare_reg.increment();
                     defer traversal.deint(self.gpa);
                     while (try traversal.next(self.gpa)) |cond| {
                         switch (cond.rhs) {
-                            .str => try self.string(cond.rhs.str, store_reg),
-                            .int => try self.integer(cond.rhs.int, store_reg),
+                            // .string => try self.string(cond.rhs.string, store_reg),
+                            .string => _ = try self.addInst(.{ .string = .{ .string = cond.rhs.string, .store_reg = store_reg } }),
+                            // .int => try self.integer(cond.rhs.int, store_reg),
+                            .int => _ = try self.addInst(.{ .integer = .{ .int = cond.rhs.int, .store_reg = store_reg } }),
                             else => return Error.InvalidSyntax, // TODO: implement float
                         }
-                        store_reg += 1;
+                        store_reg = store_reg.increment();
                     }
                 }
-                try self.goto(open_read_index);
-                self.instInit(init_index, transaction_index);
-                self.openRead(open_read_index, page_index);
-                self.rewind(rewind_index, halt_index);
+                _ = try self.addInst(.{ .goto = open_read_index });
+                // try self.goto(open_read_index);
+                self.ip.setInst(init_index, .{ .init = transaction_index });
+                // self.instInit(init_index, transaction_index);
+                // self.openRead(open_read_index, page_index);
+                self.ip.setInst(rewind_index, .{ .rewind = .{ .table = select.table, .end_inst = halt_index } });
+                // self.rewind(rewind_index, halt_index);
                 debug("instructions written", .{});
             },
         }
     }
 };
 
+// All registers are the same size, so its possible to update register type without allocating more data
+const Register = union(enum) {
+    none,
+    int: i64,
+    float: f64,
+    string: StringLen,
+    str: []u8, // TODO: consider removing these, and make all bytes be interned. Or use a 32 bit index instead of a pointer
+    binary: []u8,
+
+    const StringLen = struct {
+        string: InternPool.String,
+        len: u32,
+    };
+
+    const Index = enum(u32) {
+        none = std.math.maxInt(u32),
+        first = 0,
+        _,
+
+        pub fn unwrap(self: Index) ?u32 {
+            switch (self) {
+                .none => return null,
+                else => return @intFromEnum(self),
+            }
+        }
+
+        pub fn increment(self: Index) Index {
+            return switch (self) {
+                .none => @enumFromInt(0),
+                else => @enumFromInt(@intFromEnum(self) + 1),
+            };
+        }
+    };
+
+    const Tag = enum(u8) {
+        none,
+        int,
+        float,
+        string,
+        str,
+        binary,
+    };
+
+    const Item = struct {
+        tag: Tag,
+        data: Repr,
+    };
+
+    const Repr = extern struct {
+        @"0": u32,
+        @"1": u32,
+    };
+
+    pub fn fromColumn(column: SQLiteColumn) Register {
+        switch (column) {
+            .i8, .i16, .i24, .i32, .i48, .i64 => return .{ .int = column.getInt().? },
+            .value_0 => return .{ .int = 0 },
+            .value_1 => return .{ .int = 1 },
+            .f64 => return .{ .float = column.f64 },
+            .empty => return Register.none,
+            .invalid => {
+                debug("invalid SQLiteColumn when converting to register", .{});
+                return Register.none;
+            },
+            .blob => return .{ .binary = column.blob },
+            .text => return .{ .str = column.text },
+        }
+    }
+
+    pub fn tag(self: Register) enum { none, int, float, str, string, binary } {
+        return switch (self) {
+            .none => .none,
+            .int => .int,
+            .float => .float,
+            .str => .str,
+            .string => .string,
+            .binary => .binary,
+        };
+    }
+
+    pub fn compare(self: Register, other: Register, ip: *InternPool) bool {
+        if (self.tag() == other.tag()) {
+            return switch (self) {
+                .none => true,
+                .int => self.int == other.int,
+                .float => self.float == other.float,
+                .str => eql(u8, self.str, other.str),
+                .string => eql(u8, self.string.string.slice(self.string.len, ip), other.string.string.slice(self.string.len, ip)),
+                .binary => unreachable, // TODO: implement
+            };
+        } else if (self.tag() == .str and other.tag() == .string) {
+            return eql(u8, self.string.string.slice(self.string.len, ip), other.str);
+        } else if (self.tag() == .string and other.tag() == .str) {
+            return eql(u8, self.str, self.string.string.slice(self.string.len, ip));
+        }
+        return false;
+    }
+
+    pub fn toStr(self: Register, buffer: []u8, ip: *InternPool) anyerror![]u8 {
+        return switch (self) {
+            .none => try fmt.bufPrint(buffer, "[null]", .{}),
+            .int => try fmt.bufPrint(buffer, "{d}", .{self.int}),
+            .float => try fmt.bufPrint(buffer, "{e}", .{self.float}),
+            .str => try fmt.bufPrint(buffer, "{s}", .{self.str}),
+            .string => try fmt.bufPrint(buffer, "{s}", .{self.string.string.slice(self.string.len, ip)}),
+            .binary => try fmt.bufPrint(buffer, "[binary]", .{}),
+        };
+    }
+
+    pub fn toBuf(self: Register, buffer: []u8, ip: *InternPool) anyerror![]u8 {
+        return switch (self) {
+            .none => {
+                if (buffer.len < 4) return Allocator.Error.OutOfMemory;
+                buffer[0..4].* = std.mem.toBytes(@as(u32, 0));
+                return buffer[0..4];
+            },
+            .int => {
+                if (buffer.len < 12) return Allocator.Error.OutOfMemory;
+                buffer[0..4].* = std.mem.toBytes(@as(u32, 1));
+                buffer[4..12].* = std.mem.toBytes(self.int);
+                return buffer[0..12];
+            },
+            .float => {
+                if (buffer.len < 12) return Allocator.Error.OutOfMemory;
+                buffer[0..4].* = std.mem.toBytes(@as(u32, 2));
+                buffer[4..12].* = std.mem.toBytes(self.float);
+                return buffer[0..12];
+            },
+            .str => {
+                if (buffer.len < self.str.len + 8) return Allocator.Error.OutOfMemory;
+                buffer[0..4].* = std.mem.toBytes(@as(u32, 3));
+                const len = self.str.len;
+                buffer[4..8].* = std.mem.toBytes(len);
+                const fmt_slice = try fmt.bufPrint(buffer[8..], "{s}", .{self.str});
+                return buffer[0 .. 8 + fmt_slice.len];
+            },
+            .string => {
+                if (buffer.len < self.string.len + 8) return Allocator.Error.OutOfMemory;
+                buffer[0..4].* = std.mem.toBytes(@as(u32, 3));
+                const len = self.string.len;
+                buffer[4..8].* = std.mem.toBytes(len);
+                const fmt_slice = try fmt.bufPrint(buffer[8..], "{s}", .{self.string.string.slice(self.string.len, ip)});
+                return buffer[0 .. 8 + fmt_slice.len];
+            },
+            .binary => {
+                if (buffer.len < self.binary.len + 8) return Allocator.Error.OutOfMemory;
+                buffer[0..4].* = std.mem.toBytes(@as(u32, 4));
+                const len = self.binary.len;
+                buffer[4..8].* = std.mem.toBytes(len);
+                @memcpy(buffer[8..], self.binary);
+                return buffer[0 .. len + 8];
+            },
+        };
+    }
+};
+
 const Vm = struct {
     gpa: Allocator,
     db: Db,
-    inst_list: InstList.Slice,
-    reg_list: ArrayListUnmanaged(InternPool.Register),
-    pc: u32,
+    ip: *InternPool,
+    reg_list: MultiArrayList(Register.Item),
+    pc: InternPool.InstIndex,
 
     const Cursor = struct {
         addr: u16,
         index: u32,
     };
 
-    pub fn from(gpa: Allocator, db: Db, inst_list: InstList.Slice) Vm {
+    pub fn init(gpa: Allocator, db: Db, intern_pool: *InternPool) Vm {
         return .{
             .gpa = gpa,
             .db = db,
-            .inst_list = inst_list,
+            .ip = intern_pool,
             .reg_list = .{},
-            .pc = 0,
+            .pc = @enumFromInt(0),
         };
     }
 
-    fn reg(self: *Vm, index: u32, register: InternPool.Register) Error!void {
-        debug("reg index: {d}, len: {d}", .{ index, self.reg_list.items.len });
+    fn reg(self: *Vm, index: Register.Index) Register {
+        const item = self.reg_list.get(@intFromEnum(index));
+        const extra_data = item.data;
+        return switch (item.tag) {
+            .string => .{ .string = .{ .string = @enumFromInt(extra_data.@"0"), .len = extra_data.@"1" } },
+            .str => .{ .str = @as([*]u8, @ptrFromInt(extra_data.@"0"))[0..(extra_data.@"1")] },
+            .binary => .{ .binary = @as([*]u8, @ptrFromInt(extra_data.@"0"))[0..(extra_data.@"1")] },
+            .int => .{ .int = @bitCast(PackedU64.init(extra_data).unwrap()) },
+            .float => .{ .float = @bitCast(PackedU64.init(extra_data).unwrap()) },
+            .none => Register.none,
+        };
+    }
+
+    fn updateReg(self: *Vm, index: Register.Index, register: Register) Error!void {
+        debug("reg index: {d}, len: {d}", .{ index, self.reg_list.len });
         // registers start at 1, not 0
-        if (index - 1 == self.reg_list.items.len) {
-            try self.reg_list.append(self.gpa, register);
+        const pack: PackedU64 = switch (register) {
+            .int => |reg_int| PackedU64.init(reg_int),
+            .float => |reg_float| PackedU64.init(reg_float),
+            .string => |reg_string| PackedU64{ .a = @intFromEnum(reg_string.string), .b = reg_string.len },
+            .none => PackedU64{ .a = 0, .b = 0 },
+            .str => |reg_str| PackedU64{
+                .a = @intFromPtr(reg_str.ptr),
+                .b = @bitCast(reg_str.len),
+            },
+            .binary => |reg_binary| PackedU64{
+                .a = @intFromPtr(reg_binary.ptr),
+                .b = @bitCast(reg_binary.len),
+            },
+        };
+        const tag: Register.Tag = switch (register) {
+            .int => .int,
+            .float => .float,
+            .str => .str,
+            .string => .string,
+            .binary => .binary,
+            .none => .none,
+        };
+        const item: Register.Item = .{ .tag = tag, .data = .{ .@"0" = pack.a, .@"1" = pack.b } };
+
+        const index_num = index.unwrap() orelse return Error.InvalidSyntax;
+
+        if (index_num == self.reg_list.len) {
+            try self.reg_list.append(self.gpa, item);
         } else {
-            while (index > self.reg_list.items.len) {
-                try self.reg_list.append(self.gpa, InternPool.Register.none);
+            while (index_num > self.reg_list.len) {
+                try self.reg_list.append(self.gpa, .{ .tag = .none, .data = .{ .@"0" = 0, .@"1" = 0 } });
             }
-            self.reg_list.items[index - 1] = register;
+            const slice = self.reg_list.slice();
+            const index_u32: u32 = @intFromEnum(index);
+            slice.items(.tag)[index_u32] = item.tag;
+            slice.items(.data)[index_u32] = item.data;
         }
     }
 
     // TODO: do not reference instruction list or extra data directly. Have them go through a layer and provide a struct with field names.
     // That way don't have to figure out data.lhs/rhs for each instruction
     pub fn exec(self: *Vm) Error!void {
-        var instruction = self.inst_list.get(self.pc);
+        var instruction: InternPool.Instruction = self.ip.getInst(self.pc).?;
         // TODO: multiple cursors
         // TODO: clean up these variables
         var buffer: ?[]u8 = null;
@@ -2568,16 +2788,16 @@ const Vm = struct {
         var cell_count: u32 = 0;
         var col_value: ?SQLiteColumn = null;
 
-        while (self.pc < self.inst_list.len and instruction.opcode != .halt) {
-            instruction = self.inst_list.get(self.pc);
-            debug("inst: {s}", .{@tagName(instruction.opcode)});
-            switch (instruction.opcode) {
-                .init => {
-                    self.pc = instruction.data.lhs;
+        while (self.pc.unwrap() != null and instruction != InternPool.Instruction.halt) {
+            instruction = self.ip.getInst(self.pc).?;
+            switch (instruction) {
+                .init => |init_inst| {
+                    self.pc = init_inst;
                 },
-                .open_read => {
-                    const page_index = instruction.data.lhs;
-                    buffer = self.db.readPage(page_index);
+                .open_read => |table_index| {
+                    const table = self.ip.indexToKey(table_index).table;
+
+                    buffer = self.db.readPage(table.page);
                     debug("buffer created", .{});
                     header = SQLiteBtHeader.from(buffer.?);
                     // TODO: refactor this mess
@@ -2588,115 +2808,116 @@ const Vm = struct {
                         debug("cell address: {x}", .{addr});
                         record = SQLiteRecord.from(buffer.?[addr..]);
                     }
-                    self.pc += 1;
+                    self.pc = self.pc.increment();
                 },
-                .rewind => {
-                    const end_inst = instruction.data.lhs;
+                .rewind => |rewind_data| {
+                    const end_inst = rewind_data.end_inst;
                     if (record != null) {
                         col_value = record.?.next();
                         if (col_value == null) {
                             break;
                         }
                         col_count += 1;
-                        self.pc += 1;
+                        self.pc = self.pc.increment();
                     } else {
                         debug("table is empty", .{});
                         self.pc = end_inst;
                     }
                 },
-                .row_id => {
+                .row_id => |row_id_data| {
                     assert(record != null);
                     debug("row_id SQLiteColumn: {d}", .{record.?.row_id});
-                    try self.reg(instruction.data.rhs, InternPool.Register{ .int = @intCast(record.?.row_id) });
-                    self.pc += 1;
+                    try self.updateReg(row_id_data.store_reg, Register{ .int = @intCast(record.?.row_id) });
+                    self.pc = self.pc.increment();
                 },
-                .column => {
+                .column => |column_data| {
                     assert(record != null);
-                    const extra_index = instruction.data.rhs;
-                    const store_reg = extra.items[extra_index];
-                    const col = extra.items[extra_index + 1];
-                    if (col_count > col) {
+                    const store_reg = column_data.store_reg;
+                    const col_index = column_data.col;
+                    const col = self.ip.indexToKey(col_index).column;
+                    if (col_count > col.id) {
                         record.?.reset();
                         col_count = 0;
                     }
-                    while (col_count < col) : (col_count += 1) {
+                    while (col_count < col.id) : (col_count += 1) {
                         record.?.consume();
                     }
                     col_value = record.?.next();
                     col_count += 1;
                     assert(col_value != null);
-                    try self.reg(store_reg, InternPool.Register.fromColumn(col_value.?));
+                    try self.updateReg(store_reg, Register.fromColumn(col_value.?));
                     col_value = record.?.next();
                     debug("col_value: {?}", .{col_value});
                     col_count += 1;
-                    self.pc += 1;
+                    self.pc = self.pc.increment();
                 },
-                .result_row => {
-                    const start_reg = instruction.data.lhs;
-                    const end_reg = instruction.data.rhs;
+                .result_row => |result_row_data| {
+                    const start_reg = result_row_data.start_reg;
+                    const end_reg = result_row_data.end_reg;
+                    const end_reg_num = end_reg.unwrap().?;
 
                     // TODO: refactor this mess. Probably own struct for writing..
-                    var i = start_reg;
-                    const len: u32 = end_reg - start_reg;
+                    var i: u32 = @intFromEnum(start_reg);
+                    const len: u32 = @intFromEnum(end_reg) - i;
                     var write_buf: [256]u8 = undefined;
                     var row_buf: [512]u8 = undefined;
                     var row_buf_written: u32 = 4;
                     var write_count: u8 = 0;
                     row_buf[0..4].* = std.mem.toBytes(len);
-                    while (i < end_reg) : (i += 1) {
-                        const cur_reg = self.reg_list.items[i - 1];
-                        const written = cur_reg.toStr(@constCast(write_buf[write_count..])) catch write_buf[write_count..];
-                        const written_row = cur_reg.toBuf(row_buf[row_buf_written..]) catch row_buf[row_buf_written..];
+                    while (i < end_reg_num) : (i += 1) {
+                        const cur_reg = self.reg(@enumFromInt(i));
+                        const written = cur_reg.toStr(@constCast(write_buf[write_count..]), self.ip) catch write_buf[write_count..];
+                        const written_row = cur_reg.toBuf(row_buf[row_buf_written..], self.ip) catch row_buf[row_buf_written..];
                         row_buf_written += written_row.len;
                         const written_len: u8 = @intCast(written.len);
                         debug("written len: {d}", .{written_len});
                         write_count += written_len;
-                        if (i != end_reg - 1) {
+                        if (i != end_reg_num - 1) {
                             write_buf[write_count] = '|';
                             write_count += 1;
                         }
                     }
                     print(write_buf[0..write_count].ptr, write_buf[0..write_count].len);
                     renderRow(row_buf[0..row_buf_written].ptr, row_buf[0..row_buf_written].len);
-                    self.pc += 1;
+                    self.pc = self.pc.increment();
                 },
-                .neq, .eq => {
-                    const jump_address = instruction.data.lhs;
-                    const extra_index = instruction.data.rhs;
-                    const lhs_reg_index = extra.items[extra_index];
-                    const rhs_reg_index = extra.items[extra_index + 1];
-                    const lhs_reg = self.reg_list.items[lhs_reg_index - 1];
-                    const rhs_reg = self.reg_list.items[rhs_reg_index - 1];
-                    const equal_values: bool = lhs_reg.compare(rhs_reg);
+                .neq, .eq => |eq_data| {
+                    const jump_address = eq_data.jump;
+                    const lhs_reg_index = eq_data.lhs_reg;
+                    const rhs_reg_index = eq_data.rhs_reg;
+                    const lhs_reg = self.reg(lhs_reg_index);
+                    const rhs_reg = self.reg(rhs_reg_index);
+                    const equal_values: bool = lhs_reg.compare(rhs_reg, self.ip);
 
-                    if ((instruction.opcode == .eq and equal_values) or (instruction.opcode == .neq and !equal_values)) {
+                    const is_eq: bool = switch (instruction) {
+                        .eq => true,
+                        else => false,
+                    };
+
+                    if ((is_eq and equal_values) or (!is_eq and !equal_values)) {
                         self.pc = jump_address;
                         debug("jump: {d}", .{jump_address});
                     } else {
-                        self.pc += 1;
+                        self.pc = self.pc.increment();
                     }
                 },
-                .string => {
-                    const store_reg = instruction.data.lhs;
-                    const extra_index = instruction.data.rhs;
-                    const str_index = extra.items[extra_index];
-                    const str_len = extra.items[extra_index + 1];
-                    try self.reg(store_reg, .{ .string = .{ .index = str_index, .len = str_len } });
-                    self.pc += 1;
+                .string => |string_data| {
+                    const store_reg = string_data.store_reg;
+                    const str = string_data.string.toString();
+                    const str_len = string_data.string.slice(self.ip).len;
+                    try self.updateReg(store_reg, .{ .string = .{ .string = str, .len = @intCast(str_len) } });
+                    self.pc = self.pc.increment();
                 },
-                .int => {
-                    const store_reg = instruction.data.lhs;
-                    const extra_index = instruction.data.rhs;
-                    const int_upper = extra.items[extra_index];
-                    const int_lower = extra.items[extra_index + 1];
-                    const int: i64 = (int_upper << 8) + int_lower;
-                    try self.reg(store_reg, .{ .int = int });
-                    self.pc += 1;
+                .integer => |integer_data| {
+                    const store_reg = integer_data.store_reg;
+                    const int = integer_data.int;
+                    try self.updateReg(store_reg, .{ .int = int });
+                    self.pc = self.pc.increment();
                 },
-                .next => {
+                .next => |next_data| {
                     debug("col_value: {?}", .{col_value});
                     if (cell_count >= cell_size - 1) {
-                        self.pc += 1;
+                        self.pc = self.pc.increment();
                     } else {
                         cell_count += 1;
 
@@ -2705,19 +2926,18 @@ const Vm = struct {
                         record = SQLiteRecord.from(buffer.?[addr..]);
                         col_value = record.?.next();
 
-                        const inst_addr = instruction.data.lhs;
-                        self.pc = inst_addr;
+                        self.pc = next_data.success_jump;
                     }
                 },
                 .halt => break,
                 .transaction => {
                     // TODO: support transactions, attached databases, writing
-                    self.pc += 1;
+                    self.pc = self.pc.increment();
                 },
-                .goto => {
-                    self.pc = instruction.data.lhs;
+                .goto => |goto_inst| {
+                    self.pc = goto_inst;
                 },
-                else => debug("instruction not implemented: {}", .{instruction.opcode}),
+                // else => debug("instruction not implemented: {}", .{instruction.opcode}),
             }
         }
     }
@@ -2727,11 +2947,8 @@ const MinimizedToken = struct { tag: TokenType, start: u32 };
 
 // TODO: put all these into a self-contained structure like how the Zig compiler does with InternPool
 // Then only return the filled out structures, not the data oriented design ones
-var string_bytes: ArrayListUnmanaged(u8) = .{};
 var extra: ArrayListUnmanaged(u32) = .{};
 const TokenList = MultiArrayList(MinimizedToken);
-const ElementList = MultiArrayList(Element);
-const InstList = MultiArrayList(Inst);
 
 fn parseStatement(str: [:0]u8, file_buffer: []u8) Error!void {
     var tokenizer = Tokenizer.from(str, 0);
@@ -2740,28 +2957,24 @@ fn parseStatement(str: [:0]u8, file_buffer: []u8) Error!void {
     var tokens = TokenList{};
     defer tokens.deinit(fixed_alloc.allocator());
 
-    var data = ElementList{};
-    defer data.deinit(fixed_alloc.allocator());
-
-    var insts = InstList{};
-    defer insts.deinit(fixed_alloc.allocator());
+    var intern_pool = InternPool.init();
 
     try tokenizer.ingest(fixed_alloc.allocator(), &tokens);
 
     const db = try Db.from(file_buffer);
 
     // ASTGen can allocate more tokens, so we pass the struct instead of the underlying buffer
-    var ast = try ASTGen.from(fixed_alloc.allocator(), &tokens, &data, str, db);
+    var ast = try ASTGen.init(fixed_alloc.allocator(), &tokens, &intern_pool, str, db);
     const statement = try ast.buildStatement();
     debug("statement built!", .{});
 
-    var inst_gen = try InstGen.from(fixed_alloc.allocator(), &data, &insts, db, Stmt{ .select = statement });
+    var inst_gen = try InstGen.init(fixed_alloc.allocator(), &intern_pool, db, .{ .select = statement });
 
     debug("building instructions", .{});
     try inst_gen.buildInstructions();
     debug("inst generated!", .{});
 
-    var vm = Vm.from(fixed_alloc.allocator(), db, inst_gen.inst_list.slice());
+    var vm = Vm.init(fixed_alloc.allocator(), db, &intern_pool);
     try vm.exec();
 }
 
