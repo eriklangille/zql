@@ -315,7 +315,7 @@ const InternPool = struct {
         if (size > 1) {
             const extra_index: u32 = ip.extra.items.len;
             try ip.extra.appendNTimes(alloc, 0, size);
-            ip.instructions.insertAssumeCapacity(index, .{ .opcode = key.opcode(), .data = extra_index });
+            ip.instructions.set(index, .{ .opcode = key.opcode(), .data = extra_index });
         }
         const index_enum: InstIndex = @enumFromInt(index);
         ip.setInst(index_enum, key);
@@ -325,7 +325,7 @@ const InternPool = struct {
     pub fn setInst(ip: *InternPool, index: InstIndex, key: Instruction) void {
         const opcode = key.opcode();
         const index_int: u32 = @intFromEnum(index);
-        debug("setInst: {}, index: {d}, size: {d}", .{ opcode, index_int, key.size() });
+        debug("setInst: {}, index: {d}, size: {d}, key: {}", .{ opcode, index_int, key.size(), key });
         switch (key.size()) {
             0 => {
                 ip.instructions.set(index_int, .{ .opcode = opcode, .data = 0 });
@@ -383,11 +383,11 @@ const InternPool = struct {
 
     pub fn getInst(ip: *InternPool, index: InstIndex) ?Instruction {
         const unwrap = index.unwrap();
-        if (unwrap == null) {
+        if (unwrap == null or unwrap.? >= ip.instructions.len) {
             return null; // TODO: throw an error instead?
         }
         const item = ip.instructions.get(unwrap.?);
-        debug("getInst: {d}", .{item.data});
+        debug("getInst: {}, {d}", .{ item.opcode, item.data });
         switch (item.opcode) {
             .init => return .{ .init = @enumFromInt(item.data) },
             .halt => return Instruction.halt,
@@ -399,6 +399,7 @@ const InternPool = struct {
                 const extra_data = ip.extraData(Instruction.Equal, item.data);
                 return .{ .neq = extra_data };
             },
+            .open_read => return .{ .open_read = @enumFromInt(item.data) },
             .goto => return .{ .goto = @enumFromInt(item.data) },
             .rewind => {
                 const extra_data = ip.extraData(Instruction.Rewind, item.data);
@@ -422,7 +423,6 @@ const InternPool = struct {
             },
             .transaction => {
                 const extra_data = ip.extraData(Instruction.Transaction.Repr, item.data);
-                debug("getInst transaction: ", .{});
                 return .{ .transaction = extra_data.unpack() };
             },
             .string => {
@@ -433,7 +433,6 @@ const InternPool = struct {
                 const extra_data = ip.extraData(Instruction.Integer.Repr, item.data);
                 return .{ .integer = extra_data.unpack() };
             },
-            else => unreachable, // TODO: add rest of instructions
         }
     }
 
@@ -1918,11 +1917,13 @@ const ASTGen = struct {
                             const token_end = ASTGen.getTokenEnd(sql_str.slice(self.ip), token);
                             const table_name = try sql_str.toString().copySubstringNullTerminate(self.gpa, token.start, token_end, self.ip);
                             debug("table_name: {s}", .{table_name.slice(self.ip)});
-                            table_index = try self.ip.put(self.gpa, .{ .table = .{
-                                .name = table_name,
-                                .page = sqlite_table.page,
-                                .first_column = InternPool.Index.Optional.none,
-                            } });
+                            table_index = try self.ip.put(self.gpa, .{
+                                .table = .{
+                                    .name = table_name,
+                                    .page = sqlite_table.page - 1, // TODO: see if -1 can be removed
+                                    .first_column = InternPool.Index.Optional.none,
+                                },
+                            });
                         },
                         .lparen => {
                             state = .table_col_name;
@@ -2738,6 +2739,11 @@ const Vm = struct {
     }
 
     fn reg(self: *Vm, index: Register.Index) Register {
+        const index_num = index.unwrap();
+        if (index_num == null or index_num.? >= self.reg_list.len) {
+            debug("reg: invalid index: {}", .{index});
+            return Register.none;
+        }
         const item = self.reg_list.get(@intFromEnum(index));
         const extra_data = item.data;
         return switch (item.tag) {
@@ -2782,13 +2788,13 @@ const Vm = struct {
         if (index_num == self.reg_list.len) {
             try self.reg_list.append(self.gpa, item);
         } else {
-            while (index_num > self.reg_list.len) {
+            while (index_num >= self.reg_list.len) {
                 try self.reg_list.append(self.gpa, .{ .tag = .none, .data = .{ .@"0" = 0, .@"1" = 0 } });
             }
+            debug("updateReg: index_num: {d}, len: {d}", .{ index_num, self.reg_list.len });
             const slice = self.reg_list.slice();
-            const index_u32: u32 = @intFromEnum(index);
-            slice.items(.tag)[index_u32] = item.tag;
-            slice.items(.data)[index_u32] = item.data;
+            slice.items(.tag)[index_num] = item.tag;
+            slice.items(.data)[index_num] = item.data;
         }
     }
 
@@ -2807,13 +2813,22 @@ const Vm = struct {
         var col_value: ?SQLiteColumn = null;
 
         while (self.pc.unwrap() != null and instruction != InternPool.Instruction.halt) {
-            instruction = self.ip.getInst(self.pc).?;
+            const instruction_opt = self.ip.getInst(self.pc);
+            if (instruction_opt) |inst| {
+                debug("Inst {} at {}", .{ inst, self.pc });
+                instruction = inst;
+            } else {
+                debug("uh, oh. null instruction at pc: {}", .{self.pc});
+                return;
+            }
             switch (instruction) {
                 .init => |init_inst| {
+                    debug("init inst: {}, inst count: {d}", .{ init_inst, self.ip.instructions.len });
                     self.pc = init_inst;
                 },
                 .open_read => |table_index| {
                     const table = self.ip.indexToKey(table_index).table;
+                    debug("table: {}", .{table});
 
                     buffer = self.db.readPage(table.page);
                     debug("buffer created", .{});
