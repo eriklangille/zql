@@ -2520,8 +2520,8 @@ const InstGen = struct {
 
                 debug("output count: {d}", .{output_count});
                 _ = try self.addInst(.{ .result_row = .{
-                    .start_reg = reg_count,
-                    .end_reg = output_count.increment(),
+                    .start_reg = reg_count.increment(),
+                    .end_reg = output_count,
                 } });
                 // try self.resultRow(reg_count, output_count.increment());
                 const next_index = try self.addInst(.{ .next = .{ .cursor = cursor, .success_jump = rewind_start } });
