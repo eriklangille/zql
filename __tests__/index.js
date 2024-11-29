@@ -21,7 +21,7 @@ async function compare(query) {
   const sqlQuery = sql.prepare(query);
   const sqlResult = sqlQuery.all();
   console.log(zqlResult);
-  expect(sqlResult.length).toBe(zqlResult.length);
+  expect(zqlResult.length).toBe(sqlResult.length);
   for (let i = 0; i < sqlResult.length; i++) {
     const obj = sqlResult[i];
     let j = 0;
@@ -31,7 +31,7 @@ async function compare(query) {
       if (typeof zqlItem == 'bigint') {
         zqlItem = Number(zqlItem);
       }
-      expect(sqlItem).toBe(zqlItem);
+      expect(zqlItem).toBe(sqlItem);
       j++;
     }
   }
@@ -59,7 +59,7 @@ describe('Compare ZQL to SQL', () => {
     await compare("select id from example;");
     // compare("select name from example;");
     // TODO: implement single quotes in zql
-    // compare("select * from example where name = 'Alice';");
+    compare("select * from example where name = 'Alice';");
   });
 });
 

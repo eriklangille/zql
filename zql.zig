@@ -1337,6 +1337,9 @@ const Tokenizer = struct {
                     '"' => {
                         state = .double_quote_word;
                     },
+                    '\'' => {
+                        state = .single_quote_word;
+                    },
                     ';' => {
                         token.type = .semicolon;
                         self.index += 1;
@@ -1402,6 +1405,18 @@ const Tokenizer = struct {
                     'a'...'z', 'A'...'Z' => {},
                     '"' => {
                         token.type = TokenType.double_quote_word;
+                        self.index += 1;
+                        break;
+                    },
+                    else => {
+                        // TODO: probably want to support more characters
+                        token.type = TokenType.invalid;
+                    },
+                },
+                .single_quote_word => switch (c) {
+                    'a'...'z', 'A'...'Z', '0'...'9', '_' => {},
+                    '\'' => {
+                        token.type = TokenType.single_quote_word;
                         self.index += 1;
                         break;
                     },
@@ -1584,9 +1599,13 @@ const SQLiteRecord = struct {
         self.header_cursor += getVarint(self.buffer.ptr + self.header_cursor, &header_val);
 
         // for debugging
-        // const size: u32 = @truncate(SQLiteColumnType.size(header_val));
-        // const col_type = SQLiteColumnType.from(header_val);
-        // debug("next() size: {d} col_type: {}", .{ size, col_type });
+        // TODO: remove after finished debugging
+        const size: u32 = @truncate(SQLiteColumn.size(header_val));
+        const result = SQLiteColumn.from(
+            header_val,
+            self.buffer[self.cursor..],
+        );
+        debug("next() size: {d} col_type: {s}", .{ size, @tagName(result) });
 
         self.cursor += @truncate(SQLiteColumn.size(header_val));
     }
@@ -1753,13 +1772,14 @@ const Db = struct {
 
             if (record.next()) |name_col| {
                 if (name_col != SQLiteColumn.text) return Error.InvalidBinary;
+                debug("record text: {s}", .{name_col.text});
                 if (eql(u8, table_name, name_col.text)) {
                     if (record.next()) |index_col| {
                         const index_int = index_col.getInt();
                         if (index_int == null) return Error.InvalidBinary;
                         assert(index_int.? >= 0);
                         const page_index: u32 = @intCast(index_int.?);
-                        debug("page_index: {d}", .{page_index});
+                        debug("found table '{s}' with page_index: {d}", .{ name_col.text, page_index });
                         if (record.next()) |sql_col| {
                             if (sql_col != SQLiteColumn.text) return Error.InvalidBinary;
                             const sql_str = try InternPool.NullTerminatedString.initAddSentinel(alloc, sql_col.text, ip);
@@ -1779,6 +1799,8 @@ const Db = struct {
                 return Error.InvalidBinary;
             }
         }
+        // TODO: probably do more then log that the table doesn't exist
+        debug("Could not find table: {s}", .{table_name});
         return Error.InvalidBinary;
     }
 };
@@ -2026,6 +2048,7 @@ const ASTGen = struct {
                             // All columns
                             columns = max_64_bit;
                             processed_columns = true;
+                            column_list_index = self.index;
                         },
                         .keyword_from => {
                             state = .from;
@@ -2057,9 +2080,11 @@ const ASTGen = struct {
                                 break;
                             }
                         },
+                        .asterisk => {},
                         .comma => {},
                         .keyword_from => {
                             processed_columns = true;
+                            debug("keyword_from -> from_after", .{});
                             state = .from_after;
                         },
                         else => {
@@ -2094,7 +2119,9 @@ const ASTGen = struct {
                     }
                 },
                 .from_after => {
+                    debug("from after: {}", .{token.tag});
                     switch (token.tag) {
+                        .word => {}, // This is the table name. // TODO enforce table name before where clause or pop back to after table name after second_select
                         .keyword_where => {
                             where = try self.buildWhereClause(table.?);
                             self.ip.dump(where);
@@ -2132,6 +2159,7 @@ const ASTGen = struct {
         var expr_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
         var expr_prev_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
         var expr_first_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
+        debug("buildWhereClause", .{});
         while (self.index < self.token_list.len) : (self.index += 1) {
             const token = self.token_list.get(self.index);
             switch (state) {
@@ -2203,7 +2231,7 @@ const ASTGen = struct {
                         return Error.InvalidSyntax;
                     }
                     switch (token.tag) {
-                        .double_quote_word => {
+                        .double_quote_word, .single_quote_word => {
                             const string_literal = ASTGen.getTokenSource(self.source, token);
                             debug("where_rhs literal: {s}", .{string_literal});
                             const value = try InternPool.NullTerminatedString.initAddSentinel(self.gpa, string_literal[1 .. string_literal.len - 1], self.ip);
@@ -2440,6 +2468,7 @@ const InstGen = struct {
                 var reg_count = Register.Index.first;
                 var reader = TableMetadataReader.from(self.ip, select.table);
                 const where_clause = select.where;
+                debug("Where: {?}", .{where_clause});
                 const compare_reg = reg_count;
                 // const compare_reg = try self.ip.put(self.gpa, .{ .register = InternPool.Register.none });
                 var final_comparison: InternPool.InstIndex = InternPool.InstIndex.none;
@@ -2650,10 +2679,10 @@ const Register = union(enum) {
                 .string => eql(u8, self.string.string.slice(self.string.len, ip), other.string.string.slice(self.string.len, ip)),
                 .binary => unreachable, // TODO: implement
             };
-        } else if (self.tag() == .str and other.tag() == .string) {
-            return eql(u8, self.string.string.slice(self.string.len, ip), other.str);
         } else if (self.tag() == .string and other.tag() == .str) {
-            return eql(u8, self.str, self.string.string.slice(self.string.len, ip));
+            return eql(u8, self.string.string.slice(self.string.len, ip), other.str);
+        } else if (self.tag() == .str and other.tag() == .string) {
+            return eql(u8, self.str, other.string.string.slice(other.string.len, ip));
         }
         return false;
     }
@@ -2977,10 +3006,6 @@ const Vm = struct {
 };
 
 const MinimizedToken = struct { tag: TokenType, start: u32 };
-
-// TODO: put all these into a self-contained structure like how the Zig compiler does with InternPool
-// Then only return the filled out structures, not the data oriented design ones
-var extra: ArrayListUnmanaged(u32) = .{};
 const TokenList = MultiArrayList(MinimizedToken);
 
 fn parseStatement(str: [:0]u8, file_buffer: []u8) Error!void {
