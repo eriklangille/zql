@@ -55,11 +55,10 @@ describe('Compare ZQL to SQL', () => {
   test('example db', async () => {
     await compare("select * from example;");
     await compare("select id, name from example;");
-    // TODO: handle memory issues in ZQL
     await compare("select id from example;");
-    // compare("select name from example;");
-    // TODO: implement single quotes in zql
-    compare("select * from example where name = 'Alice';");
+    await compare("select name from example;");
+    await compare("select * from example where name = 'Alice';");
+    await compare("select * from example where name = 'Alice' or name = 'Bob';");
   });
 });
 
