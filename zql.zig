@@ -1463,62 +1463,6 @@ const SelectStmt = struct {
     where: InternPool.Index.Optional, // Optional condition index
 };
 
-const ElementType = enum {
-    compare_and,
-    compare_eq_float,
-    compare_eq_int,
-    compare_eq_str,
-    compare_ne_float,
-    compare_ne_int,
-    compare_ne_str,
-    compare_or,
-    expr_group,
-    integer,
-    table,
-    text,
-};
-
-const Element = struct {
-    value: union {
-        str: InternPool.String,
-        int: i64,
-        float: f64,
-    },
-    tag: ElementType,
-    data: Data,
-};
-
-const Data = struct {
-    lhs: u32,
-    rhs: u32,
-};
-
-const Inst = struct {
-    // In SQLite, Instructions have 6 properties: opcode, p1: u32, p2: u32, p3: u32, p4: u64 (optional?), and p5: u16.
-    // For our Zig implementation, we will do a data struct with two u32 values
-    // and then any instruction that requires more than 64 bits of information can be stored in extra data
-    opcode: Opcode,
-    data: Data,
-
-    pub const Opcode = enum(u8) {
-        init,
-        open_read,
-        rewind,
-        row_id,
-        column,
-        result_row,
-        next,
-        halt,
-        transaction,
-        goto,
-        eq,
-        neq,
-        string,
-        int,
-        float,
-    };
-};
-
 const SQLiteDbTable = struct {
     page: u32,
     sql: InternPool.NullTerminatedString,
@@ -1865,23 +1809,6 @@ const ASTGen = struct {
         var tokenizer = Tokenizer.from(buffer, min_token.start);
         const token = tokenizer.next();
         return token.location.end;
-    }
-
-    fn replaceDataAtIndex(self: *ASTGen, index: u32, data: Data) void {
-        self.element_list.items(.data)[index] = .{
-            .lhs = data.lhs,
-            .rhs = data.rhs,
-        };
-    }
-
-    fn replaceTagAtIndex(self: *ASTGen, index: u32, tag: ElementType) void {
-        self.element_list.items(.tag)[index] = tag;
-    }
-
-    fn replaceNameAtIndex(self: *ASTGen, index: u32, name: InternPool.String) void {
-        self.element_list.items(.value)[index] = .{
-            .str = name,
-        };
     }
 
     fn addToken(self: *ASTGen, token: MinimizedToken) Allocator.Error!u32 {
