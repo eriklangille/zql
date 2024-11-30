@@ -1902,7 +1902,7 @@ const ASTGen = struct {
                         },
                         .keyword_primary => {
                             // If this is a primary key, we don't have to set the column type. It will act as autoincrement int.
-                            tag = .integer;
+                            tag = .null;
                             if (primary_key != PrimaryKeyState.unfilled) {
                                 return Error.InvalidSyntax; // Primary key already filled
                             }
