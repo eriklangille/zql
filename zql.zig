@@ -1891,12 +1891,29 @@ const ASTGen = struct {
                     }
                 },
                 .table_col_type => {
-                    tag = switch (token.tag) {
-                        .keyword_integer => .integer,
-                        .keyword_text => .text,
-                        else => return Error.InvalidSyntax,
-                    };
-                    state = .table_next;
+                    switch (token.tag) {
+                        .keyword_integer => {
+                            tag = .integer;
+                            state = .table_next;
+                        },
+                        .keyword_text => {
+                            tag = .text;
+                            state = .table_next;
+                        },
+                        .keyword_primary => {
+                            // If this is a primary key, we don't have to set the column type. It will act as autoincrement int.
+                            tag = .integer;
+                            if (primary_key != PrimaryKeyState.unfilled) {
+                                return Error.InvalidSyntax; // Primary key already filled
+                            }
+                            state = .table_col_primary;
+                        },
+                        else => {
+                            // If the col type is invalid, sqlite defaults to a integer column type
+                            tag = .integer;
+                            state = .table_next;
+                        },
+                    }
                 },
                 .table_next => {
                     if (name == null or tag == null) {
@@ -1941,6 +1958,7 @@ const ASTGen = struct {
                     }
                 },
                 .table_col_primary => {
+                    debug("table_col_primary", .{});
                     switch (token.tag) {
                         .keyword_key => {
                             primary_key = PrimaryKeyState.current;

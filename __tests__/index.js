@@ -2,7 +2,8 @@ import { promises as fs } from 'fs';
 import { DatabaseSync } from 'node:sqlite';
 import loadZQL from '../zql.js';
 
-const DB_FILE = './test.db';
+const SMALL_DB_FILE = './test.db';
+const BACKUP_DB_FILE = './backup.db';
 let zql;
 let zqlResult = [];
 let sql;
@@ -39,26 +40,35 @@ async function compare(query) {
   zqlResult = [];
 }
 
-beforeAll(async () => {
+async function load(dbFile) {
   console.log("Loading SQLite");
-  sql = new DatabaseSync(DB_FILE);
+  sql = new DatabaseSync(dbFile);
   zql = await loadZQL();
   const addTableRow = (array) => {
     zqlResult.push(array);
   }
   zql.rowListeners.push(addTableRow);
-  await zql.loadFile(getFile(DB_FILE));
+  await zql.loadFile(getFile(dbFile));
   console.log("Loaded");
-});
+}
+
+// beforeAll(async () => {
+//   load();
+// });
 
 describe('Compare ZQL to SQL', () => {
-  test('example db', async () => {
+  test('small db', async () => {
+    await load(SMALL_DB_FILE)
     await compare("select * from example;");
     await compare("select id, name from example;");
     await compare("select id from example;");
     await compare("select name from example;");
     await compare("select * from example where name = 'Alice';");
     await compare("select * from example where name = 'Alice' or name = 'Bob';");
+  });
+  test('backup db', async () => {
+    await load(BACKUP_DB_FILE)
+    await compare("select * from test;");
   });
 });
 
