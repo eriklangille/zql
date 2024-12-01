@@ -1024,6 +1024,10 @@ const SQLiteDbHeader = extern struct {
     version_valid_for: u32,
     sqlite_version_number: u32,
 
+    pub fn cast(buf: []u8) *SQLiteDbHeader {
+        return @alignCast(@ptrCast(buf[0..sqlite_header_size]));
+    }
+
     pub fn getPageSize(self: *SQLiteDbHeader) u16 {
         return @byteSwap(self.page_size);
     }
@@ -1033,17 +1037,57 @@ const SQLiteDbHeader = extern struct {
     }
 };
 
+const SQLitePage = struct {
+    buffer: []u8,
+    header: *SQLiteBtHeader,
+    db_header: ?*SQLiteDbHeader,
+
+    pub fn init(buf: []u8) SQLitePage {
+        if (std.mem.eql(u8, buf[0..15], "SQLite format 3")) {
+            const db_header = SQLiteDbHeader.cast(buf);
+            return .{
+                .buffer = buf,
+                .header = SQLiteBtHeader.cast(buf[sqlite_header_size..]),
+                .db_header = db_header,
+            };
+        }
+        return .{
+            .buffer = buf,
+            .header = SQLiteBtHeader.cast(buf),
+            .db_header = null,
+        };
+    }
+
+    pub fn record(self: SQLitePage, index: u32) SQLiteRecord {
+        const header_start_buffer = if (self.db_header == null) self.buffer else self.buffer[sqlite_header_size..];
+        const cell_adr = self.header.getCellAddr(header_start_buffer, index);
+        const cell_start = self.buffer[cell_adr..];
+
+        // debug("SQLitePage.record() type: {}", .{self.header.getPageType()});
+        assert(self.header.getPageType() == .table_leaf);
+
+        return SQLiteRecord.init(cell_start);
+    }
+};
+
+const SQLitePageType = enum(u8) {
+    table_leaf = 0x0d,
+    table_interior = 0x05,
+    index_leaf = 0x0a,
+    index_interior = 0x02,
+};
+
 const sqlite_bt_header_size = 12;
 const SQLiteBtHeader = extern struct {
     metadata: [8]u8,
     // // Doesn't exist on leaf pages (0x0D and 0x0A page_type)
     right_child_page: u32,
 
-    pub fn from(buffer: []u8) *SQLiteBtHeader {
-        return @alignCast(@ptrCast(buffer[0..sqlite_bt_header_size])); // TODO: align(1)?
+    pub fn cast(buf: []u8) *SQLiteBtHeader {
+        return @alignCast(@ptrCast(buf[0..sqlite_bt_header_size]));
     }
 
-    pub fn getCellAddr(self: *SQLiteBtHeader, buffer: []u8, index: u32) u16 {
+    pub fn getCellAddr(self: *const SQLiteBtHeader, buffer: []u8, index: u32) u16 {
         const bt_header_size = self.getHeaderSize();
         const start = bt_header_size + (index * 2);
         const cell_adr: u16 = @byteSwap(valFromSlice(u16, buffer[start .. start + 2]));
@@ -1051,11 +1095,11 @@ const SQLiteBtHeader = extern struct {
         return cell_adr;
     }
 
-    pub fn getHeaderSize(self: *SQLiteBtHeader) u8 {
+    pub fn getHeaderSize(self: *const SQLiteBtHeader) u8 {
         const page_type = self.getPageType();
-        debug("page type: {x}", .{page_type});
+        debug("page type: {}", .{page_type});
         switch (page_type) {
-            0x0D, 0x0A => {
+            .table_leaf, .index_leaf => {
                 return 8;
             },
             else => {
@@ -1064,37 +1108,38 @@ const SQLiteBtHeader = extern struct {
         }
     }
 
-    pub fn getPageType(self: *SQLiteBtHeader) u8 {
-        return self.metadata[0];
+    pub fn getPageType(self: *const SQLiteBtHeader) SQLitePageType {
+        debug("page type: {x}", .{self.metadata[0]});
+        return @enumFromInt(self.metadata[0]);
     }
 
-    pub fn getFirstFreeblock(self: *SQLiteBtHeader) u16 {
+    pub fn getFirstFreeblock(self: *const SQLiteBtHeader) u16 {
         var block: u16 = 0;
         block = @as(u16, self.metadata[1]) << 8;
         block |= self.metadata[2];
         return block;
     }
 
-    pub fn getCellCount(self: *SQLiteBtHeader) u16 {
+    pub fn getCellCount(self: *const SQLiteBtHeader) u16 {
         var block: u16 = 0;
         block = @as(u16, self.metadata[3]) << 8;
         block |= self.metadata[4];
         return block;
     }
 
-    pub fn getCellOffset(self: *SQLiteBtHeader) u16 {
+    pub fn getCellOffset(self: *const SQLiteBtHeader) u16 {
         var block: u16 = 0;
         block = @as(u16, self.metadata[5]) << 8;
         block |= self.metadata[6];
         return block;
     }
 
-    pub fn getFragmentCount(self: *SQLiteBtHeader) u8 {
+    pub fn getFragmentCount(self: *const SQLiteBtHeader) u8 {
         return self.metadata[7];
     }
 
-    pub fn getRightChildPage(self: *SQLiteBtHeader) u32 {
-        assert(self.getPageType() != 0x0D and self.getPageType() != 0x0A);
+    pub fn getRightChildPage(self: *const SQLiteBtHeader) u32 {
+        assert(self.getPageType() != .table_leaf and self.getPageType() != .index_leaf);
         return @byteSwap(self.right_child_page);
     }
 };
@@ -1479,7 +1524,7 @@ const SQLiteRecord = struct {
     // header comes first with column data types. Header starts with size of header varint.
     // values come after, size of ea determined by respective header
 
-    pub fn from(buffer: []u8) SQLiteRecord {
+    pub fn init(buffer: []u8) SQLiteRecord {
         var cell_size: u64 = 0;
         var cell_header_size: u64 = 0;
         var cursor: u32 = 0;
@@ -1498,7 +1543,7 @@ const SQLiteRecord = struct {
         cursor += cell_header_int_size_bytes;
 
         // TODO: extra validation to make sure its 32 bit size?
-        return SQLiteRecord{
+        return .{
             .buffer = buffer[cursor..],
             .row_id = row_id,
             .size = @intCast(cell_size),
@@ -1639,7 +1684,7 @@ const SQLiteColumn = union(enum) {
             6, 7 => return 8,
             else => {
                 if (val % 2 == 0) {
-                    // Divide by 2 (>> 1). Compiler should be smart enough to optimize /, but I'm smart too
+                    // Compiler should be smart enough to optimize / 2
                     return (val - 12) / 2;
                 }
                 return (val - 13) / 2;
@@ -1670,7 +1715,7 @@ const Db = struct {
         };
     }
 
-    pub fn readPage(self: *Db, index: u32) []u8 {
+    pub fn readPage(self: *Db, index: u32) SQLitePage {
         debug("index: {d}, page_size: {d}", .{ index, self.page_size });
         const page_start: u32 = index * self.page_size;
         debug("page start {x}", .{page_start});
@@ -1684,7 +1729,7 @@ const Db = struct {
             debug("allocated", .{});
         }
         debug("buffer len: {d}, page_start: {d}", .{ self.buffer.len, page_start });
-        return self.buffer[page_start..];
+        return SQLitePage.init(self.buffer);
     }
 
     // Table schema:
@@ -1702,14 +1747,11 @@ const Db = struct {
         readBuffer(self.buffer.ptr, 0, self.page_size);
         const new_slice = self.buffer.ptr[0..self.page_size]; // first page
         self.buffer = new_slice;
-        const bt_header = SQLiteBtHeader.from(new_slice[sqlite_header_size..]);
+        var page = SQLitePage.init(new_slice);
 
         var cell_index: u32 = 0;
-        while (cell_index < bt_header.getCellCount()) : (cell_index += 1) {
-            const cell_adr = bt_header.getCellAddr(new_slice[sqlite_header_size..], cell_index);
-            const cell_start = new_slice[cell_adr..];
-
-            var record = SQLiteRecord.from(cell_start);
+        while (cell_index < page.header.getCellCount()) : (cell_index += 1) {
+            var record = page.record(cell_index);
             debug("table record: {}", .{record});
             record.consume();
             record.consume();
@@ -2778,8 +2820,7 @@ const Vm = struct {
         var instruction: InternPool.Instruction = self.ip.getInst(self.pc).?;
         // TODO: multiple cursors
         // TODO: clean up these variables
-        var buffer: ?[]u8 = null;
-        var header: ?*SQLiteBtHeader = null;
+        var page: ?SQLitePage = null;
         var record: ?SQLiteRecord = null;
         var col_count: u32 = 0;
         var cell_size: u32 = 0;
@@ -2804,16 +2845,12 @@ const Vm = struct {
                     const table = self.ip.indexToKey(table_index).table;
                     debug("table: {}", .{table});
 
-                    buffer = self.db.readPage(table.page);
+                    page = self.db.readPage(table.page);
                     debug("buffer created", .{});
-                    header = SQLiteBtHeader.from(buffer.?);
-                    // TODO: refactor this mess
-                    cell_size = header.?.getCellCount();
+                    cell_size = page.?.header.getCellCount();
                     debug("cell size: {d}", .{cell_size});
                     if (cell_size != 0) {
-                        const addr = header.?.getCellAddr(buffer.?, cell_count);
-                        debug("cell address: {x}", .{addr});
-                        record = SQLiteRecord.from(buffer.?[addr..]);
+                        record = page.?.record(0);
                     }
                     self.pc = self.pc.increment();
                 },
@@ -2928,9 +2965,7 @@ const Vm = struct {
                     } else {
                         cell_count += 1;
 
-                        const addr = header.?.getCellAddr(buffer.?, cell_count);
-                        debug("cell address: {x}", .{addr});
-                        record = SQLiteRecord.from(buffer.?[addr..]);
+                        record = page.?.record(cell_count);
                         col_value = record.?.next();
 
                         self.pc = next_data.success_jump;
