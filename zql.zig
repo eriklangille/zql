@@ -1032,6 +1032,12 @@ const SQLiteDbHeader = extern struct {
         return @byteSwap(self.page_size);
     }
 
+    pub fn getUsableSize(self: *SQLiteDbHeader) u16 {
+        const usable: u16 = self.getPageSize() - self.reserved_space;
+        assert(usable >= 480); // Valid SQLite table has a minimum usable space of 480 bytes
+        return usable;
+    }
+
     pub fn getVersion(self: *SQLiteDbHeader) u32 {
         return @byteSwap(self.sqlite_version_number);
     }
@@ -1039,32 +1045,45 @@ const SQLiteDbHeader = extern struct {
 
 const SQLitePage = struct {
     buffer: []u8,
-    header: *SQLiteBtHeader,
-    db_header: ?*SQLiteDbHeader,
+    db_header: *SQLiteDbHeader,
 
-    pub fn init(buf: []u8) SQLitePage {
-        if (std.mem.eql(u8, buf[0..15], "SQLite format 3")) {
-            const db_header = SQLiteDbHeader.cast(buf);
-            return .{
-                .buffer = buf,
-                .header = SQLiteBtHeader.cast(buf[sqlite_header_size..]),
-                .db_header = db_header,
-            };
-        }
+    pub fn init(buf: []u8, db_header: *SQLiteDbHeader) SQLitePage {
         return .{
             .buffer = buf,
-            .header = SQLiteBtHeader.cast(buf),
-            .db_header = null,
+            .db_header = db_header,
         };
     }
 
-    pub fn record(self: SQLitePage, index: u32) SQLiteRecord {
-        const header_start_buffer = if (self.db_header == null) self.buffer else self.buffer[sqlite_header_size..];
-        const cell_adr = self.header.getCellAddr(header_start_buffer, index);
+    pub fn headerStart(self: SQLitePage) []u8 {
+        if (self.db_header == SQLiteDbHeader.cast(self.buffer)) {
+            return self.buffer[sqlite_header_size..];
+        }
+        return self.buffer;
+    }
+
+    pub fn header(self: SQLitePage) *SQLiteBtHeader {
+        const header_start_buffer = self.headerStart();
+        return SQLiteBtHeader.cast(header_start_buffer);
+    }
+
+    pub fn cell(self: SQLitePage, index: u32) SQLiteInteriorCell {
+        const header_start_buffer = self.headerStart();
+        const bt_header = SQLiteBtHeader.cast(header_start_buffer);
+        assert(bt_header.getPageType() == .table_interior);
+
+        const cell_adr = bt_header.getCellAddr(header_start_buffer, index);
         const cell_start = self.buffer[cell_adr..];
 
-        // debug("SQLitePage.record() type: {}", .{self.header.getPageType()});
-        assert(self.header.getPageType() == .table_leaf);
+        return SQLiteInteriorCell.init(cell_start);
+    }
+
+    pub fn record(self: SQLitePage, index: u32) SQLiteRecord {
+        const header_start_buffer = self.headerStart();
+        const bt_header = SQLiteBtHeader.cast(header_start_buffer);
+        assert(bt_header.getPageType() == .table_leaf);
+
+        const cell_adr = bt_header.getCellAddr(header_start_buffer, index);
+        const cell_start = self.buffer[cell_adr..];
 
         return SQLiteRecord.init(cell_start);
     }
@@ -1080,7 +1099,7 @@ const SQLitePageType = enum(u8) {
 const sqlite_bt_header_size = 12;
 const SQLiteBtHeader = extern struct {
     metadata: [8]u8,
-    // // Doesn't exist on leaf pages (0x0D and 0x0A page_type)
+    // Doesn't exist on leaf pages (0x0D and 0x0A page_type)
     right_child_page: u32,
 
     pub fn cast(buf: []u8) *SQLiteBtHeader {
@@ -1145,7 +1164,7 @@ const SQLiteBtHeader = extern struct {
 };
 
 // Bit masks for getVarint
-const bits_7 = 0x7f;
+const bits_7: u8 = 0x7f;
 const slot_2_0 = (0x7f << 14) | 0x7f;
 const slot_4_2_0 = (0x7f << 28) | slot_2_0;
 
@@ -1183,7 +1202,7 @@ fn getVarint(ptr1: [*]u8, result: *u64) u8 {
     }
 
     if (@as(i8, @bitCast(ptr[1])) >= 0) {
-        result.* = ((ptr[0] & bits_7) << 7) | ptr[1];
+        result.* = (@as(u64, ptr[0] & bits_7) << 7) | ptr[1];
         return 2;
     }
 
@@ -1513,6 +1532,20 @@ const SQLiteDbTable = struct {
     sql: InternPool.NullTerminatedString,
 };
 
+const SQLiteInteriorCell = struct {
+    page: u32, // Page the data is located
+    int_key: u64, // cell offset on that page. Equal to row_id
+
+    pub fn init(buffer: []u8) SQLiteInteriorCell {
+        var int_key: u64 = 0;
+        _ = getVarint(buffer[@sizeOf(u32)..].ptr, &int_key);
+        return .{
+            .page = @byteSwap(valFromSlice(u32, buffer)),
+            .int_key = int_key,
+        };
+    }
+};
+
 const SQLiteRecord = struct {
     buffer: []u8,
     row_id: u64,
@@ -1558,6 +1591,8 @@ const SQLiteRecord = struct {
         self.header_cursor = 0;
     }
 
+    // TODO: rewrite. SQLiteColumn can overflow over multiple database pages
+    // we need to handle that. Typically the record header is all stored in the payload of one cell, but the body can overflow to other pages
     pub fn next(self: *SQLiteRecord) ?SQLiteColumn {
         if (self.cursor >= self.size) return null;
         if (self.header_cursor >= self.header_size) {
@@ -1696,21 +1731,19 @@ const SQLiteColumn = union(enum) {
 pub const Error = error{ InvalidBinary, InvalidSyntax, OutOfMemory };
 
 const Db = struct {
-    cursor: usize, // TODO: use this?
-    buffer: []u8,
+    memory: DbMemory,
     page_size: u16,
 
-    pub fn from(buffer: []u8) Error!Db {
-        if (buffer.len < @sizeOf(SQLiteDbHeader)) {
+    pub fn init(memory: DbMemory) Error!Db {
+        if (memory.buffer.len < @sizeOf(SQLiteDbHeader)) {
             debug("buffer too small.", .{});
             return error.InvalidBinary;
         }
-        const header: *SQLiteDbHeader = @alignCast(@ptrCast(buffer[0..sqlite_header_size]));
+        const header = SQLiteDbHeader.cast(memory.buffer);
         const page_size = header.getPageSize();
         debug("page_size: {d}", .{page_size});
         return .{
-            .cursor = 0,
-            .buffer = buffer,
+            .memory = memory,
             .page_size = page_size,
         };
     }
@@ -1718,18 +1751,22 @@ const Db = struct {
     pub fn readPage(self: *Db, index: u32) SQLitePage {
         debug("index: {d}, page_size: {d}", .{ index, self.page_size });
         const page_start: u32 = index * self.page_size;
+        const page_end: u32 = page_start + self.page_size;
         debug("page start {x}", .{page_start});
-        if (self.buffer.len <= page_start) {
-            // TODO: buffer management (alloc?)
+        assert(page_end <= self.memory.max_allocated);
+        // TODO: currently we are handling loading pages by loading up into the page address needed.
+        // Instead, we could do a LRU cache of database pages (page index and location in memory)
+        if (self.memory.buffer.len <= page_end) {
             debug("increasing buffer size", .{});
             const length = page_start + self.page_size;
-            readBuffer(self.buffer.ptr, 0, length);
-            const new_slice = self.buffer.ptr[0..length]; // first page
-            self.buffer = new_slice;
+            readBuffer(self.memory.buffer.ptr, 0, length);
+            const new_slice = self.memory.buffer.ptr[0..length]; // first page
+            self.memory.buffer = new_slice;
             debug("allocated", .{});
         }
-        debug("buffer len: {d}, page_start: {d}", .{ self.buffer.len, page_start });
-        return SQLitePage.init(self.buffer);
+        debug("buffer len: {d}, page_start: {d}", .{ self.memory.buffer.len, page_start });
+        const db_header = SQLiteDbHeader.cast(self.memory.buffer);
+        return SQLitePage.init(self.memory.buffer[page_start..page_end], db_header);
     }
 
     // Table schema:
@@ -1742,15 +1779,12 @@ const Db = struct {
     // );
 
     pub fn getTable(self: *Db, alloc: Allocator, table_name: []const u8, ip: *InternPool) Error!SQLiteDbTable {
-        // the first page contains the buffer (first 100 bytes), so we have a 0 offset to allocate the first page
-        // TODO: buffer management
-        readBuffer(self.buffer.ptr, 0, self.page_size);
-        const new_slice = self.buffer.ptr[0..self.page_size]; // first page
-        self.buffer = new_slice;
-        var page = SQLitePage.init(new_slice);
+        //
+        // The first page contains the schemas of all tables in the database
+        var page = self.readPage(0);
 
         var cell_index: u32 = 0;
-        while (cell_index < page.header.getCellCount()) : (cell_index += 1) {
+        while (cell_index < page.header().getCellCount()) : (cell_index += 1) {
             var record = page.record(cell_index);
             debug("table record: {}", .{record});
             record.consume();
@@ -2445,11 +2479,8 @@ const InstGen = struct {
                 const cursor = try self.ip.put(self.gpa, .{ .cursor = .{ .index = 0 } });
 
                 const init_index = try self.addInst(.{ .init = InternPool.InstIndex.none });
-                // const init_index = try self.markInst(.init);
                 const open_read_index = try self.addInst(.{ .open_read = select.table });
-                // const open_read_index = try self.markInst(.open_read);
                 const rewind_index = try self.addInst(.{ .rewind = .{ .table = select.table, .end_inst = InternPool.InstIndex.none } });
-                // const rewind_index = try self.markInst(.rewind);
                 const rewind_start = self.ip.peekInst();
 
                 var reg_count = Register.Index.first;
@@ -2457,7 +2488,6 @@ const InstGen = struct {
                 const where_clause = select.where;
                 debug("Where: {?}", .{where_clause});
                 const compare_reg = reg_count;
-                // const compare_reg = try self.ip.put(self.gpa, .{ .register = InternPool.Register.none });
                 var final_comparison: InternPool.InstIndex = InternPool.InstIndex.none;
                 if (where_clause.unwrap()) |ref| {
                     var traversal = ConditionTraversal.init(self.ip, ref);
@@ -2519,14 +2549,12 @@ const InstGen = struct {
                                 .read_cursor = cursor,
                                 .store_reg = output_count,
                             } });
-                            // try self.rowId(cursor, output_count);
                         } else {
                             _ = try self.addInst(.{ .column = .{
                                 .cursor = cursor,
                                 .store_reg = output_count,
                                 .col = col_i,
                             } });
-                            // try self.column(cursor, output_count, col_count);
                         }
                         output_count = output_count.increment();
                     }
@@ -2539,14 +2567,10 @@ const InstGen = struct {
                     .start_reg = reg_count.increment(),
                     .end_reg = output_count,
                 } });
-                // try self.resultRow(reg_count, output_count.increment());
                 const next_index = try self.addInst(.{ .next = .{ .cursor = cursor, .success_jump = rewind_start } });
-                // try self.next(cursor, rewind_start);
                 const halt_index = try self.addInst(InternPool.Instruction.halt);
-                // try self.halt();
                 // TODO: support multiples databases, writing to tables
                 const transaction_index = try self.addInst(.{ .transaction = .{ .database_id = 0, .write = false } });
-                // try self.transaction(0, false);
                 if (where_clause.unwrap()) |where| {
                     self.eqReplaceJump(final_comparison, next_index);
                     var traversal = ConditionTraversal.init(self.ip, where);
@@ -2554,9 +2578,7 @@ const InstGen = struct {
                     defer traversal.deint(self.gpa);
                     while (try traversal.next(self.gpa)) |cond| {
                         switch (cond.rhs) {
-                            // .string => try self.string(cond.rhs.string, store_reg),
                             .string => _ = try self.addInst(.{ .string = .{ .string = cond.rhs.string, .store_reg = store_reg } }),
-                            // .int => try self.integer(cond.rhs.int, store_reg),
                             .int => _ = try self.addInst(.{ .integer = .{ .int = cond.rhs.int, .store_reg = store_reg } }),
                             else => return Error.InvalidSyntax, // TODO: implement float
                         }
@@ -2564,12 +2586,8 @@ const InstGen = struct {
                     }
                 }
                 _ = try self.addInst(.{ .goto = open_read_index });
-                // try self.goto(open_read_index);
                 self.ip.setInst(init_index, .{ .init = transaction_index });
-                // self.instInit(init_index, transaction_index);
-                // self.openRead(open_read_index, page_index);
                 self.ip.setInst(rewind_index, .{ .rewind = .{ .table = select.table, .end_inst = halt_index } });
-                // self.rewind(rewind_index, halt_index);
                 debug("instructions written", .{});
             },
         }
@@ -2847,10 +2865,17 @@ const Vm = struct {
 
                     page = self.db.readPage(table.page);
                     debug("buffer created", .{});
-                    cell_size = page.?.header.getCellCount();
+                    cell_size = page.?.header().getCellCount();
                     debug("cell size: {d}", .{cell_size});
                     if (cell_size != 0) {
-                        record = page.?.record(0);
+                        if (page.?.header().getPageType() == .table_leaf) {
+                            record = page.?.record(0);
+                        } else if (page.?.header().getPageType() == .table_interior) {
+                            // TODO: properly implement interior pages
+                            const cell = page.?.cell(0);
+                            page = self.db.readPage(cell.page);
+                            record = page.?.record(0);
+                        }
                     }
                     self.pc = self.pc.increment();
                 },
@@ -2988,7 +3013,7 @@ const Vm = struct {
 const MinimizedToken = struct { tag: TokenType, start: u32 };
 const TokenList = MultiArrayList(MinimizedToken);
 
-fn parseStatement(str: [:0]u8, file_buffer: []u8) Error!void {
+fn parseStatement(str: [:0]u8, db_memory: DbMemory) Error!void {
     var tokenizer = Tokenizer.from(str, 0);
     var fixed_alloc = heap.FixedBufferAllocator.init(&memory_buf);
 
@@ -2999,7 +3024,7 @@ fn parseStatement(str: [:0]u8, file_buffer: []u8) Error!void {
 
     try tokenizer.ingest(fixed_alloc.allocator(), &tokens);
 
-    const db = try Db.from(file_buffer);
+    const db = try Db.init(db_memory);
 
     // ASTGen can allocate more tokens, so we pass the struct instead of the underlying buffer
     var ast = try ASTGen.init(fixed_alloc.allocator(), &tokens, &intern_pool, str, db);
@@ -3016,15 +3041,32 @@ fn parseStatement(str: [:0]u8, file_buffer: []u8) Error!void {
     try vm.exec();
 }
 
-export fn runStatementWithFile(ptr: ?*u8, size: usize) void {
-    if (ptr == null) {
+const DbMemory = struct {
+    buffer: []u8,
+    max_allocated: usize,
+};
+
+// Runs the statement at query_buf pointer with the file partially loaded into memory at loaded_file_ptr.
+// The memory for the loaded_file_ptr is allocated with the exported malloc() fn.
+// By default, the first 100 bytes, which is the SQLite DB header size, is loaded into memory.
+// From the SQLite DB header, we can find the page size, and then load the first page into the given memory
+// size is the total allocated memory available to load pages
+export fn runStatementWithFile(loaded_file_ptr: ?*u8, size: usize) void {
+    if (loaded_file_ptr == null) {
         debug("uh oh no pointer", .{});
         return;
     }
-    const buffer: [*]u8 = @as([*]u8, @ptrCast(ptr));
-    const slice = buffer[0..size];
+    if (size < sqlite_header_size) {
+        debug("Memory has to be greater than {d} bytes", .{sqlite_header_size});
+        return;
+    }
 
-    parseStatement(&query_buf, slice) catch |err| {
+    const array_ptr: [*]u8 = @ptrCast(loaded_file_ptr);
+    const slice = array_ptr[0..sqlite_header_size];
+
+    const memory: DbMemory = .{ .buffer = slice, .max_allocated = size };
+
+    parseStatement(&query_buf, memory) catch |err| {
         switch (err) {
             Error.InvalidBinary => debug("uh oh stinky binary file", .{}),
             Error.InvalidSyntax => debug("uh oh stinky SQL syntax", .{}),

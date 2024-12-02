@@ -99,17 +99,17 @@ class ZqlDb {
     }
 
     /**
-    * Listens for a file input change event and resolves with the file data as a Uint8Array.
+    * Called from WASM. Writes from the dbFile at index readPointer of length bytes to the WASM memory buffer at index writePointer 
     * @param {number} writePointer the address to write the memory
     * @param {number} readPointer the address to read the memory from the file
     * @param {number} length the number of bytes to read
     */
     const readBuffer = (writePointer, readPointer, length) => {
       if (this.#dbFile == null || this.#instance == null) return;
-      console.log('writePointer:', writePointer, 'readPointer:', readPointer, 'length:', length);
+      console.log('[readBuffer] writePointer:', writePointer, 'readPointer:', readPointer, 'length:', length);
       const memory = new Uint8Array(this.#instance.exports.memory.buffer, writePointer, length);
       const fileData = new Uint8Array(this.#dbFile);
-      console.log('Reading buffer from file:', fileData);
+      console.log('Reading buffer from file');
       memory.set(fileData.slice(readPointer, readPointer + length));
     }
 
@@ -151,7 +151,7 @@ class ZqlDb {
 
     const memory = new Uint8Array(this.#instance.exports.memory.buffer);
     memory.set(sqlArrayTerminator.slice(0, MAX_STATEMENT_LEN), sqlAddress);
-    runStatementWithFile(this.#dbMemoryAddress, SQLITE_HEADER_SIZE);
+    runStatementWithFile(this.#dbMemoryAddress, BUFFER_SIZE);
   }
 
   /**
