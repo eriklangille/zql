@@ -1110,13 +1110,11 @@ const SQLiteBtHeader = extern struct {
         const bt_header_size = self.getHeaderSize();
         const start = bt_header_size + (index * 2);
         const cell_adr: u16 = @byteSwap(valFromSlice(u16, buffer[start .. start + 2]));
-        debug("cell adr: {d}", .{cell_adr});
         return cell_adr;
     }
 
     pub fn getHeaderSize(self: *const SQLiteBtHeader) u8 {
         const page_type = self.getPageType();
-        debug("page type: {}", .{page_type});
         switch (page_type) {
             .table_leaf, .index_leaf => {
                 return 8;
@@ -1128,7 +1126,6 @@ const SQLiteBtHeader = extern struct {
     }
 
     pub fn getPageType(self: *const SQLiteBtHeader) SQLitePageType {
-        debug("page type: {x}", .{self.metadata[0]});
         return @enumFromInt(self.metadata[0]);
     }
 
@@ -1746,6 +1743,35 @@ const Db = struct {
             .memory = memory,
             .page_size = page_size,
         };
+    }
+
+    pub fn getRecord(self: *Db, table_root_page_index: u32, index: u32) ?SQLiteRecord {
+        const root = self.readPage(table_root_page_index);
+        const cell_count = root.header().getCellCount();
+
+        debug("getRecord index: {d}", .{index});
+        if (root.header().getPageType() == .table_interior) {
+            const first_cell = root.cell(0);
+            if (index < first_cell.int_key) {
+                const page = self.readPage(first_cell.page - 1);
+                debug("getRecord cell: {}", .{first_cell});
+                return page.record(index);
+            }
+            // TODO: support 64 bit indices
+            var int_key: u32 = @truncate(first_cell.int_key);
+            for (1..cell_count) |i| {
+                const cell = root.cell(i);
+                if (index < cell.int_key) {
+                    const page = self.readPage(cell.page);
+                    debug("getRecord cell: {}", .{cell});
+                    return page.record(index - int_key);
+                }
+                int_key = @truncate(cell.int_key);
+            }
+        } else if (root.header().getPageType() == .table_leaf) {
+            return root.record(index);
+        }
+        return null;
     }
 
     pub fn readPage(self: *Db, index: u32) SQLitePage {
@@ -2838,12 +2864,11 @@ const Vm = struct {
         var instruction: InternPool.Instruction = self.ip.getInst(self.pc).?;
         // TODO: multiple cursors
         // TODO: clean up these variables
-        var page: ?SQLitePage = null;
         var record: ?SQLiteRecord = null;
         var col_count: u32 = 0;
-        var cell_size: u32 = 0;
-        var cell_count: u32 = 0;
+        var cell_count: u32 = 0; // cursor
         var col_value: ?SQLiteColumn = null;
+        var table_root_page_index: u32 = 0;
 
         while (self.pc.unwrap() != null and instruction != InternPool.Instruction.halt) {
             const instruction_opt = self.ip.getInst(self.pc);
@@ -2863,20 +2888,9 @@ const Vm = struct {
                     const table = self.ip.indexToKey(table_index).table;
                     debug("table: {}", .{table});
 
-                    page = self.db.readPage(table.page);
                     debug("buffer created", .{});
-                    cell_size = page.?.header().getCellCount();
-                    debug("cell size: {d}", .{cell_size});
-                    if (cell_size != 0) {
-                        if (page.?.header().getPageType() == .table_leaf) {
-                            record = page.?.record(0);
-                        } else if (page.?.header().getPageType() == .table_interior) {
-                            // TODO: properly implement interior pages
-                            const cell = page.?.cell(0);
-                            page = self.db.readPage(cell.page);
-                            record = page.?.record(0);
-                        }
-                    }
+                    table_root_page_index = table.page;
+                    record = self.db.getRecord(table_root_page_index, 0);
                     self.pc = self.pc.increment();
                 },
                 .rewind => |rewind_data| {
@@ -2985,12 +2999,11 @@ const Vm = struct {
                 },
                 .next => |next_data| {
                     debug("col_value: {?}", .{col_value});
-                    if (cell_count >= cell_size - 1) {
+                    cell_count += 1;
+                    record = self.db.getRecord(table_root_page_index, cell_count);
+                    if (record == null) {
                         self.pc = self.pc.increment();
                     } else {
-                        cell_count += 1;
-
-                        record = page.?.record(cell_count);
                         col_value = record.?.next();
 
                         self.pc = next_data.success_jump;
