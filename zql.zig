@@ -1179,7 +1179,10 @@ comptime {
     assert(@sizeOf(SQLiteBtHeader) == sqlite_bt_header_size);
 }
 
+const debug_mode: bool = false;
+
 fn debug(comptime format: []const u8, args: anytype) void {
+    if (!debug_mode) return;
     var buf: [500]u8 = undefined;
     const line = fmt.bufPrint(&buf, format, args) catch l: {
         buf[buf.len - 3 ..][0..3].* = "...".*;
@@ -1754,19 +1757,17 @@ const Db = struct {
             const first_cell = root.cell(0);
             if (index < first_cell.int_key) {
                 const page = self.readPage(first_cell.page - 1);
-                debug("getRecord cell: {}", .{first_cell});
                 return page.record(index);
             }
             // TODO: support 64 bit indices
-            var int_key: u32 = @truncate(first_cell.int_key);
+            var base_int_key: u32 = @truncate(first_cell.int_key);
             for (1..cell_count) |i| {
                 const cell = root.cell(i);
                 if (index < cell.int_key) {
-                    const page = self.readPage(cell.page);
-                    debug("getRecord cell: {}", .{cell});
-                    return page.record(index - int_key);
+                    const page = self.readPage(cell.page - 1);
+                    return page.record(index - base_int_key);
                 }
-                int_key = @truncate(cell.int_key);
+                base_int_key = @truncate(cell.int_key);
             }
         } else if (root.header().getPageType() == .table_leaf) {
             return root.record(index);
@@ -1782,7 +1783,7 @@ const Db = struct {
         assert(page_end <= self.memory.max_allocated);
         // TODO: currently we are handling loading pages by loading up into the page address needed.
         // Instead, we could do a LRU cache of database pages (page index and location in memory)
-        if (self.memory.buffer.len <= page_end) {
+        if (self.memory.buffer.len < page_end) {
             debug("increasing buffer size", .{});
             const length = page_start + self.page_size;
             readBuffer(self.memory.buffer.ptr, 0, length);
@@ -2887,8 +2888,6 @@ const Vm = struct {
                 .open_read => |table_index| {
                     const table = self.ip.indexToKey(table_index).table;
                     debug("table: {}", .{table});
-
-                    debug("buffer created", .{});
                     table_root_page_index = table.page;
                     record = self.db.getRecord(table_root_page_index, 0);
                     self.pc = self.pc.increment();
@@ -2942,25 +2941,25 @@ const Vm = struct {
                     // TODO: refactor this mess. Probably own struct for writing..
                     var i: u32 = @intFromEnum(start_reg);
                     const len: u32 = @intFromEnum(end_reg) - i;
-                    var write_buf: [256]u8 = undefined;
+                    // var write_buf: [256]u8 = undefined;
                     var row_buf: [512]u8 = undefined;
                     var row_buf_written: u32 = 4;
-                    var write_count: u8 = 0;
+                    // var write_count: u8 = 0;
                     row_buf[0..4].* = std.mem.toBytes(len);
                     while (i < end_reg_num) : (i += 1) {
                         const cur_reg = self.reg(@enumFromInt(i));
-                        const written = cur_reg.toStr(@constCast(write_buf[write_count..]), self.ip) catch write_buf[write_count..];
+                        // const written = cur_reg.toStr(@constCast(write_buf[write_count..]), self.ip) catch write_buf[write_count..];
                         const written_row = cur_reg.toBuf(row_buf[row_buf_written..], self.ip) catch row_buf[row_buf_written..];
                         row_buf_written += written_row.len;
-                        const written_len: u8 = @intCast(written.len);
-                        debug("written len: {d}", .{written_len});
-                        write_count += written_len;
-                        if (i != end_reg_num - 1) {
-                            write_buf[write_count] = '|';
-                            write_count += 1;
-                        }
+                        // const written_len: u8 = @intCast(written.len);
+                        // debug("written len: {d}", .{written_len});
+                        // write_count += written_len;
+                        // if (i != end_reg_num - 1) {
+                        //     write_buf[write_count] = '|';
+                        //     write_count += 1;
+                        // }
                     }
-                    print(write_buf[0..write_count].ptr, write_buf[0..write_count].len);
+                    // print(write_buf[0..write_count].ptr, write_buf[0..write_count].len);
                     renderRow(row_buf[0..row_buf_written].ptr, row_buf[0..row_buf_written].len);
                     self.pc = self.pc.increment();
                 },

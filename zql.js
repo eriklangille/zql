@@ -3,7 +3,7 @@
 // Uint8Array is a view of the memory, it doesn't allocate memory
 // The memory is allocated by the FileReader and the malloc function
 
-const BUFFER_SIZE = 1024 * 64; // 64 KiB
+const BUFFER_SIZE = 1024 * 512; // 512 KiB
 const SQLITE_HEADER_SIZE = 100;
 const MAX_STATEMENT_LEN = 512;
 
