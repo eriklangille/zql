@@ -110,6 +110,8 @@ const InternPool = struct {
         result_row,
         next,
         rewind,
+        seek_gt,
+        seek_ge,
         column,
         transaction,
     };
@@ -308,8 +310,22 @@ const InternPool = struct {
         return @enumFromInt(len);
     }
 
+    pub fn markInst(ip: *InternPool, alloc: Allocator) Allocator.Error!InstIndex.Marked {
+        const index: u32 = ip.instructions.len;
+        try ip.instructions.append(alloc, .{ .opcode = .halt, .data = 0 });
+        return @enumFromInt(index);
+    }
+
+    pub fn replaceInst(ip: *InternPool, alloc: Allocator, index: InstIndex.Marked, key: Instruction) Allocator.Error!InstIndex {
+        return ip.allocInst(alloc, @intFromEnum(index), key);
+    }
+
     pub fn addInst(ip: *InternPool, alloc: Allocator, key: Instruction) Allocator.Error!InstIndex {
         const index: u32 = try ip.instructions.addOne(alloc);
+        return ip.allocInst(alloc, index, key);
+    }
+
+    fn allocInst(ip: *InternPool, alloc: Allocator, index: u32, key: Instruction) Allocator.Error!InstIndex {
         // Each data index in extra is 4 bytes. So we bit shift to the right by 2 (4 bytes) to determine how many 32 bit extra indices we need.
         const size: u32 = key.size() >> 2;
         if (size > 1) {
@@ -417,6 +433,14 @@ const InternPool = struct {
                 const extra_data = ip.extraData(Instruction.Column, item.data);
                 return .{ .column = extra_data };
             },
+            .seek_gt => {
+                const extra_data = ip.extraData(Instruction.Seek, item.data);
+                return .{ .seek_gt = extra_data };
+            },
+            .seek_ge => {
+                const extra_data = ip.extraData(Instruction.Seek, item.data);
+                return .{ .seek_ge = extra_data };
+            },
             .next => {
                 const extra_data = ip.extraData(Instruction.Next, item.data);
                 return .{ .next = extra_data };
@@ -452,6 +476,15 @@ const InternPool = struct {
                 else => @enumFromInt(@intFromEnum(opt) + 1),
             };
         }
+
+        const Marked = enum(u32) {
+            none = std.math.maxInt(u32),
+            _,
+
+            pub fn toInst(self: Marked) InstIndex {
+                return @enumFromInt(@intFromEnum(self));
+            }
+        };
     };
 
     const Instruction = union(enum) {
@@ -467,6 +500,8 @@ const InternPool = struct {
         result_row: Instruction.ResultRow,
         next: Instruction.Next,
         transaction: Instruction.Transaction,
+        seek_gt: Instruction.Seek,
+        seek_ge: Instruction.Seek,
         string: Instruction.String,
         integer: Instruction.Integer,
 
@@ -479,6 +514,8 @@ const InternPool = struct {
                 .goto => .goto,
                 .row_id => .row_id,
                 .rewind => .rewind,
+                .seek_gt => .seek_gt,
+                .seek_ge => .seek_ge,
                 .column => .column,
                 .open_read => .open_read,
                 .result_row => .result_row,
@@ -497,6 +534,8 @@ const InternPool = struct {
                 .row_id => @sizeOf(Instruction.RowId),
                 .result_row => @sizeOf(Instruction.ResultRow),
                 .rewind => @sizeOf(Instruction.Rewind),
+                .seek_gt => @sizeOf(Instruction.Seek),
+                .seek_ge => @sizeOf(Instruction.Seek),
                 .column => @sizeOf(Instruction.Column),
                 .next => @sizeOf(Instruction.Next),
                 .transaction => @sizeOf(Instruction.Transaction),
@@ -525,6 +564,12 @@ const InternPool = struct {
         // This opcode leaves the cursor configured to move in forward order, from the beginning toward the end. In other words, the cursor is configured to use Next, not Prev.
         const Rewind = struct {
             table: Index,
+            end_inst: InstIndex,
+        };
+
+        const Seek = struct {
+            table: Index,
+            seek_key: Register.Index,
             end_inst: InstIndex,
         };
 
@@ -1179,7 +1224,7 @@ comptime {
     assert(@sizeOf(SQLiteBtHeader) == sqlite_bt_header_size);
 }
 
-const debug_mode: bool = false;
+const debug_mode: bool = true;
 
 fn debug(comptime format: []const u8, args: anytype) void {
     if (!debug_mode) return;
@@ -1282,6 +1327,10 @@ const TokenType = enum {
             .eq => "=",
             .lparen => "(",
             .ne => "!=",
+            .lt => "<",
+            .gt => ">",
+            .lte => "<=",
+            .gte => ">=",
             .rparen => ")",
             .semicolon => ";",
             .keyword_and => "AND",
@@ -2266,7 +2315,7 @@ const ASTGen = struct {
                     },
                 },
                 .where_equality => switch (token.tag) {
-                    .eq, .ne => {
+                    .eq, .ne, .lt, .lte, .gt, .gte => {
                         equality = token.tag;
                         state = .where_rhs;
                     },
@@ -2307,6 +2356,10 @@ const ASTGen = struct {
                                     .equality = switch (equality.?) {
                                         .eq => .eq,
                                         .ne => .ne,
+                                        .lt => .lt,
+                                        .gt => .gt,
+                                        .lte => .lte,
+                                        .gte => .gte,
                                         else => return Error.InvalidSyntax,
                                     },
                                     .rhs = .{ .int = value },
@@ -2314,7 +2367,7 @@ const ASTGen = struct {
                             });
                             expr_index = new_index.toOptional();
                         },
-                        else => break,
+                        else => break, // TODO: support real (float)
                     }
                     last_element_andor = false;
                     if (expr_prev_index.unwrap()) |expr| {
@@ -2393,7 +2446,7 @@ const TableMetadataReader = struct {
 const ConditionTraversal = struct {
     ip: *InternPool,
     index: InternPool.Index.Optional,
-    current_condition: InternPool.Condition.Equality,
+    current_condition: ?InternPool.Condition.Equality,
     stack: ArrayListUnmanaged(InternPool.Index.Optional),
     last_pop: InternPool.Index.Optional,
 
@@ -2401,7 +2454,7 @@ const ConditionTraversal = struct {
         return .{
             .ip = intern_pool,
             .index = index.toOptional(),
-            .current_condition = .@"or",
+            .current_condition = null,
             .stack = .{},
             .last_pop = InternPool.Index.Optional.none,
         };
@@ -2418,11 +2471,10 @@ const ConditionTraversal = struct {
                         self.index = cond.lhs.condition.toOptional();
                         self.current_condition = cond.equality;
                     },
-                    .eq, .ne => {
+                    .eq, .ne, .gt, .gte, .lt, .lte => {
                         self.index = InternPool.Index.Optional.none;
                         return cond;
                     },
-                    else => unreachable, // TODO: lt/gt
                 }
             } else {
                 if (self.stack.items.len == 0) return null;
@@ -2467,7 +2519,7 @@ const InstGen = struct {
         };
     }
 
-    fn eqReplaceJump(self: *InstGen, index: InternPool.InstIndex, jump_address: InternPool.InstIndex) void {
+    fn replaceJump(self: *InstGen, index: InternPool.InstIndex, jump_address: InternPool.InstIndex) void {
         var inst = self.ip.getInst(index).?;
         switch (inst) {
             .eq => {
@@ -2476,7 +2528,13 @@ const InstGen = struct {
             .neq => {
                 inst.neq.jump = jump_address;
             },
-            else => unreachable, // Replace jump only on eq instructions
+            .rewind => {
+                inst.rewind.end_inst = jump_address;
+            },
+            .next => {
+                inst.next.success_jump = jump_address;
+            },
+            else => unreachable, // Replace jump only on instructions with jump_address
         }
         self.ip.setInst(index, inst);
     }
@@ -2495,11 +2553,21 @@ const InstGen = struct {
         return try self.ip.addInst(self.gpa, key);
     }
 
+    const SeekOptimization = union(enum) {
+        none,
+        lt,
+        le,
+        gt,
+        ge,
+    };
+
     pub fn buildInstructions(self: *InstGen) Error!void {
         switch (self.statement) {
             Stmt.select => {
                 const select = self.statement.select;
                 const table = self.ip.indexToKey(select.table).table;
+                var seek_optimization: SeekOptimization = .none;
+                var primary_key_col: InternPool.Index.Optional = .none;
                 // const page_index: u32 = select.table.page - 1;
                 debug("page_index: {d}", .{table.page});
 
@@ -2507,8 +2575,11 @@ const InstGen = struct {
 
                 const init_index = try self.addInst(.{ .init = InternPool.InstIndex.none });
                 const open_read_index = try self.addInst(.{ .open_read = select.table });
-                const rewind_index = try self.addInst(.{ .rewind = .{ .table = select.table, .end_inst = InternPool.InstIndex.none } });
-                const rewind_start = self.ip.peekInst();
+
+                // rewind or SeekGT / LT / GE / LE
+                const cursor_move_index = try self.ip.markInst(self.gpa);
+                // const rewind_index = try self.addInst(.{ .rewind = .{ .table = select.table, .end_inst = InternPool.InstIndex.none } });
+                const loop_start = self.ip.peekInst();
 
                 var reg_count = Register.Index.first;
                 var reader = TableMetadataReader.from(self.ip, select.table);
@@ -2522,14 +2593,38 @@ const InstGen = struct {
                     var comparisons: ArrayListUnmanaged(InternPool.InstIndex) = .{};
                     defer comparisons.deinit(self.gpa);
                     var columns_start = self.ip.peekInst();
+
+                    // TODO: tree traversal left and right side. When the left side is the id record (ge/gt) with and, then its seek loop for ea one
                     while (try traversal.next(self.gpa)) |cond| {
+                        const col = self.ip.indexToKey(cond.lhs.column).column;
+                        if (col.is_primary_key and col.tag == .integer and seek_optimization == .none) {
+                            primary_key_col = cond.lhs.column.toOptional();
+                            if (traversal.current_condition == null or traversal.current_condition == .@"and") {
+                                switch (cond.equality) {
+                                    .gt => seek_optimization = .gt,
+                                    .gte => seek_optimization = .ge,
+                                    else => {},
+                                }
+                            }
+                            // TODO: move replaceInst
+                            reg_count = reg_count.increment();
+                            _ = try self.ip.replaceInst(self.gpa, cursor_move_index, .{
+                                .seek_gt = .{
+                                    .table = select.table,
+                                    .seek_key = .none, // TODO: add after register declared
+                                    .end_inst = .none, // TODO: add after halt declared
+                                },
+                            });
+                            continue;
+                        }
                         _ = try self.addInst(.{ .column = .{
                             .cursor = cursor,
                             .store_reg = compare_reg,
                             .col = cond.lhs.column,
                         } });
                         reg_count = reg_count.increment();
-                        switch (traversal.current_condition) {
+                        const cur_cond = traversal.current_condition orelse .@"or";
+                        switch (cur_cond) {
                             .@"or" => {
                                 try comparisons.append(self.gpa, self.ip.peekInst());
                                 // TODO: add other conditions (lt/lte/gt/gte)
@@ -2557,7 +2652,7 @@ const InstGen = struct {
                             self.eqNegate(value);
                             final_comparison = value;
                         } else {
-                            self.eqReplaceJump(value, columns_start);
+                            self.replaceJump(value, columns_start);
                         }
                     }
                 }
@@ -2594,27 +2689,41 @@ const InstGen = struct {
                     .start_reg = reg_count.increment(),
                     .end_reg = output_count,
                 } });
-                const next_index = try self.addInst(.{ .next = .{ .cursor = cursor, .success_jump = rewind_start } });
+                const next_index = try self.addInst(.{ .next = .{ .cursor = cursor, .success_jump = loop_start } });
                 const halt_index = try self.addInst(InternPool.Instruction.halt);
                 // TODO: support multiples databases, writing to tables
                 const transaction_index = try self.addInst(.{ .transaction = .{ .database_id = 0, .write = false } });
+
                 if (where_clause.unwrap()) |where| {
-                    self.eqReplaceJump(final_comparison, next_index);
+                    self.replaceJump(final_comparison, next_index);
                     var traversal = ConditionTraversal.init(self.ip, where);
                     var store_reg = compare_reg.increment();
                     defer traversal.deint(self.gpa);
                     while (try traversal.next(self.gpa)) |cond| {
-                        switch (cond.rhs) {
-                            .string => _ = try self.addInst(.{ .string = .{ .string = cond.rhs.string, .store_reg = store_reg } }),
-                            .int => _ = try self.addInst(.{ .integer = .{ .int = cond.rhs.int, .store_reg = store_reg } }),
-                            else => return Error.InvalidSyntax, // TODO: implement float
+                        if (primary_key_col != .none and cond.lhs.column.toOptional() == primary_key_col) {
+                            _ = try self.addInst(.{ .integer = .{ .int = cond.rhs.int, .store_reg = store_reg } });
+                            _ = try self.ip.replaceInst(self.gpa, cursor_move_index, .{
+                                .seek_gt = .{
+                                    .table = select.table,
+                                    .seek_key = store_reg, // TODO: add after register declared
+                                    .end_inst = halt_index, // TODO: add after halt declared
+                                },
+                            });
+                        } else {
+                            switch (cond.rhs) {
+                                .string => _ = try self.addInst(.{ .string = .{ .string = cond.rhs.string, .store_reg = store_reg } }),
+                                .int => _ = try self.addInst(.{ .integer = .{ .int = cond.rhs.int, .store_reg = store_reg } }),
+                                else => return Error.InvalidSyntax, // TODO: implement float
+                            }
                         }
                         store_reg = store_reg.increment();
                     }
                 }
                 _ = try self.addInst(.{ .goto = open_read_index });
                 self.ip.setInst(init_index, .{ .init = transaction_index });
-                self.ip.setInst(rewind_index, .{ .rewind = .{ .table = select.table, .end_inst = halt_index } });
+                if (seek_optimization == .none) {
+                    _ = try self.ip.replaceInst(self.gpa, cursor_move_index, .{ .rewind = .{ .table = select.table, .end_inst = halt_index } });
+                }
                 debug("instructions written", .{});
             },
         }
@@ -2962,6 +3071,21 @@ const Vm = struct {
                     // print(write_buf[0..write_count].ptr, write_buf[0..write_count].len);
                     renderRow(row_buf[0..row_buf_written].ptr, row_buf[0..row_buf_written].len);
                     self.pc = self.pc.increment();
+                },
+                .seek_gt, .seek_ge => |seek_data| {
+                    const end_inst = seek_data.end_inst;
+                    const reg_cmp = seek_data.seek_key;
+                    col_count = @intCast(self.reg(reg_cmp).int);
+                    if (instruction == .seek_gt) {
+                        col_count += 1;
+                    }
+                    record = self.db.getRecord(table_root_page_index, cell_count);
+                    if (record == null) {
+                        self.pc = end_inst;
+                    } else {
+                        col_value = record.?.next();
+                        self.pc = self.pc.increment();
+                    }
                 },
                 .neq, .eq => |eq_data| {
                     const jump_address = eq_data.jump;
