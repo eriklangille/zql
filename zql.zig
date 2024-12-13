@@ -366,6 +366,9 @@ const InternPool = struct {
                     .eq, .neq => |extra_data| {
                         ip.insertExtra(extra_index, extra_data);
                     },
+                    .seek_gt, .seek_ge => |extra_data| {
+                        ip.insertExtra(extra_index, extra_data);
+                    },
                     .rewind => |extra_data| {
                         ip.insertExtra(extra_index, extra_data);
                     },
@@ -568,7 +571,7 @@ const InternPool = struct {
         };
 
         const Seek = struct {
-            table: Index,
+            table: Index, // TODO: this should be a cursor index, not a table
             seek_key: Register.Index,
             end_inst: InstIndex,
         };
@@ -1388,6 +1391,8 @@ const Tokenizer = struct {
         float,
         identifier,
         int,
+        gt,
+        lt,
         semicolon,
         single_quote_word,
         start,
@@ -1463,6 +1468,9 @@ const Tokenizer = struct {
                         self.index += 1;
                         break;
                     },
+                    '>' => {
+                        state = .gt;
+                    },
                     '!' => {
                         state = .exclamation;
                     },
@@ -1513,6 +1521,30 @@ const Tokenizer = struct {
                         token.type = TokenType.integer;
                         break;
                     },
+                },
+                .gt => switch (c) {
+                    '=' => {
+                        token.type = TokenType.gte;
+                        self.index += 1;
+                        break;
+                    },
+                    ' ' => {
+                        token.type = TokenType.gt;
+                        break;
+                    },
+                    else => token.type = TokenType.invalid,
+                },
+                .lt => switch (c) {
+                    '=' => {
+                        token.type = TokenType.lte;
+                        self.index += 1;
+                        break;
+                    },
+                    ' ' => {
+                        token.type = TokenType.lt;
+                        break;
+                    },
+                    else => token.type = TokenType.invalid,
                 },
                 .double_quote_word => switch (c) {
                     'a'...'z', 'A'...'Z' => {},
@@ -2606,16 +2638,10 @@ const InstGen = struct {
                                     else => {},
                                 }
                             }
-                            // TODO: move replaceInst
-                            reg_count = reg_count.increment();
-                            _ = try self.ip.replaceInst(self.gpa, cursor_move_index, .{
-                                .seek_gt = .{
-                                    .table = select.table,
-                                    .seek_key = .none, // TODO: add after register declared
-                                    .end_inst = .none, // TODO: add after halt declared
-                                },
-                            });
-                            continue;
+                            if (seek_optimization != .none) {
+                                reg_count = reg_count.increment();
+                                continue;
+                            }
                         }
                         _ = try self.addInst(.{ .column = .{
                             .cursor = cursor,
@@ -3075,15 +3101,16 @@ const Vm = struct {
                 .seek_gt, .seek_ge => |seek_data| {
                     const end_inst = seek_data.end_inst;
                     const reg_cmp = seek_data.seek_key;
-                    col_count = @intCast(self.reg(reg_cmp).int);
-                    if (instruction == .seek_gt) {
-                        col_count += 1;
+                    cell_count = @intCast(self.reg(reg_cmp).int);
+                    if (instruction == .seek_ge) {
+                        cell_count -= 1;
                     }
                     record = self.db.getRecord(table_root_page_index, cell_count);
                     if (record == null) {
                         self.pc = end_inst;
                     } else {
                         col_value = record.?.next();
+                        col_count += 1;
                         self.pc = self.pc.increment();
                     }
                 },

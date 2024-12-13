@@ -5,9 +5,11 @@
 - [ ] like
 - [ ] limit
 - [ ] joins
+- [ ] order by desc
 
 ## General
-- [ ] Support interior pages
+- [x] Support interior pages
+- [ ] Support index pages
 
 ## Optimization
 - [ ] page caching. LRU?
