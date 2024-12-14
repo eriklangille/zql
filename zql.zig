@@ -1829,6 +1829,7 @@ const Db = struct {
         };
     }
 
+    // TODO: support multi-layer interior pages
     pub fn getRecord(self: *Db, table_root_page_index: u32, index: u32) ?SQLiteRecord {
         const root = self.readPage(table_root_page_index);
         const cell_count = root.header().getCellCount();
@@ -1842,13 +1843,18 @@ const Db = struct {
             }
             // TODO: support 64 bit indices
             var base_int_key: u32 = @truncate(first_cell.int_key);
+            var cell = root.cell(0);
             for (1..cell_count) |i| {
-                const cell = root.cell(i);
+                cell = root.cell(i);
                 if (index < cell.int_key) {
                     const page = self.readPage(cell.page - 1);
                     return page.record(index - base_int_key);
                 }
                 base_int_key = @truncate(cell.int_key);
+            }
+            const page = self.readPage(cell.page);
+            if (index - base_int_key < page.header().getCellCount()) {
+                return page.record(index - base_int_key);
             }
         } else if (root.header().getPageType() == .table_leaf) {
             return root.record(index);
