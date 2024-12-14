@@ -1,4 +1,4 @@
-import loadZQL from './zql.js';
+import loadZQL, { getFileFromUrl } from './zql.js';
 
 /**
  * Listens for a file input change event and resolves with the file data as a Uint8Array.
@@ -21,36 +21,16 @@ async function listenForInputFile() {
   });
 }
 
+document.getElementById('query-button').addEventListener('click', async () => {
+  const sqlStatement = getSQLInput();
+  if (window.zql == null) return;
+  clearTable();
+  await window.zql.exec(sqlStatement);
+});
+
 function clearTable() {
-  const tableBody = document.querySelector("#myTable tbody");
+  const tableBody = document.querySelector("#zqlTable tbody");
   tableBody.innerHTML = '';
-}
-
-async function test(zql) {
-    const button = document.getElementById('test-button');
-    button.addEventListener('click', async () => {
-        await zql.loadFile(getFile('test.db'));
-        runTests(zql);
-    });
-}
-
-function assert(condition, message) {
-  if (!condition) {
-    throw new Error(message || "Assertion failed");
-  }
-}
-
-async function runTests(zql) {
-  rows = [];
-  const testListener = (row) => {
-    rows.push(row);
-  };
-  zql.rowListeners.push(testListener);
-  rows.splice(0, rows.length); // clear array
-  await zql.exec("select * from example");
-  assert(rows.length == 3, "row length");
-  assert(rows[0][1] == "Alice", "row name");
-  console.log("tests passed!")
 }
 
 function getSQLInput() {
@@ -66,7 +46,7 @@ loadZQL().then(async (zql) => {
     * @param {Array} array - An array of values to be added as cells in the new row.
     */
     const addTableRow = (array) => {
-      const tableBody = document.querySelector("#myTable tbody");
+      const tableBody = document.querySelector("#zqlTable tbody");
       const tr = document.createElement("tr");
       array.forEach(value => {
         const td = document.createElement("td");
@@ -76,8 +56,9 @@ loadZQL().then(async (zql) => {
       tableBody.appendChild(tr);
     }
     zql.rowListeners.push(addTableRow);
+    window.zql = zql;
 
+    await zql.loadFile(getFileFromUrl("./example.db"))
     await zql.loadFile(listenForInputFile());
-    await zql.exec(getSQLInput());
 });
 

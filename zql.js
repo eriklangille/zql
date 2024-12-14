@@ -156,7 +156,7 @@ class ZqlDb {
 
   /**
   * Loads a database file into memory.
-  * @param {Promise<DatabaseFile>} filePromise - A promise that resolves to the database file.
+  * @param {Promise<ArrayBuffer>} filePromise - A promise that resolves to the database file buffer.
   * @returns {Promise<void>}
   */
   async loadFile(filePromise) {
@@ -177,15 +177,18 @@ export default async function loadZQL() {
   return zql;
 }
 
-async function getFile(name) {
-  let response = await fetch(name);
+/**
+ * Use fetch to get a file from a URL. Returned promise can be passed to loadFile().
+ * @param {string} url - file url
+ * @returns {Promise<ArrayBuffer>}
+ */
+export async function getFileFromUrl(url) {
+  let response = await fetch(url);
 
   if (!response.ok) {
     throw new Error(`HTTP error: ${response.status}`);
   }
 
-  const arrayBuffer = await response.arrayBuffer();
-  databaseFile = arrayBuffer;
-  return databaseFile;
+  return response.arrayBuffer();
 }
 

@@ -6,19 +6,20 @@
 </head>
 <body>
   <h1>zql</h1>
-  <button id="test-button">run tests</button>
+  <br/>
+  <input type="file" id="fileInput" style="display: none;" />
+  <label for="fileInput" style="display: inline-block; padding: 10px 20px; background-color: #111; color: white; cursor: pointer; border-radius: 2px; font-size: 14px;">Choose File</label>
   <br/>
   <br/>
   <section style="display: flex; flex-direction: column;">
-    <label for="statementInput">SQL Statement</label>
-    <input style="padding: 0 5px 0 5px; margin: 10px 0 0 0;" type="text" id="statementInput" value="select * from records where id > 9000;"></input>
+    <!-- <label for="statementInput">SQL Statement</label> -->
+    <input style="padding: 5px 10px; margin: 10px 0 0 0;" type="text" id="statementInput" value="select * from records where id > 9900;"></input>
   </section>
   <br/>
-  <input type="file" id="fileInput" />
+  <button id="query-button" style="padding: 10px 20px; background-color: #111; color: white; cursor: pointer; border-radius: 2px; display: inline-block; border-width: 0">Run Query</button>
   <br/>
   <br/>
-  <br/>
-  <table id="myTable" border="1">
+  <table id="zqlTable" border="1">
     <thead>
         <tr>
             <th>Table</th>
