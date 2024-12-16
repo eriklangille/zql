@@ -1,4 +1,6 @@
 *.wasm
 *.wasm.o
 node_modules/
+zig-out/
+.zig-cache/
 

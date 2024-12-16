@@ -2727,7 +2727,9 @@ const InstGen = struct {
                 const transaction_index = try self.addInst(.{ .transaction = .{ .database_id = 0, .write = false } });
 
                 if (where_clause.unwrap()) |where| {
-                    self.replaceJump(final_comparison, next_index);
+                    if (final_comparison != .none) {
+                        self.replaceJump(final_comparison, next_index);
+                    }
                     var traversal = ConditionTraversal.init(self.ip, where);
                     var store_reg = compare_reg.increment();
                     defer traversal.deint(self.gpa);
