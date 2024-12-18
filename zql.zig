@@ -503,6 +503,7 @@ const InternPool = struct {
         result_row: Instruction.ResultRow,
         next: Instruction.Next,
         transaction: Instruction.Transaction,
+        function: Instruction.Function,
         seek_gt: Instruction.Seek,
         seek_ge: Instruction.Seek,
         string: Instruction.String,
@@ -524,6 +525,7 @@ const InternPool = struct {
                 .result_row => .result_row,
                 .next => .next,
                 .transaction => .transaction,
+                .function => .function,
                 .string => .string,
                 .integer => .integer,
             };
@@ -537,8 +539,8 @@ const InternPool = struct {
                 .row_id => @sizeOf(Instruction.RowId),
                 .result_row => @sizeOf(Instruction.ResultRow),
                 .rewind => @sizeOf(Instruction.Rewind),
-                .seek_gt => @sizeOf(Instruction.Seek),
-                .seek_ge => @sizeOf(Instruction.Seek),
+                .seek_gt, .seek_ge => @sizeOf(Instruction.Seek),
+                .function => @sizeOf(Instruction.Function),
                 .column => @sizeOf(Instruction.Column),
                 .next => @sizeOf(Instruction.Next),
                 .transaction => @sizeOf(Instruction.Transaction),
@@ -551,6 +553,15 @@ const InternPool = struct {
             lhs_reg: Register.Index,
             rhs_reg: Register.Index,
             jump: InstIndex,
+        };
+
+        // Additional arguments are stored in the next incremented register(s) from the first_argument_register. call_site is the built-in function
+        // and should also provide context on argument.
+        // TODO: Perhaps should be anytype for call_site? Also, do we care if an argument is a constant for performance reasons?
+        const Function = struct {
+            call_site: u32,
+            first_argument_register: Register.Index,
+            result_register: Register.Index,
         };
 
         // Store in register P2 an integer which is the key of the table entry that P1 is currently point to.
@@ -2919,6 +2930,39 @@ const Register = union(enum) {
         };
     }
 };
+
+fn like(str: []u8, pattern: []u8) bool {
+    var si: u32 = 0;
+    var pi: u32 = 0;
+    while (si < str.len and pi < pattern.len) {
+        switch (pattern[pi]) {
+            '%' => {
+                while (pi + 1 < pattern.len and pi == '%') : (pi += 1) {}
+                if (pi + 1 == pattern.len) return true;
+                if (pattern[pi] != '_') {
+                    while (si < str.len and str[si] != pattern[pi + 1]) : (si += 1) {}
+                    pi += 1;
+                }
+            },
+            '_' => {
+                if (si + 1 == str.len) return true;
+                if (pi + 1 == pattern.len) return false;
+                si += 1;
+                pi += 1;
+            },
+            else => {
+                if (str[si] != pattern[pi]) return false;
+                si += 1;
+                pi += 1;
+                if (si == str.len) return true;
+                if (pi == pattern.len) return false;
+            },
+        }
+    }
+    return false;
+}
+
+const builtin_funcs = []anyopaque{};
 
 const Vm = struct {
     gpa: Allocator,
