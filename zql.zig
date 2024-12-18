@@ -2962,7 +2962,40 @@ fn like(str: []u8, pattern: []u8) bool {
     return false;
 }
 
-const builtin_funcs = []anyopaque{};
+const FunctionContext = struct {
+    ip: *InternPool,
+    vm: *Vm,
+    first_reg: Register.Index,
+    return_reg: Register.Index,
+};
+
+fn like_func(ctx: FunctionContext, args: u8) anyerror!void {
+    if (args != 2) return;
+    const ip = ctx.ip;
+    const vm = ctx.vm;
+    const pattern_reg = vm.reg(ctx.first_reg);
+    const string_reg = vm.reg(ctx.first_reg.increment());
+    const pattern: []u8 = switch (pattern_reg) {
+        .str => |reg_str| reg_str,
+        .string => |reg_string| @constCast(reg_string.string.slice(reg_string.len, ip)),
+        else => unreachable,
+    };
+    // TODO: move to register as function
+    const string: []u8 = switch (string_reg) {
+        .str => |reg_str| reg_str,
+        .string => |reg_string| @constCast(reg_string.string.slice(reg_string.len, ip)),
+        else => unreachable,
+    };
+    if (like(string, pattern)) {
+        vm.updateReg(ctx.return_reg, .{ .int = 1 });
+    } else {
+        vm.updateReg(ctx.return_reg, .{ .int = 0 });
+    }
+}
+
+const BuiltInFunction = *const fn (ctx: FunctionContext, args: u8) anyerror!void;
+
+const builtin_funcs = []BuiltInFunction{like_func};
 
 const Vm = struct {
     gpa: Allocator,
