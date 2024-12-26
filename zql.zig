@@ -3230,6 +3230,13 @@ const Register = union(enum) {
     }
 };
 
+pub inline fn char_lower(char: u8) u8 {
+    return switch (char) {
+        'A'...'Z' => char | 0x20, // convert to lowercase by setting the 6th bit
+        else => char,
+    };
+}
+
 fn like(str: []u8, pattern: []u8) bool {
     var si: u32 = 0;
     var pi: u32 = 0;
@@ -3239,7 +3246,7 @@ fn like(str: []u8, pattern: []u8) bool {
                 while (pi + 1 < pattern.len and pi == '%') : (pi += 1) {}
                 if (pi + 1 == pattern.len) return true;
                 if (pattern[pi] != '_') {
-                    while (si < str.len and str[si] != pattern[pi + 1]) : (si += 1) {}
+                    while (si < str.len and char_lower(str[si]) != char_lower(pattern[pi + 1])) : (si += 1) {}
                     pi += 1;
                 }
             },
@@ -3250,7 +3257,7 @@ fn like(str: []u8, pattern: []u8) bool {
                 pi += 1;
             },
             else => {
-                if (str[si] != pattern[pi]) return false;
+                if (char_lower(str[si]) != char_lower(pattern[pi])) return false;
                 si += 1;
                 pi += 1;
                 if (si == str.len) return true;
