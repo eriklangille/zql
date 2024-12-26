@@ -60,6 +60,7 @@ describe('Compare ZQL to SQL', () => {
     await compare("select id, name from example;");
     await compare("select id from example;");
     await compare("select name from example;");
+    await compare("select * from example where id = 1;");
     await compare("select * from example where name = 'Alice';");
     await compare("select * from example where name = 'Alice' or name = 'Bob';");
     await compare("select * from example where name like 'A%'");

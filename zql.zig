@@ -120,6 +120,10 @@ const InternPool = struct {
         function,
         @"if",
         if_not,
+        gt,
+        gte,
+        lt,
+        lte,
         seek_gt,
         seek_ge,
         column,
@@ -376,6 +380,9 @@ const InternPool = struct {
                     .eq, .neq => |extra_data| {
                         ip.insertExtra(extra_index, extra_data);
                     },
+                    .lt, .lte, .gt, .gte => |extra_data| {
+                        ip.insertExtra(extra_index, extra_data);
+                    },
                     .@"if", .if_not => |extra_data| {
                         ip.insertExtra(extra_index, extra_data);
                     },
@@ -433,6 +440,16 @@ const InternPool = struct {
             .neq => {
                 const extra_data = ip.extraData(Instruction.Equal, item.data);
                 return .{ .neq = extra_data };
+            },
+            .lt, .gt, .gte, .lte => {
+                const extra_data = ip.extraData(Instruction.Lt, item.data);
+                return switch (item.opcode) {
+                    .lt => .{ .lt = extra_data },
+                    .lte => .{ .lte = extra_data },
+                    .gt => .{ .gt = extra_data },
+                    .gte => .{ .gte = extra_data },
+                    else => unreachable,
+                };
             },
             .open_read => return .{ .open_read = @enumFromInt(item.data) },
             .goto => return .{ .goto = @enumFromInt(item.data) },
@@ -534,6 +551,10 @@ const InternPool = struct {
         function: Instruction.Function,
         @"if": Instruction.If,
         if_not: Instruction.If,
+        gt: Instruction.Lt,
+        gte: Instruction.Lt,
+        lt: Instruction.Lt,
+        lte: Instruction.Lt,
         seek_gt: Instruction.Seek,
         seek_ge: Instruction.Seek,
         string: Instruction.String,
@@ -558,6 +579,10 @@ const InternPool = struct {
                 .function => .function,
                 .@"if" => .@"if",
                 .if_not => .if_not,
+                .gt => .gt,
+                .gte => .gte,
+                .lt => .lt,
+                .lte => .lte,
                 .string => .string,
                 .integer => .integer,
             };
@@ -574,6 +599,7 @@ const InternPool = struct {
                 .seek_gt, .seek_ge => @sizeOf(Instruction.Seek),
                 .function => @sizeOf(Instruction.Function),
                 .if_not, .@"if" => @sizeOf(Instruction.If),
+                .lt, .lte, .gt, .gte => @sizeOf(Instruction.Lt),
                 .column => @sizeOf(Instruction.Column),
                 .next => @sizeOf(Instruction.Next),
                 .transaction => @sizeOf(Instruction.Transaction),
@@ -581,6 +607,13 @@ const InternPool = struct {
                 .integer => @sizeOf(Instruction.Integer),
             };
         }
+
+        const Lt = struct {
+            lhs_reg: Register.Index,
+            rhs_reg: Register.Index,
+            jump: InstIndex,
+            // TODO: affinity/coersion, bit masking
+        };
 
         const Equal = struct {
             lhs_reg: Register.Index,
@@ -1420,7 +1453,7 @@ comptime {
     assert(@sizeOf(SQLiteBtHeader) == sqlite_bt_header_size);
 }
 
-const debug_mode: bool = false;
+const debug_mode: bool = true;
 
 fn debug(comptime format: []const u8, args: anytype) void {
     if (!debug_mode) return;
@@ -1666,6 +1699,9 @@ const Tokenizer = struct {
                     },
                     '>' => {
                         state = .gt;
+                    },
+                    '<' => {
+                        state = .lt;
                     },
                     '!' => {
                         state = .exclamation;
@@ -2815,6 +2851,18 @@ const InstGen = struct {
             .if_not => {
                 inst.if_not.jump_address = jump_address;
             },
+            .gt => {
+                inst.gt.jump = jump_address;
+            },
+            .gte => {
+                inst.gte.jump = jump_address;
+            },
+            .lt => {
+                inst.lt.jump = jump_address;
+            },
+            .lte => {
+                inst.lte.jump = jump_address;
+            },
             else => unreachable, // Replace jump only on instructions with jump_address
         }
         self.ip.setInst(index, inst);
@@ -2827,6 +2875,10 @@ const InstGen = struct {
             .neq => |data| .{ .eq = data },
             .@"if" => |data| .{ .if_not = data },
             .if_not => |data| .{ .@"if" = data },
+            .lte => |data| .{ .gt = data },
+            .lt => |data| .{ .gte = data },
+            .gte => |data| .{ .lt = data },
+            .gt => |data| .{ .lte = data },
             else => unreachable, // Can only negate eq/ne opcodes
         };
         self.ip.setInst(index, new_inst);
@@ -2861,7 +2913,6 @@ const InstGen = struct {
 
                 // rewind or SeekGT / LT / GE / LE
                 const cursor_move_index = try self.ip.markInst(self.gpa);
-                // const rewind_index = try self.addInst(.{ .rewind = .{ .table = select.table, .end_inst = InternPool.InstIndex.none } });
                 const loop_start = self.ip.peekInst();
 
                 var reg_count = Register.Index.first;
@@ -2938,19 +2989,36 @@ const InstGen = struct {
                                 switch (cur_cond) {
                                     .@"or" => {
                                         try comparisons.append(self.gpa, self.ip.peekInst());
-                                        // TODO: add other conditions (lt/lte/gt/gte)
-                                        if (cond.equality == .eq) {
-                                            _ = try self.addInst(.{ .eq = .{
-                                                .lhs_reg = compare_reg,
-                                                .rhs_reg = reg_count,
-                                                .jump = InternPool.InstIndex.none,
-                                            } });
-                                        } else {
-                                            _ = try self.addInst(.{ .neq = .{
-                                                .lhs_reg = compare_reg,
-                                                .rhs_reg = reg_count,
-                                                .jump = InternPool.InstIndex.none,
-                                            } });
+                                        switch (cond.equality) {
+                                            .eq => {
+                                                _ = try self.addInst(.{ .eq = .{
+                                                    .lhs_reg = compare_reg,
+                                                    .rhs_reg = reg_count,
+                                                    .jump = InternPool.InstIndex.none,
+                                                } });
+                                            },
+                                            .ne => {
+                                                _ = try self.addInst(.{ .neq = .{
+                                                    .lhs_reg = compare_reg,
+                                                    .rhs_reg = reg_count,
+                                                    .jump = InternPool.InstIndex.none,
+                                                } });
+                                            },
+                                            .gt, .gte, .lt, .lte => {
+                                                const data: InternPool.Instruction.Lt = .{
+                                                    .lhs_reg = compare_reg,
+                                                    .rhs_reg = reg_count,
+                                                    .jump = .none,
+                                                };
+                                                switch (cond.equality) {
+                                                    .gt => _ = try self.addInst(.{ .gt = data }),
+                                                    .gte => _ = try self.addInst(.{ .gte = data }),
+                                                    .lt => _ = try self.addInst(.{ .lt = data }),
+                                                    .lte => _ = try self.addInst(.{ .lte = data }),
+                                                    else => unreachable,
+                                                }
+                                            },
+                                            else => unreachable,
                                         }
                                     },
                                     else => return Error.InvalidSyntax, // TODO: implement and clause
@@ -3015,7 +3083,6 @@ const InstGen = struct {
                     var traversal = ConditionTraversal.init(self.ip, where);
                     var store_reg = compare_reg.increment();
                     defer traversal.deint(self.gpa);
-                    // TODO: handle LHS if its a function, not a column
                     while (try traversal.next(self.gpa)) |cond| {
                         const is_func = switch (cond.lhs) {
                             .func => true,
@@ -3075,12 +3142,14 @@ const InstGen = struct {
 };
 
 // All registers are the same size, so its possible to update register type without allocating more data
+// this would not be true on a 64 bit system, since the slice will be 128 bits.
+// In SQLite, max page size is 2^48. So we can do a 48 bit ptr and 16 bit length. But then max compare length is 2^16.
 const Register = union(enum) {
     none,
     int: i64,
     float: f64,
     string: StringLen,
-    str: []u8, // TODO: consider removing these, and make all bytes be interned. Or use a 32 bit index instead of a pointer
+    str: []u8, // TODO: consider removing these, and make all bytes be interned. Or use a 32 bit index instead of a slice
     binary: []u8,
 
     const StringLen = struct {
@@ -3286,7 +3355,6 @@ fn like_func(ctx: FunctionContext, args: u8) anyerror!void {
         .string => |reg_string| @constCast(reg_string.string.slice(reg_string.len, ip)),
         else => unreachable,
     };
-    // TODO: move to register as function
     const string: []u8 = switch (string_reg) {
         .str => |reg_str| reg_str,
         .string => |reg_string| @constCast(reg_string.string.slice(reg_string.len, ip)),
@@ -3303,6 +3371,7 @@ const BuiltInFunction = *const fn (ctx: FunctionContext, args: u8) anyerror!void
 
 // TODO: we can make this code comptime so the enum and array are automatically populated
 const builtin_funcs = [_]BuiltInFunction{like_func};
+const builtin_funcs_args = [_]u8{2};
 const BuiltInFunctionIndex = enum(u32) {
     like,
 
@@ -3353,7 +3422,6 @@ const Vm = struct {
 
     fn updateReg(self: *Vm, index: Register.Index, register: Register) Error!void {
         debug("reg index: {d}, len: {d}", .{ index, self.reg_list.len });
-        // registers start at 1, not 0
         const pack: PackedU64 = switch (register) {
             .int => |reg_int| PackedU64.init(reg_int),
             .float => |reg_float| PackedU64.init(reg_float),
@@ -3393,8 +3461,6 @@ const Vm = struct {
         }
     }
 
-    // TODO: do not reference instruction list or extra data directly. Have them go through a layer and provide a struct with field names.
-    // That way don't have to figure out data.lhs/rhs for each instruction
     pub fn exec(self: *Vm) Error!void {
         var instruction: InternPool.Instruction = self.ip.getInst(self.pc).?;
         // TODO: multiple cursors
@@ -3500,6 +3566,7 @@ const Vm = struct {
                 .function => |function_data| {
                     const index = function_data.index;
                     const func = builtin_funcs[index.unwrap()];
+                    const arg_count = builtin_funcs_args[index.unwrap()];
                     const context: FunctionContext = .{
                         .ip = self.ip,
                         .vm = self,
@@ -3507,7 +3574,7 @@ const Vm = struct {
                         .return_reg = function_data.result_register,
                     };
                     // TODO: better error return handling
-                    func(context, 2) catch return error.OutOfMemory;
+                    func(context, arg_count) catch return error.OutOfMemory;
                     self.pc = self.pc.increment();
                 },
                 .seek_gt, .seek_ge => |seek_data| {
@@ -3523,6 +3590,29 @@ const Vm = struct {
                     } else {
                         col_value = record.?.next();
                         col_count += 1;
+                        self.pc = self.pc.increment();
+                    }
+                },
+                .gt, .gte, .lt, .lte => |lt_data| {
+                    const jump_address = lt_data.jump;
+                    const lhs_reg_index = lt_data.lhs_reg;
+                    const rhs_reg_index = lt_data.rhs_reg;
+                    const lhs_reg = self.reg(lhs_reg_index);
+                    const rhs_reg = self.reg(rhs_reg_index);
+                    if (lhs_reg.tag() != .int or rhs_reg.tag() != .int) {
+                        // TODO: support coersion
+                        debug("LT comparison. lhs: {}, rhs: {}", .{ lhs_reg, rhs_reg });
+                        return Error.InvalidSyntax;
+                    }
+                    if (switch (instruction) {
+                        .gt => lhs_reg.int > rhs_reg.int,
+                        .gte => lhs_reg.int >= rhs_reg.int,
+                        .lt => lhs_reg.int < rhs_reg.int,
+                        .lte => lhs_reg.int <= rhs_reg.int,
+                        else => false,
+                    }) {
+                        self.pc = jump_address;
+                    } else {
                         self.pc = self.pc.increment();
                     }
                 },
