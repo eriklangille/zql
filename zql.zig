@@ -355,7 +355,7 @@ const InternPool = struct {
     pub fn setInst(ip: *InternPool, index: InstIndex, key: Instruction) void {
         const opcode = key.opcode();
         const index_int: u32 = @intFromEnum(index);
-        debug("setInst: {}, index: {d}, size: {d}, key: {}", .{ opcode, index_int, key.size(), key });
+        // debug("setInst: {}, index: {d}, size: {d}, key: {}", .{ opcode, index_int, key.size(), key });
         switch (key.size()) {
             0 => {
                 ip.instructions.set(index_int, .{ .opcode = opcode, .data = 0 });
@@ -429,7 +429,7 @@ const InternPool = struct {
             return null; // TODO: throw an error instead?
         }
         const item = ip.instructions.get(unwrap.?);
-        debug("getInst: {}, {d}", .{ item.opcode, item.data });
+        // debug("getInst: {}, {d}", .{ item.opcode, item.data });
         switch (item.opcode) {
             .init => return .{ .init = @enumFromInt(item.data) },
             .halt => return Instruction.halt,
@@ -2896,6 +2896,15 @@ const InstGen = struct {
         ge,
     };
 
+    pub fn dump(self: *InstGen) void {
+        var i: u32 = 0;
+        debug("--- Instructions ---", .{});
+        while (i < self.ip.instructions.len) : (i += 1) {
+            debug("[{d}] {}", .{ i, self.ip.getInst(@enumFromInt(i)).? });
+        }
+        debug("------", .{});
+    }
+
     pub fn buildInstructions(self: *InstGen) Error!void {
         switch (self.statement) {
             Stmt.select => {
@@ -2979,11 +2988,18 @@ const InstGen = struct {
                                         continue;
                                     }
                                 }
-                                _ = try self.addInst(.{ .column = .{
-                                    .cursor = cursor,
-                                    .store_reg = compare_reg,
-                                    .col = cond.lhs.column,
-                                } });
+                                if (col.is_primary_key and col.tag == .integer) {
+                                    _ = try self.addInst(.{ .row_id = .{
+                                        .read_cursor = cursor,
+                                        .store_reg = compare_reg,
+                                    } });
+                                } else {
+                                    _ = try self.addInst(.{ .column = .{
+                                        .cursor = cursor,
+                                        .store_reg = compare_reg,
+                                        .col = cond.lhs.column,
+                                    } });
+                                }
                                 reg_count = reg_count.increment();
                                 const cur_cond = traversal.current_condition orelse .@"or";
                                 switch (cur_cond) {
@@ -3454,10 +3470,8 @@ const Vm = struct {
             while (index_num >= self.reg_list.len) {
                 try self.reg_list.append(self.gpa, .{ .tag = .none, .data = .{ .@"0" = 0, .@"1" = 0 } });
             }
-            debug("updateReg: index_num: {d}, len: {d}", .{ index_num, self.reg_list.len });
-            const slice = self.reg_list.slice();
-            slice.items(.tag)[index_num] = item.tag;
-            slice.items(.data)[index_num] = item.data;
+            debug("updateReg: index_num: {d}, len: {d}, item: {}", .{ index_num, self.reg_list.len, item });
+            self.reg_list.set(index_num, item);
         }
     }
 
@@ -3653,6 +3667,8 @@ const Vm = struct {
                         else => false,
                     };
 
+                    debug("EQ comparison. lhs: {}, rhs: {}", .{ lhs_reg, rhs_reg });
+
                     if ((is_eq and equal_values) or (!is_eq and !equal_values)) {
                         self.pc = jump_address;
                         debug("jump: {d}", .{jump_address});
@@ -3725,6 +3741,8 @@ fn parseStatement(str: [:0]u8, db_memory: DbMemory) Error!void {
     debug("building instructions", .{});
     try inst_gen.buildInstructions();
     debug("inst generated!", .{});
+
+    inst_gen.dump();
 
     var vm = Vm.init(fixed_alloc.allocator(), db, &intern_pool);
     try vm.exec();
