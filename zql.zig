@@ -87,9 +87,16 @@ const InternPool = struct {
         condition_eq_int,
         condition_eq_float,
         condition_eq_string,
+        condition_eq_func,
         condition_ne_int,
         condition_ne_float,
         condition_ne_string,
+        function,
+        argument_string,
+        argument_int,
+        argument_float,
+        argument_condition,
+        argument_column,
     };
 
     const Item = struct {
@@ -110,6 +117,9 @@ const InternPool = struct {
         result_row,
         next,
         rewind,
+        function,
+        @"if",
+        if_not,
         seek_gt,
         seek_ge,
         column,
@@ -366,6 +376,9 @@ const InternPool = struct {
                     .eq, .neq => |extra_data| {
                         ip.insertExtra(extra_index, extra_data);
                     },
+                    .@"if", .if_not => |extra_data| {
+                        ip.insertExtra(extra_index, extra_data);
+                    },
                     .seek_gt, .seek_ge => |extra_data| {
                         ip.insertExtra(extra_index, extra_data);
                     },
@@ -376,6 +389,9 @@ const InternPool = struct {
                         ip.insertExtra(extra_index, extra_data);
                     },
                     .result_row => |extra_data| {
+                        ip.insertExtra(extra_index, extra_data);
+                    },
+                    .function => |extra_data| {
                         ip.insertExtra(extra_index, extra_data);
                     },
                     .column => |extra_data| {
@@ -435,6 +451,18 @@ const InternPool = struct {
             .column => {
                 const extra_data = ip.extraData(Instruction.Column, item.data);
                 return .{ .column = extra_data };
+            },
+            .function => {
+                const extra_data = ip.extraData(Instruction.Function, item.data);
+                return .{ .function = extra_data };
+            },
+            .@"if" => {
+                const extra_data = ip.extraData(Instruction.If, item.data);
+                return .{ .@"if" = extra_data };
+            },
+            .if_not => {
+                const extra_data = ip.extraData(Instruction.If, item.data);
+                return .{ .if_not = extra_data };
             },
             .seek_gt => {
                 const extra_data = ip.extraData(Instruction.Seek, item.data);
@@ -504,6 +532,8 @@ const InternPool = struct {
         next: Instruction.Next,
         transaction: Instruction.Transaction,
         function: Instruction.Function,
+        @"if": Instruction.If,
+        if_not: Instruction.If,
         seek_gt: Instruction.Seek,
         seek_ge: Instruction.Seek,
         string: Instruction.String,
@@ -526,6 +556,8 @@ const InternPool = struct {
                 .next => .next,
                 .transaction => .transaction,
                 .function => .function,
+                .@"if" => .@"if",
+                .if_not => .if_not,
                 .string => .string,
                 .integer => .integer,
             };
@@ -541,6 +573,7 @@ const InternPool = struct {
                 .rewind => @sizeOf(Instruction.Rewind),
                 .seek_gt, .seek_ge => @sizeOf(Instruction.Seek),
                 .function => @sizeOf(Instruction.Function),
+                .if_not, .@"if" => @sizeOf(Instruction.If),
                 .column => @sizeOf(Instruction.Column),
                 .next => @sizeOf(Instruction.Next),
                 .transaction => @sizeOf(Instruction.Transaction),
@@ -555,13 +588,18 @@ const InternPool = struct {
             jump: InstIndex,
         };
 
-        // Additional arguments are stored in the next incremented register(s) from the first_argument_register. call_site is the built-in function
-        // and should also provide context on argument.
-        // TODO: Perhaps should be anytype for call_site? Also, do we care if an argument is a constant for performance reasons?
+        // Additional arguments are stored in the next incremented register(s) from the first_argument_register.
+        // TODO: Do we care if an argument is a constant for performance reasons?
         const Function = struct {
-            call_site: u32,
+            index: BuiltInFunctionIndex,
             first_argument_register: Register.Index,
             result_register: Register.Index,
+        };
+
+        // If compare_reg is zero, the comparison is considered false. Otherwise, true. Jump address if evaluated true
+        const If = struct {
+            compare_reg: Register.Index,
+            jump_address: InstIndex,
         };
 
         // Store in register P2 an integer which is the key of the table entry that P1 is currently point to.
@@ -679,13 +717,43 @@ const InternPool = struct {
         };
     };
 
+    const Function = struct {
+        index: BuiltInFunctionIndex,
+        first_argument: Index.Optional, // Argument key
+
+        const Repr = struct {
+            index: u32,
+            arg: u32,
+        };
+    };
+
+    const Argument = struct {
+        expression: Expression,
+        next_argument: Index.Optional,
+
+        const Repr = struct {
+            arg: u32,
+            expr_0: u32,
+            expr_1: u32,
+        };
+    };
+
+    const Expression = union(enum) {
+        condition: Index.Optional,
+        column: Index.Optional,
+        string: NullTerminatedString,
+        int: i64,
+        float: f64,
+    };
+
     const Condition = struct {
         equality: Condition.Equality,
         lhs: union(enum) {
             column: Index, // Column index
             condition: Index, // Condition index
+            func: Index, // Function index
         },
-        rhs: union(enum) {
+        rhs: union(enum) { // TODO: rhs can have columns. For e.g., where a = b. Replace with Expression
             condition: Index.Optional,
             string: NullTerminatedString,
             int: i64,
@@ -710,6 +778,7 @@ const InternPool = struct {
         };
     };
 
+    // TODO: Cursor should be like register, not in InternPool but in VM.
     const Cursor = struct {
         index: u32,
     };
@@ -719,6 +788,8 @@ const InternPool = struct {
         column: Column,
         condition: Condition,
         cursor: Cursor,
+        function: Function,
+        argument: Argument,
     };
 
     pub fn dump(ip: *InternPool, index: Index.Optional) void {
@@ -751,9 +822,21 @@ const InternPool = struct {
                         switch (condition_data.rhs) {
                             .int => |int_value| try fmt.format(buffer.writer().any(), "COL_{d}, {d})", .{ @intFromEnum(column), int_value }),
                             .float => |float_value| try fmt.format(buffer.writer().any(), "COL_{d}, {e})", .{ @intFromEnum(column), float_value }),
-                            .string => |str_value| try fmt.format(buffer.writer().any(), "COL_{d}, {s})", .{ @intFromEnum(column), str_value.slice(ip) }),
+                            .string => |str_value| try fmt.format(buffer.writer().any(), "COL_{d}, '{s}')", .{ @intFromEnum(column), str_value.slice(ip) }),
                             else => unreachable,
                         }
+                    },
+                    .func => |builtin_func| {
+                        _ = try buffer.write("(EQ ");
+                        try ip.bufWrite(buffer, builtin_func.toOptional());
+                        _ = try buffer.write(", ");
+                        switch (condition_data.rhs) {
+                            .int => |int_value| try fmt.format(buffer.writer().any(), "{d}", .{int_value}),
+                            .float => |float_value| try fmt.format(buffer.writer().any(), "{e}", .{float_value}),
+                            .string => |str_value| try fmt.format(buffer.writer().any(), "'{s}'", .{str_value.slice(ip)}),
+                            else => unreachable,
+                        }
+                        _ = try buffer.write(")");
                     },
                     .condition => |condition_lhs| {
                         switch (condition_data.equality) {
@@ -771,6 +854,28 @@ const InternPool = struct {
                             else => unreachable, // Can only compare condition to another condition
                         }
                     },
+                }
+            },
+            .function => |func_data| {
+                switch (func_data.index) {
+                    .like => _ = try buffer.write("LIKE("),
+                }
+                if (func_data.first_argument != .none) {
+                    try ip.bufWrite(buffer, func_data.first_argument);
+                }
+                _ = try buffer.write(")");
+            },
+            .argument => |arg_data| {
+                switch (arg_data.expression) {
+                    .int => |int_value| try fmt.format(buffer.writer().any(), "{d}", .{int_value}),
+                    .float => |float_value| try fmt.format(buffer.writer().any(), "{e}", .{float_value}),
+                    .string => |str_value| try fmt.format(buffer.writer().any(), "'{s}'", .{str_value.slice(ip)}),
+                    .column => |col_value| try fmt.format(buffer.writer().any(), "COL_{d}", .{@intFromEnum(col_value)}),
+                    .condition => |cond_value| try ip.bufWrite(buffer, cond_value),
+                }
+                if (arg_data.next_argument != .none) {
+                    _ = try buffer.write(", ");
+                    try ip.bufWrite(buffer, arg_data.next_argument);
                 }
             },
             else => unreachable, // TODO: implement dump for other key types
@@ -791,9 +896,8 @@ const InternPool = struct {
         const fields = @typeInfo(@TypeOf(item)).Struct.fields;
         inline for (fields, 0..) |field, i| {
             ip.extra.items[index + i] = switch (field.type) {
-                Index, Index.Optional, Register.Index, InstIndex, NullTerminatedString, String => @intFromEnum(@field(item, field.name)),
-                u32,
-                => @bitCast(@field(item, field.name)),
+                Index, Index.Optional, Register.Index, InstIndex, BuiltInFunctionIndex, NullTerminatedString, String => @intFromEnum(@field(item, field.name)),
+                u32 => @bitCast(@field(item, field.name)),
                 else => @compileError("bad field type: " ++ @typeName(field.type)),
             };
         }
@@ -811,6 +915,7 @@ const InternPool = struct {
                 Index,
                 Index.Optional,
                 InstIndex,
+                BuiltInFunctionIndex,
                 Register.Index,
                 String,
                 NullTerminatedString,
@@ -838,6 +943,7 @@ const InternPool = struct {
             .condition_eq_int,
             .condition_eq_float,
             .condition_eq_string,
+            .condition_eq_func,
             .condition_ne_int,
             .condition_ne_float,
             .condition_ne_string,
@@ -897,8 +1003,12 @@ const InternPool = struct {
         switch (key) {
             .condition => {
                 const cond = key.condition;
+                const is_func = switch (cond.lhs) {
+                    .func => true,
+                    else => false,
+                };
                 const lhs: u32 = switch (cond.lhs) {
-                    .condition, .column => |col_cond| @intFromEnum(col_cond),
+                    .condition, .column, .func => |col_cond_func| @intFromEnum(col_cond_func),
                 };
                 const rhs: PackedU64 = switch (cond.rhs) {
                     .string => |cond_string| .{ .a = @intFromEnum(cond_string), .b = 0 },
@@ -906,7 +1016,7 @@ const InternPool = struct {
                     .float => |cond_float| PackedU64.init(cond_float),
                     .condition => |cond_index| .{ .a = @intFromEnum(cond_index), .b = 0 },
                 };
-                const tag: Tag = switch (cond.equality) {
+                const tag: Tag = if (is_func) .condition_eq_func else switch (cond.equality) {
                     .eq => switch (cond.rhs) {
                         .string => .condition_eq_string,
                         .int => .condition_eq_int,
@@ -977,6 +1087,43 @@ const InternPool = struct {
                 });
                 ip.itemPlaceAt(index, item.?);
             },
+            .function => {
+                const func = key.function;
+                if (item == null) {
+                    item = .{ .tag = .function, .data = extra_len };
+                }
+                _ = try ip.extraPlaceAt(alloc, item.?, Function.Repr{
+                    .index = func.index.unwrap(),
+                    .arg = @intFromEnum(func.first_argument),
+                });
+                ip.itemPlaceAt(index, item.?);
+            },
+            .argument => {
+                const arg = key.argument;
+                const tag: Tag = switch (arg.expression) {
+                    .string => .argument_string,
+                    .int => .argument_int,
+                    .float => .argument_float,
+                    .condition => .argument_condition,
+                    .column => .argument_column,
+                };
+                if (item == null) {
+                    item = .{ .tag = tag, .data = extra_len };
+                }
+                const expr: PackedU64 = switch (arg.expression) {
+                    .string => |cond_string| .{ .a = @intFromEnum(cond_string), .b = 0 },
+                    .int => |cond_int| PackedU64.init(cond_int),
+                    .float => |cond_float| PackedU64.init(cond_float),
+                    .condition => |cond_index| .{ .a = @intFromEnum(cond_index), .b = 0 },
+                    .column => |col_index| .{ .a = @intFromEnum(col_index), .b = 0 },
+                };
+                _ = try ip.extraPlaceAt(alloc, item.?, Argument.Repr{
+                    .expr_0 = expr.a,
+                    .expr_1 = expr.b,
+                    .arg = @intFromEnum(arg.next_argument),
+                });
+                ip.itemPlaceAt(index, item.?);
+            },
             .cursor => {
                 const cursor = key.cursor;
                 item = .{ .tag = .cursor, .data = cursor.index };
@@ -1003,13 +1150,23 @@ const InternPool = struct {
             .condition_eq_int,
             .condition_eq_float,
             .condition_eq_string,
+            .condition_eq_func,
             .condition_ne_int,
             .condition_ne_float,
             .condition_ne_string,
             => {
                 const extra_data: Condition.Repr = ip.extraData(Condition.Repr, item.data);
-                const lhs_index: Index = @enumFromInt(extra_data.lhs);
                 const rhs: PackedU64 = .{ .a = extra_data.rhs_0, .b = extra_data.rhs_1 };
+                if (item.tag == .condition_eq_func) {
+                    return .{
+                        .condition = .{
+                            .equality = .eq,
+                            .lhs = .{ .func = @enumFromInt(extra_data.lhs) },
+                            .rhs = .{ .int = @bitCast(rhs) }, // TODO: support more than the int datatype.
+                        },
+                    };
+                }
+                const lhs_index: Index = @enumFromInt(extra_data.lhs);
                 const result: Condition = switch (item.tag) {
                     .condition_or => .{ .equality = .@"or", .lhs = .{ .condition = lhs_index }, .rhs = .{ .condition = @enumFromInt(rhs.a) } },
                     .condition_and => .{ .equality = .@"and", .lhs = .{ .condition = lhs_index }, .rhs = .{ .condition = @enumFromInt(rhs.a) } },
@@ -1027,7 +1184,7 @@ const InternPool = struct {
                     .condition_ne_float => .{ .equality = .ne, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
                     .condition_eq_string => .{ .equality = .eq, .lhs = .{ .column = lhs_index }, .rhs = .{ .string = @enumFromInt(rhs.a) } },
                     .condition_ne_string => .{ .equality = .ne, .lhs = .{ .column = lhs_index }, .rhs = .{ .string = @enumFromInt(rhs.a) } },
-                    else => unreachable, // Only handling conditions
+                    else => unreachable, // Only handling non-functional conditions
                 };
                 return .{ .condition = result };
             },
@@ -1047,6 +1204,31 @@ const InternPool = struct {
                 const extra_data = ip.extraData(Table.Repr, item.data);
                 const result: Table = .{ .name = extra_data.name, .page = extra_data.page, .first_column = extra_data.first_column };
                 return .{ .table = result };
+            },
+            .function => {
+                const extra_data = ip.extraData(Function.Repr, item.data);
+                const result: Function = .{
+                    .index = @enumFromInt(extra_data.index),
+                    .first_argument = @enumFromInt(extra_data.arg),
+                };
+                return .{ .function = result };
+            },
+            .argument_string, .argument_condition, .argument_float, .argument_int, .argument_column => {
+                const extra_data = ip.extraData(Argument.Repr, item.data);
+                const packed_expr: PackedU64 = .{ .a = extra_data.expr_0, .b = extra_data.expr_1 };
+                const expr: Expression = switch (item.tag) {
+                    .argument_string => .{ .string = @enumFromInt(packed_expr.a) },
+                    .argument_int => .{ .int = @bitCast(packed_expr) },
+                    .argument_float => .{ .float = @bitCast(packed_expr) },
+                    .argument_column => .{ .column = @enumFromInt(packed_expr.a) },
+                    .argument_condition => .{ .condition = @enumFromInt(packed_expr.a) },
+                    else => unreachable, // Only handling argument tags
+                };
+                const result: Argument = .{
+                    .expression = expr,
+                    .next_argument = @enumFromInt(extra_data.arg),
+                };
+                return .{ .argument = result };
             },
             .cursor => {
                 const result: Cursor = .{ .index = item.data };
@@ -1238,7 +1420,7 @@ comptime {
     assert(@sizeOf(SQLiteBtHeader) == sqlite_bt_header_size);
 }
 
-const debug_mode: bool = true;
+const debug_mode: bool = false;
 
 fn debug(comptime format: []const u8, args: anytype) void {
     if (!debug_mode) return;
@@ -1326,6 +1508,7 @@ const TokenType = enum {
     keyword_integer,
     keyword_primary,
     keyword_key,
+    keyword_like,
     keyword_text,
     keyword_select,
     keyword_from,
@@ -1352,6 +1535,7 @@ const TokenType = enum {
             .keyword_from => "FROM",
             .keyword_integer => "INTEGER",
             .keyword_key => "KEY",
+            .keyword_like => "LIKE",
             .keyword_or => "OR",
             .keyword_primary => "PRIMARY",
             .keyword_select => "SELECT",
@@ -1382,6 +1566,7 @@ const Token = struct {
         .{ "from", TokenType.keyword_from },
         .{ "integer", TokenType.keyword_integer },
         .{ "key", TokenType.keyword_key },
+        .{ "like", TokenType.keyword_like },
         .{ "or", TokenType.keyword_or },
         .{ "primary", TokenType.keyword_primary },
         .{ "select", TokenType.keyword_select },
@@ -1614,7 +1799,7 @@ const Tokenizer = struct {
 
 // TODO: replace with internpool key
 const SelectStmt = struct {
-    columns: u64, // Each bit represents one column in the table TODO: support tables with more than 64 columns
+    columns: u64, // Each bit represents one column in the table TODO: support tables with more than 64 columns and built-in function operations on columns
     table: InternPool.Index, // table index
     where: InternPool.Index.Optional, // Optional condition index
 };
@@ -1868,7 +2053,10 @@ const Db = struct {
                 return page.record(index - base_int_key);
             }
         } else if (root.header().getPageType() == .table_leaf) {
-            return root.record(index);
+            if (index < root.header().getCellCount()) {
+                return root.record(index);
+            }
+            return null;
         }
         return null;
     }
@@ -2302,6 +2490,7 @@ const ASTGen = struct {
         var equality: ?TokenType = null;
         var col_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
         var last_element_andor = false;
+        var is_like = false;
         var expr_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
         var expr_prev_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
         var expr_first_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
@@ -2368,6 +2557,11 @@ const ASTGen = struct {
                         equality = token.tag;
                         state = .where_rhs;
                     },
+                    .keyword_like => {
+                        equality = .eq;
+                        is_like = true;
+                        state = .where_rhs;
+                    },
                     else => break,
                 },
                 .where_rhs => {
@@ -2382,18 +2576,50 @@ const ASTGen = struct {
                             debug("where_rhs literal: {s}", .{string_literal});
                             const value = try InternPool.NullTerminatedString.initAddSentinel(self.gpa, string_literal[1 .. string_literal.len - 1], self.ip);
                             expr_prev_index = expr_index;
-                            const new_index = try self.ip.put(self.gpa, .{
-                                .condition = .{
-                                    .lhs = .{ .column = col_index.unwrap().? },
-                                    .equality = switch (equality.?) {
-                                        .eq => .eq,
-                                        .ne => .ne,
-                                        else => return Error.InvalidSyntax,
+                            if (is_like) {
+                                const match_arg = try self.ip.put(self.gpa, .{ .argument = .{
+                                    .expression = .{
+                                        .column = col_index,
                                     },
-                                    .rhs = .{ .string = value },
-                                },
-                            });
-                            expr_index = new_index.toOptional();
+                                    .next_argument = .none,
+                                } });
+                                const pattern_arg = try self.ip.put(self.gpa, .{ .argument = .{
+                                    .expression = .{
+                                        .string = value,
+                                    },
+                                    .next_argument = match_arg.toOptional(),
+                                } });
+                                const func_lhs = try self.ip.put(self.gpa, .{ .function = .{
+                                    .index = .like,
+                                    .first_argument = pattern_arg.toOptional(),
+                                } });
+                                const new_index = try self.ip.put(self.gpa, .{
+                                    .condition = .{
+                                        .lhs = .{ .func = func_lhs },
+                                        .equality = switch (equality.?) {
+                                            .eq => .eq,
+                                            else => return Error.InvalidSyntax,
+                                        },
+                                        .rhs = .{ .int = 1 }, // int assigned to 1 if true
+                                    },
+                                });
+                                expr_index = new_index.toOptional();
+                                is_like = false;
+                            } else {
+                                const new_index = try self.ip.put(self.gpa, .{
+                                    .condition = .{
+                                        .lhs = .{ .column = col_index.unwrap().? },
+                                        .equality = switch (equality.?) {
+                                            .eq => .eq,
+                                            .ne => .ne,
+                                            else => return Error.InvalidSyntax,
+                                        },
+                                        .rhs = .{ .string = value },
+                                    },
+                                });
+                                expr_index = new_index.toOptional();
+                            }
+                            // TODO: put func on the LHS for like and have it equate to 1
                         },
                         .integer => {
                             const slice = ASTGen.getTokenSource(self.source, token);
@@ -2520,7 +2746,7 @@ const ConditionTraversal = struct {
                         self.index = cond.lhs.condition.toOptional();
                         self.current_condition = cond.equality;
                     },
-                    .eq, .ne, .gt, .gte, .lt, .lte => {
+                    else => {
                         self.index = InternPool.Index.Optional.none;
                         return cond;
                     },
@@ -2583,16 +2809,24 @@ const InstGen = struct {
             .next => {
                 inst.next.success_jump = jump_address;
             },
+            .@"if" => {
+                inst.@"if".jump_address = jump_address;
+            },
+            .if_not => {
+                inst.if_not.jump_address = jump_address;
+            },
             else => unreachable, // Replace jump only on instructions with jump_address
         }
         self.ip.setInst(index, inst);
     }
 
-    fn eqNegate(self: *InstGen, index: InternPool.InstIndex) void {
+    fn negate(self: *InstGen, index: InternPool.InstIndex) void {
         const old_inst = self.ip.getInst(index).?;
         const new_inst: InternPool.Instruction = switch (old_inst) {
             .eq => |data| .{ .neq = data },
             .neq => |data| .{ .eq = data },
+            .@"if" => |data| .{ .if_not = data },
+            .if_not => |data| .{ .@"if" = data },
             else => unreachable, // Can only negate eq/ne opcodes
         };
         self.ip.setInst(index, new_inst);
@@ -2645,54 +2879,91 @@ const InstGen = struct {
 
                     // TODO: tree traversal left and right side. When the left side is the id record (ge/gt) with and, then its seek loop for ea one
                     while (try traversal.next(self.gpa)) |cond| {
-                        const col = self.ip.indexToKey(cond.lhs.column).column;
-                        if (col.is_primary_key and col.tag == .integer and seek_optimization == .none) {
-                            primary_key_col = cond.lhs.column.toOptional();
-                            if (traversal.current_condition == null or traversal.current_condition == .@"and") {
-                                switch (cond.equality) {
-                                    .gt => seek_optimization = .gt,
-                                    .gte => seek_optimization = .ge,
-                                    else => {},
-                                }
-                            }
-                            if (seek_optimization != .none) {
-                                reg_count = reg_count.increment();
-                                continue;
-                            }
-                        }
-                        _ = try self.addInst(.{ .column = .{
-                            .cursor = cursor,
-                            .store_reg = compare_reg,
-                            .col = cond.lhs.column,
-                        } });
-                        reg_count = reg_count.increment();
-                        const cur_cond = traversal.current_condition orelse .@"or";
-                        switch (cur_cond) {
-                            .@"or" => {
-                                try comparisons.append(self.gpa, self.ip.peekInst());
-                                // TODO: add other conditions (lt/lte/gt/gte)
-                                if (cond.equality == .eq) {
-                                    _ = try self.addInst(.{ .eq = .{
-                                        .lhs_reg = compare_reg,
-                                        .rhs_reg = reg_count,
-                                        .jump = InternPool.InstIndex.none,
+                        switch (cond.lhs) {
+                            .func => {
+                                const func = self.ip.indexToKey(cond.lhs.func).function;
+                                // TODO: support functions with 0 arguments
+                                if (func.first_argument != .none) {
+                                    const first_arg_register = reg_count.increment();
+                                    var arg_index = func.first_argument;
+                                    while (arg_index.unwrap()) |idx| {
+                                        const arg = self.ip.indexToKey(idx).argument;
+                                        // TODO: properly handle reg count
+                                        switch (arg.expression) {
+                                            .column => {
+                                                _ = try self.addInst(.{ .column = .{
+                                                    .cursor = cursor,
+                                                    .store_reg = reg_count.increment(),
+                                                    .col = arg.expression.column.unwrap().?,
+                                                } });
+                                            },
+                                            else => {},
+                                        }
+                                        reg_count = reg_count.increment();
+                                        arg_index = arg.next_argument;
+                                    }
+                                    _ = try self.addInst(.{ .function = .{
+                                        .index = func.index,
+                                        .first_argument_register = first_arg_register,
+                                        .result_register = compare_reg,
                                     } });
-                                } else {
-                                    _ = try self.addInst(.{ .neq = .{
-                                        .lhs_reg = compare_reg,
-                                        .rhs_reg = reg_count,
-                                        .jump = InternPool.InstIndex.none,
-                                    } });
+                                    // TODO: support or/and clauses like column
+                                    try comparisons.append(self.gpa, self.ip.peekInst());
+                                    _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
                                 }
                             },
-                            else => return Error.InvalidSyntax, // TODO: implement and clause
+                            .column => {
+                                const col = self.ip.indexToKey(cond.lhs.column).column;
+                                if (col.is_primary_key and col.tag == .integer and seek_optimization == .none) {
+                                    primary_key_col = cond.lhs.column.toOptional();
+                                    if (traversal.current_condition == null or traversal.current_condition == .@"and") {
+                                        switch (cond.equality) {
+                                            .gt => seek_optimization = .gt,
+                                            .gte => seek_optimization = .ge,
+                                            else => {},
+                                        }
+                                    }
+                                    if (seek_optimization != .none) {
+                                        reg_count = reg_count.increment();
+                                        continue;
+                                    }
+                                }
+                                _ = try self.addInst(.{ .column = .{
+                                    .cursor = cursor,
+                                    .store_reg = compare_reg,
+                                    .col = cond.lhs.column,
+                                } });
+                                reg_count = reg_count.increment();
+                                const cur_cond = traversal.current_condition orelse .@"or";
+                                switch (cur_cond) {
+                                    .@"or" => {
+                                        try comparisons.append(self.gpa, self.ip.peekInst());
+                                        // TODO: add other conditions (lt/lte/gt/gte)
+                                        if (cond.equality == .eq) {
+                                            _ = try self.addInst(.{ .eq = .{
+                                                .lhs_reg = compare_reg,
+                                                .rhs_reg = reg_count,
+                                                .jump = InternPool.InstIndex.none,
+                                            } });
+                                        } else {
+                                            _ = try self.addInst(.{ .neq = .{
+                                                .lhs_reg = compare_reg,
+                                                .rhs_reg = reg_count,
+                                                .jump = InternPool.InstIndex.none,
+                                            } });
+                                        }
+                                    },
+                                    else => return Error.InvalidSyntax, // TODO: implement and clause
+                                }
+                            },
+                            else => unreachable,
                         }
                     } else {
                         columns_start = self.ip.peekInst();
                     }
                     for (comparisons.items, 0..) |value, i| {
                         if (i == comparisons.items.len - 1) {
-                            self.eqNegate(value);
+                            self.negate(value);
                             final_comparison = value;
                         } else {
                             self.replaceJump(value, columns_start);
@@ -2744,24 +3015,52 @@ const InstGen = struct {
                     var traversal = ConditionTraversal.init(self.ip, where);
                     var store_reg = compare_reg.increment();
                     defer traversal.deint(self.gpa);
+                    // TODO: handle LHS if its a function, not a column
                     while (try traversal.next(self.gpa)) |cond| {
-                        if (primary_key_col != .none and cond.lhs.column.toOptional() == primary_key_col) {
-                            _ = try self.addInst(.{ .integer = .{ .int = cond.rhs.int, .store_reg = store_reg } });
-                            _ = try self.ip.replaceInst(self.gpa, cursor_move_index, .{
-                                .seek_gt = .{
-                                    .table = select.table,
-                                    .seek_key = store_reg, // TODO: add after register declared
-                                    .end_inst = halt_index, // TODO: add after halt declared
-                                },
-                            });
-                        } else {
-                            switch (cond.rhs) {
-                                .string => _ = try self.addInst(.{ .string = .{ .string = cond.rhs.string, .store_reg = store_reg } }),
-                                .int => _ = try self.addInst(.{ .integer = .{ .int = cond.rhs.int, .store_reg = store_reg } }),
-                                else => return Error.InvalidSyntax, // TODO: implement float
+                        const is_func = switch (cond.lhs) {
+                            .func => true,
+                            else => false,
+                        };
+                        if (is_func) {
+                            const func = self.ip.indexToKey(cond.lhs.func).function;
+                            if (func.first_argument != .none) {
+                                var arg_index_opt = func.first_argument;
+                                while (arg_index_opt.unwrap()) |arg_index| {
+                                    const arg = self.ip.indexToKey(arg_index).argument;
+                                    var skip_reg = false;
+                                    switch (arg.expression) {
+                                        .string => _ = try self.addInst(.{ .string = .{ .string = arg.expression.string, .store_reg = store_reg } }),
+                                        .int => _ = try self.addInst(.{ .integer = .{ .int = arg.expression.int, .store_reg = store_reg } }),
+                                        .column => {
+                                            skip_reg = true;
+                                        },
+                                        else => return Error.InvalidSyntax, // TODO: implement float
+                                    }
+                                    if (!skip_reg) {
+                                        store_reg = store_reg.increment();
+                                    }
+                                    arg_index_opt = arg.next_argument;
+                                }
                             }
+                        } else {
+                            if (!is_func and primary_key_col != .none and cond.lhs.column.toOptional() == primary_key_col) {
+                                _ = try self.addInst(.{ .integer = .{ .int = cond.rhs.int, .store_reg = store_reg } });
+                                _ = try self.ip.replaceInst(self.gpa, cursor_move_index, .{
+                                    .seek_gt = .{
+                                        .table = select.table,
+                                        .seek_key = store_reg,
+                                        .end_inst = halt_index,
+                                    },
+                                });
+                            } else {
+                                switch (cond.rhs) {
+                                    .string => _ = try self.addInst(.{ .string = .{ .string = cond.rhs.string, .store_reg = store_reg } }),
+                                    .int => _ = try self.addInst(.{ .integer = .{ .int = cond.rhs.int, .store_reg = store_reg } }),
+                                    else => return Error.InvalidSyntax, // TODO: implement float
+                                }
+                            }
+                            store_reg = store_reg.increment();
                         }
-                        store_reg = store_reg.increment();
                     }
                 }
                 _ = try self.addInst(.{ .goto = open_read_index });
@@ -2987,15 +3286,23 @@ fn like_func(ctx: FunctionContext, args: u8) anyerror!void {
         else => unreachable,
     };
     if (like(string, pattern)) {
-        vm.updateReg(ctx.return_reg, .{ .int = 1 });
+        try vm.updateReg(ctx.return_reg, .{ .int = 1 });
     } else {
-        vm.updateReg(ctx.return_reg, .{ .int = 0 });
+        try vm.updateReg(ctx.return_reg, .{ .int = 0 });
     }
 }
 
 const BuiltInFunction = *const fn (ctx: FunctionContext, args: u8) anyerror!void;
 
-const builtin_funcs = []BuiltInFunction{like_func};
+// TODO: we can make this code comptime so the enum and array are automatically populated
+const builtin_funcs = [_]BuiltInFunction{like_func};
+const BuiltInFunctionIndex = enum(u32) {
+    like,
+
+    pub fn unwrap(self: BuiltInFunctionIndex) u32 {
+        return @intFromEnum(self);
+    }
+};
 
 const Vm = struct {
     gpa: Allocator,
@@ -3183,6 +3490,19 @@ const Vm = struct {
                     renderRow(row_buf[0..row_buf_written].ptr, row_buf[0..row_buf_written].len);
                     self.pc = self.pc.increment();
                 },
+                .function => |function_data| {
+                    const index = function_data.index;
+                    const func = builtin_funcs[index.unwrap()];
+                    const context: FunctionContext = .{
+                        .ip = self.ip,
+                        .vm = self,
+                        .first_reg = function_data.first_argument_register,
+                        .return_reg = function_data.result_register,
+                    };
+                    // TODO: better error return handling
+                    func(context, 2) catch return error.OutOfMemory;
+                    self.pc = self.pc.increment();
+                },
                 .seek_gt, .seek_ge => |seek_data| {
                     const end_inst = seek_data.end_inst;
                     const reg_cmp = seek_data.seek_key;
@@ -3197,6 +3517,30 @@ const Vm = struct {
                         col_value = record.?.next();
                         col_count += 1;
                         self.pc = self.pc.increment();
+                    }
+                },
+                .@"if", .if_not => |if_data| {
+                    const jump_address = if_data.jump_address;
+                    const if_reg_index = if_data.compare_reg;
+                    const if_reg = self.reg(if_reg_index);
+
+                    const is_if: bool = switch (instruction) {
+                        .@"if" => true,
+                        else => false,
+                    };
+
+                    if (if_reg.tag() == .int and if_reg.int == 1) {
+                        if (is_if) {
+                            self.pc = jump_address;
+                        } else {
+                            self.pc = self.pc.increment();
+                        }
+                    } else {
+                        if (is_if) {
+                            self.pc = self.pc.increment();
+                        } else {
+                            self.pc = jump_address;
+                        }
                     }
                 },
                 .neq, .eq => |eq_data| {

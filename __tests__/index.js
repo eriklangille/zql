@@ -4,6 +4,7 @@ import loadZQL from '../zql.js';
 
 const SMALL_DB_FILE = './test.db';
 const BACKUP_DB_FILE = './backup.db';
+const BIG_DB_FILE = './example.db';
 let zql;
 let zqlResult = [];
 let sql;
@@ -52,10 +53,6 @@ async function load(dbFile) {
   console.log("Loaded");
 }
 
-// beforeAll(async () => {
-//   load();
-// });
-
 describe('Compare ZQL to SQL', () => {
   test('small db', async () => {
     await load(SMALL_DB_FILE)
@@ -65,10 +62,16 @@ describe('Compare ZQL to SQL', () => {
     await compare("select name from example;");
     await compare("select * from example where name = 'Alice';");
     await compare("select * from example where name = 'Alice' or name = 'Bob';");
+    await compare("select * from example where name like 'A%'");
+    await compare("select * from example where name like '%l%'");
   });
   test('backup db', async () => {
     await load(BACKUP_DB_FILE)
     await compare("select * from test;");
+  });
+  test('example db', async () => {
+    await load(BIG_DB_FILE)
+    await compare("select * from records;");
   });
 });
 
