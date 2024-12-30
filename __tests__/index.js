@@ -23,7 +23,7 @@ async function compare(query) {
   await zql.exec(query);
   const sqlQuery = sql.prepare(query);
   const sqlResult = sqlQuery.all();
-  console.log(zqlResult);
+  // console.log(zqlResult);
   expect(zqlResult.length).toBe(sqlResult.length);
   for (let i = 0; i < sqlResult.length; i++) {
     const obj = sqlResult[i];
@@ -80,6 +80,14 @@ describe('Compare ZQL to SQL', () => {
   test('example db', async () => {
     await load(BIG_DB_FILE)
     await compare("select * from records where name like '%a';");
+    await compare("select * from records where name like '%a%a';");
+    await compare("select * from records where name like 'a%a';");
+    await compare("select * from records where name like 'a%b';");
+    await compare("select * from records where name like 'a%';");
+    await compare("select * from records where name like '_%';");
+    await compare("select * from records where name like '%_';");
+    await compare("select * from records where name like '%___';");
+    await compare("select * from records where name like 'simfyvo__a';");
   });
 });
 

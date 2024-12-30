@@ -106,10 +106,10 @@ class ZqlDb {
     */
     const readBuffer = (writePointer, readPointer, length) => {
       if (this.#dbFile == null || this.#instance == null) return;
-      console.log('[readBuffer] writePointer:', writePointer, 'readPointer:', readPointer, 'length:', length);
+      // console.log('[readBuffer] writePointer:', writePointer, 'readPointer:', readPointer, 'length:', length);
       const memory = new Uint8Array(this.#instance.exports.memory.buffer, writePointer, length);
       const fileData = new Uint8Array(this.#dbFile);
-      console.log('Reading buffer from file');
+      // console.log('Reading buffer from file');
       memory.set(fileData.slice(readPointer, readPointer + length));
     }
 
@@ -163,7 +163,6 @@ class ZqlDb {
     const dbFileBuffer = await filePromise;
     const dbFile = new Uint8Array(dbFileBuffer);
     this.#dbFile = dbFile;
-    console.log(dbFile);
 
     const memory = new Uint8Array(this.#instance.exports.memory.buffer);
     memory.set(dbFile.slice(0, SQLITE_HEADER_SIZE), this.#dbMemoryAddress);

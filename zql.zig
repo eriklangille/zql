@@ -830,7 +830,7 @@ const InternPool = struct {
         var fbs = io.fixedBufferStream(@constCast(&buf));
         _ = ip.bufWrite(@constCast(&fbs), index) catch null;
         const slice = fbs.getWritten();
-        print(slice.ptr, slice.len);
+        debug("{s}", .{slice});
     }
 
     fn bufWrite(ip: *InternPool, buffer: *FixedBufferStream([]u8), index: Index.Optional) anyerror!void {
@@ -1652,7 +1652,7 @@ const Tokenizer = struct {
 
     pub fn dump(self: *Tokenizer, token: *Token) void {
         if (token.type.lexeme()) |word| {
-            print(word.ptr, word.len);
+            debug("{s}", .{word});
         } else {
             debug("[{d}]: {s}", .{ token.location.start, self.buffer[token.location.start..token.location.end] });
         }
@@ -3318,44 +3318,57 @@ pub inline fn char_lower(char: u8) u8 {
     };
 }
 
+// TODO: figure out why '%_' is so slow to match and speed it up
 fn like(str: []u8, pattern: []u8) bool {
     var si: u32 = 0;
     var pi: u32 = 0;
-    var wild_char: u8 = 0;
+    var wild_char: u32 = 0;
     while (si < str.len and pi < pattern.len) {
         switch (pattern[pi]) {
             '%' => {
                 while (pi + 1 < pattern.len and pi == '%') : (pi += 1) {}
                 if (pi + 1 == pattern.len) return true;
-                wild_char = char_lower(pattern[pi + 1]);
-                if (pattern[pi] != '_') {
+                wild_char = pi + 1;
+                if (pattern[pi + 1] != '_') {
                     while (si < str.len and char_lower(str[si]) != char_lower(pattern[pi + 1])) : (si += 1) {}
-                    pi += 1;
                 }
+                pi += 1;
             },
             '_' => {
                 if (si + 1 == str.len) return true;
-                if (pi + 1 == pattern.len) return false;
+                if (pi + 1 == pattern.len) {
+                    if (wild_char != 0) {
+                        pi = wild_char - 1;
+                    } else {
+                        return false;
+                    }
+                }
                 si += 1;
                 pi += 1;
             },
             else => {
-                if (char_lower(str[si]) != char_lower(pattern[pi])) {
+                const is_end_mismatch: bool = str.len - si > 1 and pi == pattern.len - 1;
+                const is_char_mismatch: bool = char_lower(str[si]) != char_lower(pattern[pi]);
+                if (is_end_mismatch or is_char_mismatch) {
                     if (wild_char != 0) {
-                        while (si < str.len and char_lower(str[si]) != wild_char) : (si += 1) {}
+                        if (pattern[wild_char] == '_') {
+                            si += 1;
+                            pi = wild_char;
+                        } else {
+                            if (!is_char_mismatch) {
+                                si += 1;
+                            }
+                            while (si < str.len and char_lower(str[si]) != char_lower(pattern[wild_char])) : (si += 1) {}
+                            pi = wild_char;
+                        }
                     } else {
                         return false;
                     }
                 } else {
                     si += 1;
                     pi += 1;
-                    if (si == str.len) return true;
-                    if (pi == pattern.len) {
-                        if (str[str.len - 1] == wild_char) {
-                            return true;
-                        }
-                        return false;
-                    }
+                    if (si == str.len and pi == pattern.len) return true;
+                    if (pi == pattern.len) return false;
                 }
             },
         }
