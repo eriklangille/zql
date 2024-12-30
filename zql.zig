@@ -1453,7 +1453,7 @@ comptime {
     assert(@sizeOf(SQLiteBtHeader) == sqlite_bt_header_size);
 }
 
-const debug_mode: bool = true;
+const debug_mode: bool = false;
 
 fn debug(comptime format: []const u8, args: anytype) void {
     if (!debug_mode) return;
@@ -1734,7 +1734,7 @@ const Tokenizer = struct {
                     },
                 },
                 .identifier => switch (c) {
-                    'a'...'z', 'A'...'Z' => {},
+                    'a'...'z', 'A'...'Z', '0'...'9' => {},
                     else => {
                         if (Token.getKeyword(self.buffer[token.location.start..self.index])) |token_type| {
                             token.type = token_type;
@@ -2912,7 +2912,6 @@ const InstGen = struct {
                 const table = self.ip.indexToKey(select.table).table;
                 var seek_optimization: SeekOptimization = .none;
                 var primary_key_col: InternPool.Index.Optional = .none;
-                // const page_index: u32 = select.table.page - 1;
                 debug("page_index: {d}", .{table.page});
 
                 const cursor = try self.ip.put(self.gpa, .{ .cursor = .{ .index = 0 } });
@@ -3110,18 +3109,15 @@ const InstGen = struct {
                                 var arg_index_opt = func.first_argument;
                                 while (arg_index_opt.unwrap()) |arg_index| {
                                     const arg = self.ip.indexToKey(arg_index).argument;
-                                    var skip_reg = false;
                                     switch (arg.expression) {
                                         .string => _ = try self.addInst(.{ .string = .{ .string = arg.expression.string, .store_reg = store_reg } }),
                                         .int => _ = try self.addInst(.{ .integer = .{ .int = arg.expression.int, .store_reg = store_reg } }),
                                         .column => {
-                                            skip_reg = true;
+                                            // skip_reg = true;
                                         },
                                         else => return Error.InvalidSyntax, // TODO: implement float
                                     }
-                                    if (!skip_reg) {
-                                        store_reg = store_reg.increment();
-                                    }
+                                    store_reg = store_reg.increment();
                                     arg_index_opt = arg.next_argument;
                                 }
                             }
@@ -3325,11 +3321,13 @@ pub inline fn char_lower(char: u8) u8 {
 fn like(str: []u8, pattern: []u8) bool {
     var si: u32 = 0;
     var pi: u32 = 0;
+    var wild_char: u8 = 0;
     while (si < str.len and pi < pattern.len) {
         switch (pattern[pi]) {
             '%' => {
                 while (pi + 1 < pattern.len and pi == '%') : (pi += 1) {}
                 if (pi + 1 == pattern.len) return true;
+                wild_char = char_lower(pattern[pi + 1]);
                 if (pattern[pi] != '_') {
                     while (si < str.len and char_lower(str[si]) != char_lower(pattern[pi + 1])) : (si += 1) {}
                     pi += 1;
@@ -3342,11 +3340,23 @@ fn like(str: []u8, pattern: []u8) bool {
                 pi += 1;
             },
             else => {
-                if (char_lower(str[si]) != char_lower(pattern[pi])) return false;
-                si += 1;
-                pi += 1;
-                if (si == str.len) return true;
-                if (pi == pattern.len) return false;
+                if (char_lower(str[si]) != char_lower(pattern[pi])) {
+                    if (wild_char != 0) {
+                        while (si < str.len and char_lower(str[si]) != wild_char) : (si += 1) {}
+                    } else {
+                        return false;
+                    }
+                } else {
+                    si += 1;
+                    pi += 1;
+                    if (si == str.len) return true;
+                    if (pi == pattern.len) {
+                        if (str[str.len - 1] == wild_char) {
+                            return true;
+                        }
+                        return false;
+                    }
+                }
             },
         }
     }
@@ -3744,6 +3754,9 @@ fn parseStatement(str: [:0]u8, db_memory: DbMemory) Error!void {
 
     inst_gen.dump();
 
+    // temp return to see inst_dump
+    // TODO: make this path taken if work 'explain' is used at start of SQL statement
+    // if (true) return;
     var vm = Vm.init(fixed_alloc.allocator(), db, &intern_pool);
     try vm.exec();
 }

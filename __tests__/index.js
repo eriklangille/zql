@@ -3,6 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import loadZQL from '../zql.js';
 
 const SMALL_DB_FILE = './test.db';
+const MED_DB_FILE = './med.db';
 const BACKUP_DB_FILE = './backup.db';
 const BIG_DB_FILE = './example.db';
 let zql;
@@ -66,13 +67,19 @@ describe('Compare ZQL to SQL', () => {
     await compare("select * from example where name like 'A%'");
     await compare("select * from example where name like '%l%'");
   });
+  test('med db', async () => {
+    await load(MED_DB_FILE)
+    await compare("select * from t1;");
+    await compare("select * from t1 where age < 18 or name like '%a%';");
+    await compare("select * from t1 where age <= 18 or name like '%a%';");
+  });
   test('backup db', async () => {
     await load(BACKUP_DB_FILE)
     await compare("select * from test;");
   });
   test('example db', async () => {
     await load(BIG_DB_FILE)
-    await compare("select * from records;");
+    await compare("select * from records where name like '%a';");
   });
 });
 
