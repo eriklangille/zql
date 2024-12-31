@@ -70,8 +70,12 @@ describe('Compare ZQL to SQL', () => {
   test('med db', async () => {
     await load(MED_DB_FILE)
     await compare("select * from t1;");
+    await compare("select * from t1 where name like 'a%' or name = 'Louis' or name = 'Paul';");
     await compare("select * from t1 where age < 18 or name like '%a%';");
     await compare("select * from t1 where age <= 18 or name like '%a%';");
+    await compare("select * from t1 where name like '_%';");
+    await compare("select * from t1 where name like '%_';");
+    await compare("select * from t1 where name like '%___';");
   });
   test('backup db', async () => {
     await load(BACKUP_DB_FILE)
@@ -84,9 +88,6 @@ describe('Compare ZQL to SQL', () => {
     await compare("select * from records where name like 'a%a';");
     await compare("select * from records where name like 'a%b';");
     await compare("select * from records where name like 'a%';");
-    await compare("select * from records where name like '_%';");
-    await compare("select * from records where name like '%_';");
-    await compare("select * from records where name like '%___';");
     await compare("select * from records where name like 'simfyvo__a';");
   });
 });

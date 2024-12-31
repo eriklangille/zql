@@ -783,7 +783,7 @@ const InternPool = struct {
         equality: Condition.Equality,
         lhs: union(enum) {
             column: Index, // Column index
-            condition: Index, // Condition index
+            condition: Index.Optional, // Condition index
             func: Index, // Function index
         },
         rhs: union(enum) { // TODO: rhs can have columns. For e.g., where a = b. Replace with Expression
@@ -879,7 +879,7 @@ const InternPool = struct {
                         }
                         switch (condition_data.rhs) {
                             .condition => |condition_rhs| {
-                                try ip.bufWrite(buffer, condition_lhs.toOptional());
+                                try ip.bufWrite(buffer, condition_lhs);
                                 _ = try buffer.write(", ");
                                 try ip.bufWrite(buffer, condition_rhs);
                                 _ = try buffer.write(")");
@@ -1041,7 +1041,8 @@ const InternPool = struct {
                     else => false,
                 };
                 const lhs: u32 = switch (cond.lhs) {
-                    .condition, .column, .func => |col_cond_func| @intFromEnum(col_cond_func),
+                    .condition => |cond_opt| @intFromEnum(cond_opt),
+                    .column, .func => |col_func| @intFromEnum(col_func),
                 };
                 const rhs: PackedU64 = switch (cond.rhs) {
                     .string => |cond_string| .{ .a = @intFromEnum(cond_string), .b = 0 },
@@ -1201,8 +1202,8 @@ const InternPool = struct {
                 }
                 const lhs_index: Index = @enumFromInt(extra_data.lhs);
                 const result: Condition = switch (item.tag) {
-                    .condition_or => .{ .equality = .@"or", .lhs = .{ .condition = lhs_index }, .rhs = .{ .condition = @enumFromInt(rhs.a) } },
-                    .condition_and => .{ .equality = .@"and", .lhs = .{ .condition = lhs_index }, .rhs = .{ .condition = @enumFromInt(rhs.a) } },
+                    .condition_or => .{ .equality = .@"or", .lhs = .{ .condition = lhs_index.toOptional() }, .rhs = .{ .condition = @enumFromInt(rhs.a) } },
+                    .condition_and => .{ .equality = .@"and", .lhs = .{ .condition = lhs_index.toOptional() }, .rhs = .{ .condition = @enumFromInt(rhs.a) } },
                     .condition_lte_int => .{ .equality = .lte, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
                     .condition_lt_int => .{ .equality = .lt, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
                     .condition_gte_int => .{ .equality = .gte, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
@@ -2527,9 +2528,9 @@ const ASTGen = struct {
         var col_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
         var last_element_andor = false;
         var is_like = false;
-        var expr_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
-        var expr_prev_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
-        var expr_first_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
+        var expr_index: InternPool.Index.Optional = .none;
+        var expr_prev_index: InternPool.Index.Optional = .none;
+        var expr_first_index: InternPool.Index.Optional = .none;
         debug("buildWhereClause", .{});
         while (self.index < self.token_list.len) : (self.index += 1) {
             const token = self.token_list.get(self.index);
@@ -2553,30 +2554,26 @@ const ASTGen = struct {
                         if (last_element_andor or expr_index.unwrap() == null) {
                             break;
                         }
-                        const replace_first_expr = expr_first_index == expr_index;
-                        const expr_prev_temp_index = expr_index;
                         const new_index = try self.ip.put(self.gpa, .{
                             .condition = .{
-                                .lhs = .{ .condition = expr_index.unwrap().? },
+                                .rhs = .{ .condition = switch (expr_first_index) {
+                                    .none => .none,
+                                    else => expr_index,
+                                } },
                                 .equality = switch (token.tag) {
                                     .keyword_and => .@"and",
                                     .keyword_or => .@"or",
                                     else => unreachable, // and or conditions
                                 },
-                                .rhs = .{ .condition = InternPool.Index.Optional.none },
+                                .lhs = .{ .condition = switch (expr_first_index) {
+                                    .none => expr_index,
+                                    else => expr_first_index,
+                                } },
                             },
                         });
                         expr_index = new_index.toOptional();
                         last_element_andor = true;
-                        if (expr_prev_index.unwrap()) |expr| {
-                            var key = self.ip.indexToKey(expr);
-                            key.condition.rhs = .{ .condition = expr_index };
-                            try self.ip.update(self.gpa, expr, key);
-                        }
-                        expr_prev_index = expr_prev_temp_index;
-                        if (replace_first_expr) {
-                            expr_first_index = expr_index;
-                        }
+                        expr_first_index = expr_index;
                     },
                     else => {
                         if (last_element_andor) {
@@ -2681,7 +2678,7 @@ const ASTGen = struct {
                         else => break, // TODO: support real (float)
                     }
                     last_element_andor = false;
-                    if (expr_prev_index.unwrap()) |expr| {
+                    if (expr_first_index.unwrap()) |expr| {
                         var key = self.ip.indexToKey(expr);
                         key.condition.rhs = .{ .condition = expr_index.unwrap().?.toOptional() };
                         try self.ip.update(self.gpa, expr, key);
@@ -2779,7 +2776,7 @@ const ConditionTraversal = struct {
                 switch (cond.equality) {
                     .@"or", .@"and" => {
                         try self.stack.append(alloc, self.index);
-                        self.index = cond.lhs.condition.toOptional();
+                        self.index = cond.lhs.condition;
                         self.current_condition = cond.equality;
                     },
                     else => {
@@ -2928,14 +2925,13 @@ const InstGen = struct {
                 const where_clause = select.where;
                 debug("Where: {?}", .{where_clause});
                 const compare_reg = reg_count;
-                var final_comparison: InternPool.InstIndex = InternPool.InstIndex.none;
+                var comparisons: ArrayListUnmanaged(struct { eq: ?InternPool.Condition.Equality, inst: InternPool.InstIndex }) = .{};
+                defer comparisons.deinit(self.gpa);
+                var columns_start = self.ip.peekInst();
+
                 if (where_clause.unwrap()) |ref| {
                     var traversal = ConditionTraversal.init(self.ip, ref);
                     defer traversal.deint(self.gpa);
-                    var comparisons: ArrayListUnmanaged(InternPool.InstIndex) = .{};
-                    defer comparisons.deinit(self.gpa);
-                    var columns_start = self.ip.peekInst();
-
                     // TODO: tree traversal left and right side. When the left side is the id record (ge/gt) with and, then its seek loop for ea one
                     while (try traversal.next(self.gpa)) |cond| {
                         switch (cond.lhs) {
@@ -2967,7 +2963,7 @@ const InstGen = struct {
                                         .result_register = compare_reg,
                                     } });
                                     // TODO: support or/and clauses like column
-                                    try comparisons.append(self.gpa, self.ip.peekInst());
+                                    try comparisons.append(self.gpa, .{ .eq = traversal.current_condition, .inst = self.ip.peekInst() });
                                     _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
                                 }
                             },
@@ -3000,57 +2996,43 @@ const InstGen = struct {
                                     } });
                                 }
                                 reg_count = reg_count.increment();
-                                const cur_cond = traversal.current_condition orelse .@"or";
-                                switch (cur_cond) {
-                                    .@"or" => {
-                                        try comparisons.append(self.gpa, self.ip.peekInst());
+                                try comparisons.append(self.gpa, .{ .eq = traversal.current_condition, .inst = self.ip.peekInst() });
+                                switch (cond.equality) {
+                                    .eq => {
+                                        _ = try self.addInst(.{ .eq = .{
+                                            .lhs_reg = compare_reg,
+                                            .rhs_reg = reg_count,
+                                            .jump = InternPool.InstIndex.none,
+                                        } });
+                                    },
+                                    .ne => {
+                                        _ = try self.addInst(.{ .neq = .{
+                                            .lhs_reg = compare_reg,
+                                            .rhs_reg = reg_count,
+                                            .jump = InternPool.InstIndex.none,
+                                        } });
+                                    },
+                                    .gt, .gte, .lt, .lte => {
+                                        const data: InternPool.Instruction.Lt = .{
+                                            .lhs_reg = compare_reg,
+                                            .rhs_reg = reg_count,
+                                            .jump = .none,
+                                        };
                                         switch (cond.equality) {
-                                            .eq => {
-                                                _ = try self.addInst(.{ .eq = .{
-                                                    .lhs_reg = compare_reg,
-                                                    .rhs_reg = reg_count,
-                                                    .jump = InternPool.InstIndex.none,
-                                                } });
-                                            },
-                                            .ne => {
-                                                _ = try self.addInst(.{ .neq = .{
-                                                    .lhs_reg = compare_reg,
-                                                    .rhs_reg = reg_count,
-                                                    .jump = InternPool.InstIndex.none,
-                                                } });
-                                            },
-                                            .gt, .gte, .lt, .lte => {
-                                                const data: InternPool.Instruction.Lt = .{
-                                                    .lhs_reg = compare_reg,
-                                                    .rhs_reg = reg_count,
-                                                    .jump = .none,
-                                                };
-                                                switch (cond.equality) {
-                                                    .gt => _ = try self.addInst(.{ .gt = data }),
-                                                    .gte => _ = try self.addInst(.{ .gte = data }),
-                                                    .lt => _ = try self.addInst(.{ .lt = data }),
-                                                    .lte => _ = try self.addInst(.{ .lte = data }),
-                                                    else => unreachable,
-                                                }
-                                            },
+                                            .gt => _ = try self.addInst(.{ .gt = data }),
+                                            .gte => _ = try self.addInst(.{ .gte = data }),
+                                            .lt => _ = try self.addInst(.{ .lt = data }),
+                                            .lte => _ = try self.addInst(.{ .lte = data }),
                                             else => unreachable,
                                         }
                                     },
-                                    else => return Error.InvalidSyntax, // TODO: implement and clause
+                                    else => unreachable,
                                 }
                             },
                             else => unreachable,
                         }
                     } else {
                         columns_start = self.ip.peekInst();
-                    }
-                    for (comparisons.items, 0..) |value, i| {
-                        if (i == comparisons.items.len - 1) {
-                            self.negate(value);
-                            final_comparison = value;
-                        } else {
-                            self.replaceJump(value, columns_start);
-                        }
                     }
                 }
 
@@ -3091,10 +3073,29 @@ const InstGen = struct {
                 // TODO: support multiples databases, writing to tables
                 const transaction_index = try self.addInst(.{ .transaction = .{ .database_id = 0, .write = false } });
 
-                if (where_clause.unwrap()) |where| {
-                    if (final_comparison != .none) {
-                        self.replaceJump(final_comparison, next_index);
+                for (comparisons.items, 0..) |value, i| {
+                    if (i == comparisons.items.len - 1) {
+                        self.negate(value.inst);
+                        self.replaceJump(value.inst, next_index);
+                    } else {
+                        if (value.eq) |eq| {
+                            switch (eq) {
+                                .@"or" => {
+                                    self.replaceJump(value.inst, columns_start);
+                                },
+                                .@"and" => {
+                                    self.negate(value.inst);
+                                    self.replaceJump(value.inst, halt_index);
+                                },
+                                else => unreachable,
+                            }
+                        } else {
+                            self.replaceJump(value.inst, columns_start);
+                        }
                     }
+                }
+
+                if (where_clause.unwrap()) |where| {
                     var traversal = ConditionTraversal.init(self.ip, where);
                     var store_reg = compare_reg.increment();
                     defer traversal.deint(self.gpa);
@@ -3112,9 +3113,7 @@ const InstGen = struct {
                                     switch (arg.expression) {
                                         .string => _ = try self.addInst(.{ .string = .{ .string = arg.expression.string, .store_reg = store_reg } }),
                                         .int => _ = try self.addInst(.{ .integer = .{ .int = arg.expression.int, .store_reg = store_reg } }),
-                                        .column => {
-                                            // skip_reg = true;
-                                        },
+                                        .column => {},
                                         else => return Error.InvalidSyntax, // TODO: implement float
                                     }
                                     store_reg = store_reg.increment();

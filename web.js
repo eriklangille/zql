@@ -58,7 +58,7 @@ loadZQL().then(async (zql) => {
     zql.rowListeners.push(addTableRow);
     window.zql = zql;
 
-    await zql.loadFile(getFileFromUrl("./example.db"))
+    await zql.loadFile(getFileFromUrl("./med.db"))
     await zql.loadFile(listenForInputFile());
 });
 
