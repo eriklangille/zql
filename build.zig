@@ -12,5 +12,11 @@ pub fn build(b: *std.Build) !void {
     });
     wasm.rdynamic = true;
     wasm.entry = .disabled;
+
+    const debug = b.option(bool, "debug", "Debug mode - application logging") orelse false;
+    const options = b.addOptions();
+    options.addOption(bool, "is_debug", debug);
+    wasm.root_module.addOptions("config", options);
+
     b.installArtifact(wasm);
 }

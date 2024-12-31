@@ -1,4 +1,5 @@
 const std = @import("std");
+const config = @import("config");
 const Allocator = std.mem.Allocator;
 const ArrayListUnmanaged = std.ArrayListUnmanaged;
 const assert = std.debug.assert;
@@ -1454,7 +1455,7 @@ comptime {
     assert(@sizeOf(SQLiteBtHeader) == sqlite_bt_header_size);
 }
 
-const debug_mode: bool = false;
+const debug_mode: bool = config.is_debug;
 
 fn debug(comptime format: []const u8, args: anytype) void {
     if (!debug_mode) return;
@@ -2062,7 +2063,7 @@ const Db = struct {
         };
     }
 
-    // TODO: support multi-layer interior pages
+    // TODO: support multi-layer interior pages (recursive)
     pub fn getRecord(self: *Db, table_root_page_index: u32, index: u32) ?SQLiteRecord {
         const root = self.readPage(table_root_page_index);
         const cell_count = root.header().getCellCount();
