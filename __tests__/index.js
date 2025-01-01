@@ -8,6 +8,7 @@ const BACKUP_DB_FILE = './backup.db';
 const BIG_DB_FILE = './example.db';
 let zql;
 let zqlResult = [];
+let sqlResult = [];
 let sql;
 
 async function getFile(name) {
@@ -19,28 +20,36 @@ async function getFile(name) {
   }
 }
 
+async function compareInternal(query) {
+  await zql.exec(query);
+  // console.log(zqlResult);
+  expect(zqlResult.length).toBe(sqlResult.length);
+  for (let i = 0; i < sqlResult.length; i++) {
+    const obj = sqlResult[i];
+    let j = 0;
+    for (const key in obj) {
+      const sqlItem = obj[key];
+      let zqlItem = zqlResult[i][j];
+      if (typeof zqlItem == 'bigint') {
+        zqlItem = Number(zqlItem);
+      }
+      expect(zqlItem).toBe(sqlItem);
+      j++;
+    }
+  }
+  // clear the array
+  zqlResult = [];
+}
+
 function compare(query) {
   test(query, async () => {
-    await zql.exec(query);
-    const sqlQuery = sql.prepare(query);
-    const sqlResult = sqlQuery.all();
-    // console.log(zqlResult);
-    expect(zqlResult.length).toBe(sqlResult.length);
-    for (let i = 0; i < sqlResult.length; i++) {
-      const obj = sqlResult[i];
-      let j = 0;
-      for (const key in obj) {
-        const sqlItem = obj[key];
-        let zqlItem = zqlResult[i][j];
-        if (typeof zqlItem == 'bigint') {
-          zqlItem = Number(zqlItem);
-        }
-        expect(zqlItem).toBe(sqlItem);
-        j++;
-      }
-    }
-    // clear the array
-    zqlResult = [];
+    await compareInternal(query);
+  });
+}
+
+function compareOnly(query) {
+  test.only(query, async () => {
+    await compareInternal(query);
   });
 }
 
@@ -56,10 +65,23 @@ async function load(dbFile) {
   console.log("Loaded");
 }
 
-describe('small db', () => {
-  beforeAll(async () => {
-    await load(SMALL_DB_FILE);
+async function describeDb(dbFile, callback) {
+  describe(dbFile, () => {
+    beforeAll(async () => {
+      await load(dbFile);
+    });
+    beforeEach(async () => {
+      const testName = expect.getState().currentTestName;
+      // testName also includes name of describe, so we need to remove that
+      const query = testName.substring(dbFile.length, testName.length);
+      const sqlQuery = sql.prepare(query);
+      sqlResult = sqlQuery.all();
+    });
+    callback();
   });
+}
+
+describeDb(SMALL_DB_FILE, () => {
   compare("select * from example;");
   compare("select id, name from example;");
   compare("select id from example;");
@@ -71,10 +93,7 @@ describe('small db', () => {
   compare("select * from example where name like '%l%'");
 });
 
-describe('med db', () => {
-  beforeAll(async () => {
-    await load(MED_DB_FILE);
-  });
+describeDb(MED_DB_FILE, () => {
   compare("select * from t1;");
   compare("select * from t1 where name like 'a%' or name = 'Louis' or name = 'Paul';");
   compare("select * from t1 where age < 18 or name like '%a%';");
@@ -84,17 +103,11 @@ describe('med db', () => {
   compare("select * from t1 where name like '%___';");
 });
 
-describe('backup db', () => {
-  beforeAll(async () => {
-    await load(BACKUP_DB_FILE);
-  });
+describeDb(BACKUP_DB_FILE, () => {
   compare("select * from test;");
 });
 
-describe('example db', () => {
-  beforeAll(async () => {
-    await load(BIG_DB_FILE);
-  });
+describeDb(BIG_DB_FILE, () => {
   compare("select * from records where name like '%a';");
   compare("select * from records where name like '%a%a';");
   compare("select * from records where name like 'a%a';");

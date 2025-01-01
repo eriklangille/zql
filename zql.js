@@ -129,7 +129,7 @@ class ZqlDb {
       : WebAssembly.instantiateStreaming(fetch('./zql.wasm'), { env: this.#env })
     );
 
-    console.log('WASM Loaded, instance:', results.instance);
+    // console.log('WASM Loaded, instance:', results.instance);
     this.#instance = results.instance;
     this.#dbMemoryAddress = results.instance.exports.malloc(BUFFER_SIZE);
   }
@@ -165,7 +165,7 @@ class ZqlDb {
     this.#dbFile = dbFile;
 
     const memory = new Uint8Array(this.#instance.exports.memory.buffer);
-    memory.set(dbFile.slice(0, SQLITE_HEADER_SIZE), this.#dbMemoryAddress);
+    memory.set(dbFile.slice(0, BUFFER_SIZE), this.#dbMemoryAddress);
     console.log("DB loaded");
   }
 }

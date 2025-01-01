@@ -2107,11 +2107,14 @@ const Db = struct {
         assert(page_end <= self.memory.max_allocated);
         // TODO: currently we are handling loading pages by loading up into the page address needed.
         // Instead, we could do a LRU cache of database pages (page index and location in memory)
+        // TODO: we want to pre-load a lot of memory instead of loading with every page miss. So we have a warm cache.
+        // this matters a lot for incremental select all statements
         if (self.memory.buffer.len < page_end) {
             debug("increasing buffer size", .{});
-            const length = page_start + self.page_size;
-            readBuffer(self.memory.buffer.ptr, 0, length);
-            const new_slice = self.memory.buffer.ptr[0..length]; // first page
+            // const length = page_start + self.page_size;
+            const length_max = self.memory.max_allocated;
+            readBuffer(self.memory.buffer.ptr, 0, length_max);
+            const new_slice = self.memory.buffer.ptr[0..length_max]; // first page
             self.memory.buffer = new_slice;
             debug("allocated", .{});
         }
@@ -3781,9 +3784,10 @@ const DbMemory = struct {
 
 // Runs the statement at query_buf pointer with the file partially loaded into memory at loaded_file_ptr.
 // The memory for the loaded_file_ptr is allocated with the exported malloc() fn.
-// By default, the first 100 bytes, which is the SQLite DB header size, is loaded into memory.
-// From the SQLite DB header, we can find the page size, and then load the first page into the given memory
+// By default the max buffer size is loaded into memory. The first 100 bytes is the SQLite DB header size.
+// From the SQLite DB header, we can find the page size.
 // size is the total allocated memory available to load pages
+// TODO: evict least recently used pages from memory if buffer size is smaller than database size and spill to disk
 export fn runStatementWithFile(loaded_file_ptr: ?*u8, size: usize) void {
     if (loaded_file_ptr == null) {
         debug("uh oh no pointer", .{});
@@ -3795,7 +3799,7 @@ export fn runStatementWithFile(loaded_file_ptr: ?*u8, size: usize) void {
     }
 
     const array_ptr: [*]u8 = @ptrCast(loaded_file_ptr);
-    const slice = array_ptr[0..sqlite_header_size];
+    const slice = array_ptr[0..size];
 
     const memory: DbMemory = .{ .buffer = slice, .max_allocated = size };
 
