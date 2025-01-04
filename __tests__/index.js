@@ -22,21 +22,28 @@ async function getFile(name) {
 
 async function compareInternal(query) {
   await zql.exec(query);
-  // console.log(zqlResult);
-  expect(zqlResult.length).toBe(sqlResult.length);
+  const expected = []
+  const actual = []
   for (let i = 0; i < sqlResult.length; i++) {
+    const actual_item = [];
+    const expected_item = [];
     const obj = sqlResult[i];
     let j = 0;
     for (const key in obj) {
       const sqlItem = obj[key];
+      if (zqlResult.length <= i) break;
       let zqlItem = zqlResult[i][j];
       if (typeof zqlItem == 'bigint') {
         zqlItem = Number(zqlItem);
       }
-      expect(zqlItem).toBe(sqlItem);
+      actual_item.push(zqlItem);
+      expected_item.push(sqlItem);
       j++;
     }
+    actual.push(actual_item);
+    expected.push(expected_item);
   }
+  expect(expected).toStrictEqual(actual);
   // clear the array
   zqlResult = [];
 }
@@ -97,10 +104,15 @@ describeDb(MED_DB_FILE, () => {
   compare("select * from t1;");
   compare("select * from t1 where id > 1;");
   // TODO: fix this test
-  // compareOnly("select * from t1 where id >= 1;");
+  compare("select * from t1 where id >= 1;");
   compare("select * from t1 where age >= 19;");
   compare("select * from t1 where id < 4;");
   compare("select * from t1 where name like 'a%' or name = 'Louis' or name = 'Paul';");
+  // And Or Tests
+  compare("select * from t1 where name like '%o%' and name = 'Louis' or name = 'Paul';");
+  compare("select * from t1 where id = 1 and name = 'Paul' or age = 21 and name = 'Ryan' or id = 3 and name = 'Michael' and age = 26;");
+  compare("select * from t1 where id > 4 or age = 21 and name = 'Ryan' or id = 3 and name = 'Michael' and age = 26;");
+
   compare("select * from t1 where age < 18 or name like '%a%';");
   compare("select * from t1 where age <= 18 or name like '%a%';");
   compare("select * from t1 where name like '_%';");

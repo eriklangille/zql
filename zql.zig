@@ -1455,7 +1455,7 @@ comptime {
     assert(@sizeOf(SQLiteBtHeader) == sqlite_bt_header_size);
 }
 
-// Enable debug printing to console by compiling with -Ddebug=true
+// Enable debug printing to console by compiling with -Ddebug
 const debug_mode: bool = config.is_debug;
 
 fn debug(comptime format: []const u8, args: anytype) void {
@@ -2762,65 +2762,43 @@ const TableMetadataReader = struct {
 const ConditionTraversal = struct {
     ip: *InternPool,
     stack: Stack,
-    leaf: InternPool.Index.Optional,
+    first: InternPool.Index.Optional,
 
     const StackItem = struct { eq: InternPool.Condition.Equality, index: InternPool.Index };
+    const Leaf = struct { eq: ?InternPool.Condition.Equality, index: InternPool.Index, parent: InternPool.Index.Optional };
     const Stack = ArrayListUnmanaged(StackItem);
 
-    pub fn init(intern_pool: *InternPool, alloc: Allocator, index: InternPool.Index.Optional) Allocator.Error!ConditionTraversal {
-        var stack: Stack = .{};
-        var cur = index;
-        var leaf: InternPool.Index.Optional = .none;
-        while (cur.unwrap()) |idx| {
-            const cond = intern_pool.indexToKey(idx).condition;
-            switch (cond.equality) {
-                .@"or", .@"and" => {
-                    // TODO: handle or/and that are not condition
-                    try stack.append(alloc, .{ .eq = cond.equality, .index = idx });
-                    cur = cond.lhs.condition;
-                },
-                else => {
-                    leaf = cur;
-                    cur = .none;
-                },
-            }
-        }
+    pub fn init(intern_pool: *InternPool, root: InternPool.Index.Optional) Allocator.Error!ConditionTraversal {
         return .{
             .ip = intern_pool,
-            .stack = stack,
-            .leaf = leaf,
+            .stack = .{},
+            .first = root,
         };
     }
 
-    // TODO: can probably be deleted. Instead, when we get to an and index, all previous none jumps can be changed to jump to that condition
-    pub fn nextRequiredCondition(self: *ConditionTraversal) InternPool.Index.Optional {
+    // TODO: can probably be deleted. Instead, when we get to an and index, all previous none or jumps can be changed to jump to that condition
+    pub fn nextRequiredCondition(self: *ConditionTraversal, eq: ?InternPool.Condition.Equality) InternPool.Index.Optional {
+        if (eq == null) return .none;
         if (self.stack.items.len == 0) return .none;
+        debug("nextRequiredCondition: eq: {}, stack: {any}", .{ eq.?, self.stack.items });
         var i: usize = self.stack.items.len - 1;
         while (i >= 0) : (i -= 1) {
             const item = self.stack.items[i];
-            if (item.eq == .@"and") return item.index.toOptional();
+            switch (eq.?) {
+                .@"or" => if (item.eq == .@"and") return item.index.toOptional(),
+                .@"and" => if (item.eq == .@"or") return item.index.toOptional(),
+                else => unreachable,
+            }
+            debug("nextRequiredCondition: item missed {}", .{item});
             if (i == 0) return .none;
         }
         return .none;
     }
 
-    pub fn equality(self: *ConditionTraversal) ?InternPool.Condition.Equality {
-        if (self.stack.items.len == 0) return null;
-        return self.stack.items[self.stack.items.len - 1].eq;
-    }
-
-    pub fn next(self: *ConditionTraversal, alloc: Allocator) Allocator.Error!InternPool.Index.Optional {
-        if (self.leaf != .none) {
-            defer self.leaf = .none;
-            return self.leaf;
-        }
-        if (self.stack.popOrNull()) |pop| {
-            const key = self.ip.indexToKey(pop.index).condition;
-            var cur: InternPool.Index.Optional = .none;
-            switch (key.rhs) {
-                .condition => |cond| cur = cond,
-                else => unreachable, // All items on the stack should have left and right conditions
-            }
+    pub fn next(self: *ConditionTraversal, alloc: Allocator) Allocator.Error!?Leaf {
+        if (self.first != .none) {
+            var cur = self.first;
+            self.first = .none;
             while (cur.unwrap()) |idx| {
                 const cond = self.ip.indexToKey(idx).condition;
                 switch (cond.equality) {
@@ -2829,11 +2807,40 @@ const ConditionTraversal = struct {
                         try self.stack.append(alloc, .{ .eq = cond.equality, .index = idx });
                         cur = cond.lhs.condition;
                     },
-                    else => return cur,
+                    else => {
+                        if (self.stack.items.len == 0) return .{ .eq = null, .index = idx, .parent = .none };
+                        const parent = self.stack.items[self.stack.items.len - 1];
+                        return .{ .eq = parent.eq, .index = idx, .parent = parent.index.toOptional() };
+                    },
                 }
             }
         }
-        return .none;
+        if (self.stack.popOrNull()) |pop| {
+            const key = self.ip.indexToKey(pop.index).condition;
+            var cur: InternPool.Index.Optional = .none;
+            switch (key.rhs) {
+                .condition => |cond| cur = cond,
+                else => unreachable, // All items on the stack should have left and right conditions
+            }
+            var prev = cur;
+            while (cur.unwrap()) |idx| {
+                const cond = self.ip.indexToKey(idx).condition;
+                switch (cond.equality) {
+                    .@"or", .@"and" => {
+                        // TODO: handle or/and that are not condition
+                        try self.stack.append(alloc, .{ .eq = cond.equality, .index = idx });
+                        prev = cur;
+                        cur = cond.lhs.condition;
+                    },
+                    else => return .{
+                        .eq = pop.eq,
+                        .index = idx,
+                        .parent = prev,
+                    },
+                }
+            }
+        }
+        return null;
     }
 
     pub fn deinit(self: *ConditionTraversal, alloc: Allocator) void {
@@ -2932,6 +2939,7 @@ const InstGen = struct {
     };
 
     pub fn dump(self: *InstGen) void {
+        if (!debug_mode) return;
         var i: u32 = 0;
         debug("--- Instructions ---", .{});
         while (i < self.ip.instructions.len) : (i += 1) {
@@ -2942,6 +2950,7 @@ const InstGen = struct {
 
     const Comparison = struct {
         inst: InternPool.InstIndex, // Instruction to modify
+        jump: InternPool.InstIndex, // Instruction to jump to
         cond: InternPool.Index, // Related condition index
         next_cond: InternPool.Index.Optional, // Determines jump instruction. Match with cond to get jump instruction
         eq: InternPool.Condition.Equality, // Determines next instruction jump behaviour
@@ -2977,15 +2986,18 @@ const InstGen = struct {
                 var columns_start = self.ip.peekInst();
 
                 if (where_clause != .none) {
-                    var traversal = try ConditionTraversal.init(self.ip, self.gpa, where_clause);
+                    var traversal = try ConditionTraversal.init(self.ip, where_clause);
                     defer traversal.deinit(self.gpa);
                     // TODO: tree traversal left and right side. When the left side is the id record (ge/gt) with and, then its seek loop for ea one
-                    while ((try traversal.next(self.gpa)).unwrap()) |cond_idx| {
+                    while (try traversal.next(self.gpa)) |item| {
+                        const cond_idx = item.index;
+                        const eq = item.eq;
                         const cond = self.ip.indexToKey(cond_idx).condition;
                         switch (cond.lhs) {
                             .func => {
                                 const func = self.ip.indexToKey(cond.lhs.func).function;
                                 // TODO: support functions with 0 arguments
+                                const first_inst = self.ip.peekInst();
                                 if (func.first_argument != .none) {
                                     const first_arg_register = reg_count.increment();
                                     var arg_index = func.first_argument;
@@ -3009,12 +3021,12 @@ const InstGen = struct {
                                         .first_argument_register = first_arg_register,
                                         .result_register = compare_reg,
                                     } });
-                                    // TODO: support or/and clauses like column
                                     try comparisons.append(self.gpa, .{
-                                        .eq = traversal.equality() orelse .@"or",
+                                        .eq = eq orelse .@"or",
+                                        .jump = first_inst,
                                         .inst = self.ip.peekInst(),
                                         .cond = cond_idx,
-                                        .next_cond = traversal.nextRequiredCondition(),
+                                        .next_cond = traversal.nextRequiredCondition(eq),
                                     });
                                     _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
                                 }
@@ -3023,7 +3035,7 @@ const InstGen = struct {
                                 const col = self.ip.indexToKey(cond.lhs.column).column;
                                 if (col.is_primary_key and col.tag == .integer and seek_optimization == .none) {
                                     primary_key_col = cond.lhs.column.toOptional();
-                                    if (traversal.equality() == null or (traversal.equality() == .@"and" and traversal.nextRequiredCondition() == .none)) {
+                                    if (eq == null or (eq == .@"and" and traversal.nextRequiredCondition(.@"and") == .none)) {
                                         switch (cond.equality) {
                                             .gt => seek_optimization = .gt,
                                             .gte => seek_optimization = .ge,
@@ -3035,6 +3047,7 @@ const InstGen = struct {
                                         continue;
                                     }
                                 }
+                                const first_inst = self.ip.peekInst();
                                 if (col.is_primary_key and col.tag == .integer) {
                                     _ = try self.addInst(.{ .row_id = .{
                                         .read_cursor = cursor,
@@ -3049,10 +3062,11 @@ const InstGen = struct {
                                 }
                                 reg_count = reg_count.increment();
                                 try comparisons.append(self.gpa, .{
-                                    .eq = traversal.equality() orelse .@"or",
+                                    .eq = eq orelse .@"or",
+                                    .jump = first_inst,
                                     .inst = self.ip.peekInst(),
                                     .cond = cond_idx,
-                                    .next_cond = traversal.nextRequiredCondition(),
+                                    .next_cond = traversal.nextRequiredCondition(eq),
                                 });
                                 switch (cond.equality) {
                                     .eq => {
@@ -3135,27 +3149,50 @@ const InstGen = struct {
                 while (i < slice.len) : (i += 1) {
                     const value = slice.get(i);
                     // TODO: add jump for ands to future instructions
+                    debug("Comparison Value: {}", .{value});
                     if (i == slice.len - 1) {
                         self.negate(value.inst);
                         self.replaceJump(value.inst, next_index);
                     } else {
                         switch (value.eq) {
                             .@"or" => {
-                                self.replaceJump(value.inst, columns_start);
+                                const next = slice.get(i + 1);
+                                const next_eq = next.eq;
+                                if (next_eq == .@"and") {
+                                    self.negate(value.inst);
+                                }
+                                var j: usize = i + 1;
+                                while (j < slice.len and slice.items(.eq)[j] != .@"or") : (j += 1) {}
+                                if (j == slice.len) {
+                                    self.replaceJump(value.inst, if (next_eq == .@"and") next_index else columns_start);
+                                } else {
+                                    self.replaceJump(value.inst, if (next_eq == .@"and") slice.items(.jump)[j] else columns_start);
+                                }
                             },
                             .@"and" => {
-                                self.negate(value.inst);
-                                self.replaceJump(value.inst, halt_index);
+                                const next = slice.get(i + 1);
+                                const next_eq = next.eq;
+                                if (next_eq == .@"and") {
+                                    self.negate(value.inst);
+                                }
+                                var j: usize = i + 1;
+                                while (j < slice.len and slice.items(.eq)[j] != .@"or") : (j += 1) {}
+                                if (j == slice.len) {
+                                    self.replaceJump(value.inst, if (next_eq == .@"and") next_index else columns_start);
+                                } else {
+                                    self.replaceJump(value.inst, if (next_eq == .@"and") slice.items(.jump)[j] else columns_start);
+                                }
                             },
                             else => unreachable,
                         }
                     }
                 }
                 if (where_clause != .none) {
-                    var traversal = try ConditionTraversal.init(self.ip, self.gpa, where_clause);
+                    var traversal = try ConditionTraversal.init(self.ip, where_clause);
                     var store_reg = compare_reg.increment();
                     defer traversal.deinit(self.gpa);
-                    while ((try traversal.next(self.gpa)).unwrap()) |cond_idx| {
+                    while (try traversal.next(self.gpa)) |leaf| {
+                        const cond_idx = leaf.index;
                         const cond = self.ip.indexToKey(cond_idx).condition;
                         const is_func = switch (cond.lhs) {
                             .func => true,
@@ -3178,14 +3215,17 @@ const InstGen = struct {
                                 }
                             }
                         } else {
-                            if (!is_func and primary_key_col != .none and cond.lhs.column.toOptional() == primary_key_col) {
+                            if (seek_optimization != .none) {
                                 _ = try self.addInst(.{ .integer = .{ .int = cond.rhs.int, .store_reg = store_reg } });
-                                _ = try self.ip.replaceInst(self.gpa, cursor_move_index, .{
-                                    .seek_gt = .{
-                                        .table = select.table,
-                                        .seek_key = store_reg,
-                                        .end_inst = halt_index,
-                                    },
+                                const seek: InternPool.Instruction.Seek = .{
+                                    .table = select.table,
+                                    .seek_key = store_reg,
+                                    .end_inst = halt_index,
+                                };
+                                _ = try self.ip.replaceInst(self.gpa, cursor_move_index, switch (cond.equality) {
+                                    .gt => .{ .seek_gt = seek },
+                                    .gte => .{ .seek_ge = seek },
+                                    else => unreachable,
                                 });
                             } else {
                                 switch (cond.rhs) {
