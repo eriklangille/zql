@@ -36,6 +36,7 @@ function benchQuery(query) {
 }
 
 benchQuery("select * from records;");
+benchQuery("select * from records where id > 9000;");
 benchQuery("select * from records where name like '%a';");
 
 await run();

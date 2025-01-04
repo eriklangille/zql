@@ -95,6 +95,11 @@ describeDb(SMALL_DB_FILE, () => {
 
 describeDb(MED_DB_FILE, () => {
   compare("select * from t1;");
+  compare("select * from t1 where id > 1;");
+  // TODO: fix this test
+  // compareOnly("select * from t1 where id >= 1;");
+  compare("select * from t1 where age >= 19;");
+  compare("select * from t1 where id < 4;");
   compare("select * from t1 where name like 'a%' or name = 'Louis' or name = 'Paul';");
   compare("select * from t1 where age < 18 or name like '%a%';");
   compare("select * from t1 where age <= 18 or name like '%a%';");
