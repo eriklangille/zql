@@ -77,6 +77,7 @@ const InternPool = struct {
         cursor,
         condition_or,
         condition_and,
+        condition_group,
         condition_lte_int,
         condition_lte_float,
         condition_lt_int,
@@ -797,6 +798,7 @@ const InternPool = struct {
         const Equality = enum(u8) {
             @"or",
             @"and",
+            group,
             eq,
             ne,
             lt,
@@ -876,6 +878,7 @@ const InternPool = struct {
                         switch (condition_data.equality) {
                             .@"and" => _ = try buffer.write("(AND "),
                             .@"or" => _ = try buffer.write("(OR "),
+                            .group => _ = try buffer.write("("),
                             else => unreachable, // Not a condition equality
                         }
                         switch (condition_data.rhs) {
@@ -925,6 +928,7 @@ const InternPool = struct {
         return len;
     }
 
+    // Replaces values at index to index + item field count. All fields in item must be size u32.
     fn insertExtra(ip: *InternPool, index: u32, item: anytype) void {
         // const fields = @typeInfo(@TypeOf(item)).@"struct".fields;
         const fields = @typeInfo(@TypeOf(item)).Struct.fields;
@@ -966,6 +970,7 @@ const InternPool = struct {
         switch (item.tag) {
             .condition_or,
             .condition_and,
+            .condition_group,
             .condition_lte_int,
             .condition_lte_float,
             .condition_lt_int,
@@ -1086,6 +1091,7 @@ const InternPool = struct {
                     },
                     .@"or" => .condition_or,
                     .@"and" => .condition_and,
+                    .group => .condition_group,
                 };
                 if (item == null) {
                     item = .{ .tag = tag, .data = extra_len };
@@ -1174,6 +1180,7 @@ const InternPool = struct {
         switch (item.tag) {
             .condition_or,
             .condition_and,
+            .condition_group,
             .condition_lte_int,
             .condition_lte_float,
             .condition_lt_int,
@@ -1205,6 +1212,7 @@ const InternPool = struct {
                 const result: Condition = switch (item.tag) {
                     .condition_or => .{ .equality = .@"or", .lhs = .{ .condition = lhs_index.toOptional() }, .rhs = .{ .condition = @enumFromInt(rhs.a) } },
                     .condition_and => .{ .equality = .@"and", .lhs = .{ .condition = lhs_index.toOptional() }, .rhs = .{ .condition = @enumFromInt(rhs.a) } },
+                    .condition_group => .{ .equality = .@"and", .lhs = .{ .condition = lhs_index.toOptional() }, .rhs = .{ .condition = .none } },
                     .condition_lte_int => .{ .equality = .lte, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
                     .condition_lt_int => .{ .equality = .lt, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
                     .condition_gte_int => .{ .equality = .gte, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
@@ -1764,6 +1772,7 @@ const Tokenizer = struct {
                         break;
                     },
                     ' ' => {
+                        // TODO: accept tokens other than ' '
                         token.type = TokenType.gt;
                         break;
                     },
@@ -2534,8 +2543,11 @@ const ASTGen = struct {
         var last_element_andor = false;
         var is_like = false;
         var expr_index: InternPool.Index.Optional = .none;
-        var expr_prev_index: InternPool.Index.Optional = .none;
-        var expr_first_index: InternPool.Index.Optional = .none;
+
+        var open_roots: ArrayListUnmanaged(InternPool.Index.Optional) = .{};
+        defer open_roots.deinit(self.gpa);
+        try open_roots.append(self.gpa, .none);
+
         debug("buildWhereClause", .{});
         while (self.index < self.token_list.len) : (self.index += 1) {
             const token = self.token_list.get(self.index);
@@ -2555,10 +2567,43 @@ const ASTGen = struct {
                         }
                         state = .where_equality;
                     },
+                    .rparen => {
+                        if (open_roots.items.len == 1) break; // Too many closing brackets. Invalid
+                        const last = open_roots.pop();
+                        if (last != .none) {
+                            // Create new group from last open root and add it to the previous root
+                            const new_index = try self.ip.put(self.gpa, .{ .condition = .{
+                                .equality = .group,
+                                .rhs = .{ .condition = .none },
+                                .lhs = .{ .condition = last },
+                            } });
+                            const new_index_opt = new_index.toOptional();
+                            const new_root_index_opt = open_roots.items[open_roots.items.len - 1];
+                            if (new_root_index_opt.unwrap()) |new_root_index| {
+                                var cur = self.ip.indexToKey(new_root_index).condition;
+                                switch (cur.equality) {
+                                    .@"and", .@"or" => {},
+                                    else => break, // Invalid syntax
+                                }
+                                if (cur.lhs.condition == .none) cur.lhs.condition = new_index_opt else cur.rhs.condition = new_index_opt;
+                                debug("rparen update index: {}", .{cur});
+                                try self.ip.update(self.gpa, new_root_index, .{ .condition = cur });
+                            } else {
+                                open_roots.items[open_roots.items.len - 1] = new_index_opt;
+                            }
+                        }
+                    },
+                    .lparen => {
+                        if (open_roots.items[0] != .none) {
+                            if (!last_element_andor) break; // open bracket only after and/or. TODO: other ignorable brackets such as (col_name)
+                            try open_roots.append(self.gpa, .none);
+                        }
+                    },
                     .keyword_and, .keyword_or => {
                         if (last_element_andor or expr_index.unwrap() == null) {
                             break;
                         }
+                        const expr_first_index = open_roots.items[open_roots.items.len - 1];
                         const new_index = try self.ip.put(self.gpa, .{
                             .condition = .{
                                 .rhs = .{ .condition = switch (expr_first_index) {
@@ -2578,13 +2623,13 @@ const ASTGen = struct {
                         });
                         expr_index = new_index.toOptional();
                         last_element_andor = true;
-                        expr_first_index = expr_index;
+                        open_roots.items[open_roots.items.len - 1] = expr_index;
                     },
                     else => {
                         if (last_element_andor) {
                             break;
                         }
-                        if (expr_first_index.unwrap()) |index| {
+                        if (open_roots.items[0].unwrap()) |index| {
                             return index.toOptional();
                         }
                         break;
@@ -2613,7 +2658,6 @@ const ASTGen = struct {
                             const string_literal = ASTGen.getTokenSource(self.source, token);
                             debug("where_rhs literal: {s}", .{string_literal});
                             const value = try InternPool.NullTerminatedString.initAddSentinel(self.gpa, string_literal[1 .. string_literal.len - 1], self.ip);
-                            expr_prev_index = expr_index;
                             if (is_like) {
                                 const match_arg = try self.ip.put(self.gpa, .{ .argument = .{
                                     .expression = .{
@@ -2662,7 +2706,6 @@ const ASTGen = struct {
                         .integer => {
                             const slice = ASTGen.getTokenSource(self.source, token);
                             const value = fmt.parseInt(i64, slice, 10) catch break;
-                            expr_prev_index = expr_index;
                             const new_index = try self.ip.put(self.gpa, .{
                                 .condition = .{
                                     .lhs = .{ .column = col_index.unwrap().? },
@@ -2683,12 +2726,14 @@ const ASTGen = struct {
                         else => break, // TODO: support real (float)
                     }
                     last_element_andor = false;
-                    if (expr_first_index.unwrap()) |expr| {
+                    if (open_roots.items[open_roots.items.len - 1].unwrap()) |expr| {
                         var key = self.ip.indexToKey(expr);
+                        debug("where rhs: {}", .{key});
                         key.condition.rhs = .{ .condition = expr_index.unwrap().?.toOptional() };
+                        debug("where rhs update: {}", .{key});
                         try self.ip.update(self.gpa, expr, key);
                     } else {
-                        expr_first_index = expr_index;
+                        open_roots.items[open_roots.items.len - 1] = expr_index;
                     }
                     equality = null;
                     col_index = InternPool.Index.Optional.none;
@@ -2763,9 +2808,10 @@ const ConditionTraversal = struct {
     ip: *InternPool,
     stack: Stack,
     first: InternPool.Index.Optional,
+    depth: u32,
 
     const StackItem = struct { eq: InternPool.Condition.Equality, index: InternPool.Index };
-    const Leaf = struct { eq: ?InternPool.Condition.Equality, index: InternPool.Index, parent: InternPool.Index.Optional };
+    const Leaf = struct { eq: ?InternPool.Condition.Equality, index: InternPool.Index, depth: u32 };
     const Stack = ArrayListUnmanaged(StackItem);
 
     pub fn init(intern_pool: *InternPool, root: InternPool.Index.Optional) Allocator.Error!ConditionTraversal {
@@ -2773,6 +2819,7 @@ const ConditionTraversal = struct {
             .ip = intern_pool,
             .stack = .{},
             .first = root,
+            .depth = 0,
         };
     }
 
@@ -2802,21 +2849,28 @@ const ConditionTraversal = struct {
             while (cur.unwrap()) |idx| {
                 const cond = self.ip.indexToKey(idx).condition;
                 switch (cond.equality) {
-                    .@"or", .@"and" => {
+                    .@"or", .@"and", .group => {
                         // TODO: handle or/and that are not condition
                         try self.stack.append(alloc, .{ .eq = cond.equality, .index = idx });
                         cur = cond.lhs.condition;
+                        if (cond.equality == .group) {
+                            self.depth += 1;
+                        }
                     },
                     else => {
-                        if (self.stack.items.len == 0) return .{ .eq = null, .index = idx, .parent = .none };
+                        if (self.stack.items.len == 0) return .{ .eq = null, .index = idx, .depth = self.depth };
                         const parent = self.stack.items[self.stack.items.len - 1];
-                        return .{ .eq = parent.eq, .index = idx, .parent = parent.index.toOptional() };
+                        return .{ .eq = parent.eq, .index = idx, .depth = self.depth };
                     },
                 }
             }
         }
-        if (self.stack.popOrNull()) |pop| {
+        while (self.stack.popOrNull()) |pop| {
             const key = self.ip.indexToKey(pop.index).condition;
+            if (key.equality == .group) {
+                self.depth -= 1;
+                continue;
+            }
             var cur: InternPool.Index.Optional = .none;
             switch (key.rhs) {
                 .condition => |cond| cur = cond,
@@ -2831,11 +2885,14 @@ const ConditionTraversal = struct {
                         try self.stack.append(alloc, .{ .eq = cond.equality, .index = idx });
                         prev = cur;
                         cur = cond.lhs.condition;
+                        if (cond.equality == .group) {
+                            self.depth += 1;
+                        }
                     },
                     else => return .{
                         .eq = pop.eq,
                         .index = idx,
-                        .parent = prev,
+                        .depth = self.depth,
                     },
                 }
             }
@@ -2951,9 +3008,8 @@ const InstGen = struct {
     const Comparison = struct {
         inst: InternPool.InstIndex, // Instruction to modify
         jump: InternPool.InstIndex, // Instruction to jump to
-        cond: InternPool.Index, // Related condition index
-        next_cond: InternPool.Index.Optional, // Determines jump instruction. Match with cond to get jump instruction
         eq: InternPool.Condition.Equality, // Determines next instruction jump behaviour
+        depth: u32, // Bracket depth, can only jump to instructions with a smaller depth
     };
 
     const ComparisonList = MultiArrayList(Comparison);
@@ -2992,6 +3048,7 @@ const InstGen = struct {
                     while (try traversal.next(self.gpa)) |item| {
                         const cond_idx = item.index;
                         const eq = item.eq;
+                        const depth = item.depth;
                         const cond = self.ip.indexToKey(cond_idx).condition;
                         switch (cond.lhs) {
                             .func => {
@@ -3025,8 +3082,7 @@ const InstGen = struct {
                                         .eq = eq orelse .@"or",
                                         .jump = first_inst,
                                         .inst = self.ip.peekInst(),
-                                        .cond = cond_idx,
-                                        .next_cond = traversal.nextRequiredCondition(eq),
+                                        .depth = depth,
                                     });
                                     _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
                                 }
@@ -3065,8 +3121,7 @@ const InstGen = struct {
                                     .eq = eq orelse .@"or",
                                     .jump = first_inst,
                                     .inst = self.ip.peekInst(),
-                                    .cond = cond_idx,
-                                    .next_cond = traversal.nextRequiredCondition(eq),
+                                    .depth = depth,
                                 });
                                 switch (cond.equality) {
                                     .eq => {
@@ -3147,40 +3202,38 @@ const InstGen = struct {
                 const slice = comparisons.slice();
                 var i: usize = 0;
                 while (i < slice.len) : (i += 1) {
-                    const value = slice.get(i);
-                    // TODO: add jump for ands to future instructions
-                    debug("Comparison Value: {}", .{value});
+                    const inst = slice.items(.inst)[i];
+                    const eq = slice.items(.eq)[i];
+                    const depth = slice.items(.depth)[i];
+                    debug("comparisons: inst {}, eq {}, depth {d}", .{ inst, eq, depth });
                     if (i == slice.len - 1) {
-                        self.negate(value.inst);
-                        self.replaceJump(value.inst, next_index);
+                        self.negate(inst);
+                        self.replaceJump(inst, next_index);
                     } else {
-                        switch (value.eq) {
+                        const next_eq = slice.items(.eq)[i + 1];
+                        switch (eq) {
                             .@"or" => {
-                                const next = slice.get(i + 1);
-                                const next_eq = next.eq;
                                 if (next_eq == .@"and") {
-                                    self.negate(value.inst);
+                                    self.negate(inst);
                                 }
                                 var j: usize = i + 1;
-                                while (j < slice.len and slice.items(.eq)[j] != .@"or") : (j += 1) {}
+                                while (j < slice.len and (slice.items(.eq)[j] != .@"or" or slice.items(.depth)[j] < depth)) : (j += 1) {}
                                 if (j == slice.len) {
-                                    self.replaceJump(value.inst, if (next_eq == .@"and") next_index else columns_start);
+                                    self.replaceJump(inst, if (next_eq == .@"and") next_index else columns_start);
                                 } else {
-                                    self.replaceJump(value.inst, if (next_eq == .@"and") slice.items(.jump)[j] else columns_start);
+                                    self.replaceJump(inst, if (next_eq == .@"and") slice.items(.jump)[j] else columns_start);
                                 }
                             },
                             .@"and" => {
-                                const next = slice.get(i + 1);
-                                const next_eq = next.eq;
                                 if (next_eq == .@"and") {
-                                    self.negate(value.inst);
+                                    self.negate(inst);
                                 }
                                 var j: usize = i + 1;
-                                while (j < slice.len and slice.items(.eq)[j] != .@"or") : (j += 1) {}
+                                while (j < slice.len and (slice.items(.eq)[j] != .@"or" or slice.items(.depth)[j] < depth)) : (j += 1) {}
                                 if (j == slice.len) {
-                                    self.replaceJump(value.inst, if (next_eq == .@"and") next_index else columns_start);
+                                    self.replaceJump(inst, if (next_eq == .@"and") next_index else columns_start);
                                 } else {
-                                    self.replaceJump(value.inst, if (next_eq == .@"and") slice.items(.jump)[j] else columns_start);
+                                    self.replaceJump(inst, if (next_eq == .@"and") slice.items(.jump)[j] else columns_start);
                                 }
                             },
                             else => unreachable,
