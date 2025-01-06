@@ -43,7 +43,7 @@ async function compareInternal(query) {
     actual.push(actual_item);
     expected.push(expected_item);
   }
-  expect(expected).toStrictEqual(actual);
+  expect(actual).toStrictEqual(expected);
   // clear the array
   zqlResult = [];
 }
@@ -78,6 +78,9 @@ async function describeDb(dbFile, callback) {
       await load(dbFile);
     });
     beforeEach(async () => {
+      // Clear any lingering results from past failures
+      sqlResult = [];
+      zqlResult = [];
       const testName = expect.getState().currentTestName;
       // testName also includes name of describe, so we need to remove that
       const query = testName.substring(dbFile.length, testName.length);
@@ -103,7 +106,6 @@ describeDb(SMALL_DB_FILE, () => {
 describeDb(MED_DB_FILE, () => {
   compare("select * from t1;");
   compare("select * from t1 where id > 1;");
-  // TODO: fix this test
   compare("select * from t1 where id >= 1;");
   compare("select * from t1 where age >= 19;");
   compare("select * from t1 where id < 4;");
