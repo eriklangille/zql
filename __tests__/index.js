@@ -116,7 +116,10 @@ describeDb(MED_DB_FILE, () => {
   compare("select * from t1 where id > 4 or age = 21 and name = 'Ryan' or id = 3 and name = 'Michael' and age = 26;");
 
   // Brackets
+  compare("select * from t1 where (id > 4) or (age = 21) and (name = 'Ryan') or (id = 3 and name = 'Michael') and age = 26;");
   compare("select * from t1 where id = 1 and name = 'Paul' or age = 21 and (name = 'Ryan' or id = 3) and name = 'Michael' and age = 26;");
+  compare("select * from t1 where (id = 1 and name = 'Paul') or age = 21 and (name = 'Ryan' or id = 3) and (name = 'Michael' and age = 26);");
+  compare("select * from t1 where id = 1 and name = 'Paul' or age = 21 and ((name = 'Ryan' or id = 3) and name = 'Michael') and age = 26;");
 
   compare("select * from t1 where age < 18 or name like '%a%';");
   compare("select * from t1 where age <= 18 or name like '%a%';");

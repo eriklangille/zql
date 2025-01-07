@@ -829,6 +829,7 @@ const InternPool = struct {
     };
 
     pub fn dump(ip: *InternPool, index: Index.Optional) void {
+        if (!debug_mode) return;
         const buf: [512]u8 = undefined;
         var fbs = io.fixedBufferStream(@constCast(&buf));
         _ = ip.bufWrite(@constCast(&fbs), index) catch null;
@@ -836,6 +837,7 @@ const InternPool = struct {
         debug("{s}", .{slice});
     }
 
+    // Since this is only used for debugging, we permit the use of recursion to make the code more readable/easier to implement
     fn bufWrite(ip: *InternPool, buffer: *FixedBufferStream([]u8), index: Index.Optional) anyerror!void {
         if (index.unwrap() == null) {
             _ = try buffer.write("NULL");
@@ -875,17 +877,25 @@ const InternPool = struct {
                         _ = try buffer.write(")");
                     },
                     .condition => |condition_lhs| {
+                        var group: bool = false;
                         switch (condition_data.equality) {
                             .@"and" => _ = try buffer.write("(AND "),
                             .@"or" => _ = try buffer.write("(OR "),
-                            .group => _ = try buffer.write("("),
+                            .group => {
+                                _ = try buffer.write("(");
+                                group = true;
+                            },
                             else => unreachable, // Not a condition equality
                         }
                         switch (condition_data.rhs) {
                             .condition => |condition_rhs| {
                                 try ip.bufWrite(buffer, condition_lhs);
-                                _ = try buffer.write(", ");
-                                try ip.bufWrite(buffer, condition_rhs);
+                                if (!group) {
+                                    _ = try buffer.write(", ");
+                                    try ip.bufWrite(buffer, condition_rhs);
+                                } else {
+                                    group = false;
+                                }
                                 _ = try buffer.write(")");
                             },
                             else => unreachable, // Can only compare condition to another condition
@@ -1212,7 +1222,7 @@ const InternPool = struct {
                 const result: Condition = switch (item.tag) {
                     .condition_or => .{ .equality = .@"or", .lhs = .{ .condition = lhs_index.toOptional() }, .rhs = .{ .condition = @enumFromInt(rhs.a) } },
                     .condition_and => .{ .equality = .@"and", .lhs = .{ .condition = lhs_index.toOptional() }, .rhs = .{ .condition = @enumFromInt(rhs.a) } },
-                    .condition_group => .{ .equality = .@"and", .lhs = .{ .condition = lhs_index.toOptional() }, .rhs = .{ .condition = .none } },
+                    .condition_group => .{ .equality = .group, .lhs = .{ .condition = lhs_index.toOptional() }, .rhs = .{ .condition = .none } },
                     .condition_lte_int => .{ .equality = .lte, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
                     .condition_lt_int => .{ .equality = .lt, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
                     .condition_gte_int => .{ .equality = .gte, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
@@ -2570,13 +2580,20 @@ const ASTGen = struct {
                     .rparen => {
                         if (open_roots.items.len == 1) break; // Too many closing brackets. Invalid
                         const last = open_roots.pop();
-                        if (last != .none) {
+                        if (last.unwrap()) |last_idx| {
                             // Create new group from last open root and add it to the previous root
-                            const new_index = try self.ip.put(self.gpa, .{ .condition = .{
-                                .equality = .group,
-                                .rhs = .{ .condition = .none },
-                                .lhs = .{ .condition = last },
-                            } });
+                            const last_cond = self.ip.indexToKey(last_idx).condition;
+                            const new_index = switch (last_cond.equality) {
+                                .@"and", .@"or", .group => try self.ip.put(self.gpa, .{
+                                    .condition = .{
+                                        .equality = .group,
+                                        .rhs = .{ .condition = .none },
+                                        .lhs = .{ .condition = last },
+                                    },
+                                }),
+                                // If inside the brackets there is only one condition, we can ignore the brackets
+                                else => last_idx,
+                            };
                             const new_index_opt = new_index.toOptional();
                             const new_root_index_opt = open_roots.items[open_roots.items.len - 1];
                             if (new_root_index_opt.unwrap()) |new_root_index| {
@@ -2594,13 +2611,11 @@ const ASTGen = struct {
                         }
                     },
                     .lparen => {
-                        if (open_roots.items[0] != .none) {
-                            if (!last_element_andor) break; // open bracket only after and/or. TODO: other ignorable brackets such as (col_name)
-                            try open_roots.append(self.gpa, .none);
-                        }
+                        // if (!last_element_andor and expr_index != .none) break; // open bracket only after and/or. TODO: other ignorable brackets such as (col_name)
+                        try open_roots.append(self.gpa, .none);
                     },
                     .keyword_and, .keyword_or => {
-                        if (last_element_andor or expr_index.unwrap() == null) {
+                        if (last_element_andor or expr_index == .none) {
                             break;
                         }
                         const expr_first_index = open_roots.items[open_roots.items.len - 1];
@@ -2880,7 +2895,7 @@ const ConditionTraversal = struct {
             while (cur.unwrap()) |idx| {
                 const cond = self.ip.indexToKey(idx).condition;
                 switch (cond.equality) {
-                    .@"or", .@"and" => {
+                    .@"or", .@"and", .group => {
                         // TODO: handle or/and that are not condition
                         try self.stack.append(alloc, .{ .eq = cond.equality, .index = idx });
                         prev = cur;
