@@ -1693,7 +1693,7 @@ const Tokenizer = struct {
                     0 => {
                         break;
                     },
-                    'a'...'z', 'A'...'Z' => {
+                    'a'...'z', 'A'...'Z', '_' => {
                         state = .identifier;
                     },
                     '0'...'9' => {
@@ -1755,7 +1755,7 @@ const Tokenizer = struct {
                     },
                 },
                 .identifier => switch (c) {
-                    'a'...'z', 'A'...'Z', '0'...'9' => {},
+                    'a'...'z', 'A'...'Z', '0'...'9', '_' => {},
                     else => {
                         if (Token.getKeyword(self.buffer[token.location.start..self.index])) |token_type| {
                             token.type = token_type;
@@ -1929,7 +1929,8 @@ const SQLiteRecord = struct {
     // TODO: rewrite. SQLiteColumn can overflow over multiple database pages
     // we need to handle that. Typically the record header is all stored in the payload of one cell, but the body can overflow to other pages
     pub fn next(self: *SQLiteRecord) ?SQLiteColumn {
-        if (self.cursor >= self.size) return null;
+        // Cursor can eq size and it still return a value if the value takes up 0 bytes (for e.g., 1, which is stored in the header)
+        if (self.cursor > self.size) return null;
         if (self.header_cursor >= self.header_size) {
             self.header_cursor = 0;
         }
@@ -1937,6 +1938,8 @@ const SQLiteRecord = struct {
         self.header_cursor += getVarint(self.buffer.ptr + self.header_cursor, &header_val);
 
         const size: u32 = @truncate(SQLiteColumn.size(header_val));
+
+        if (self.cursor + size > self.size) return null;
 
         const result = SQLiteColumn.from(
             header_val,
@@ -3727,6 +3730,7 @@ const Vm = struct {
                     }
                     col_value = record.?.next();
                     col_count += 1;
+                    debug("col_value: {?}", .{col_value});
                     assert(col_value != null);
                     try self.updateReg(store_reg, Register.fromColumn(col_value.?));
                     col_value = record.?.next();

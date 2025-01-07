@@ -105,6 +105,8 @@ describeDb(SMALL_DB_FILE, () => {
 
 describeDb(MED_DB_FILE, () => {
   compare("select * from t1;");
+  compare("select * from t2;");
+  compare("select * from t3;");
   compare("select * from t1 where id > 1;");
   compare("select * from t1 where id >= 1;");
   compare("select * from t1 where age >= 19;");
