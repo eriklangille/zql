@@ -3,15 +3,10 @@ const config = @import("config");
 const Allocator = std.mem.Allocator;
 const ArrayListUnmanaged = std.ArrayListUnmanaged;
 const assert = std.debug.assert;
-const eql = std.mem.eql;
 const eqlLenIgnoreCase = std.static_string_map.eqlAsciiIgnoreCase;
 const FixedBufferStream = std.io.FixedBufferStream;
 const fmt = std.fmt;
-const heap = std.heap;
-const io = std.io;
-const maxInt = std.math.maxInt;
 const MultiArrayList = std.MultiArrayList;
-const panic = std.debug.panic;
 const StaticStringMap = std.StaticStringMapWithEql;
 
 // (arrayPointer: i32, length: i32)
@@ -22,7 +17,7 @@ extern fn readBuffer(ptr: [*]const u8, offset: usize, len: usize) void;
 extern fn renderRow(ptr: [*]const u8, len: usize) void;
 
 export fn malloc(size: usize) ?*u8 {
-    const page_allocator = heap.page_allocator;
+    const page_allocator = std.heap.page_allocator;
     const mem = page_allocator.alloc(u8, size) catch null;
     if (mem == null) {
         return null;
@@ -143,7 +138,7 @@ const InternPool = struct {
             return @enumFromInt(@intFromEnum(dep));
         }
         pub const Optional = enum(u32) {
-            none = maxInt(u32),
+            none = std.math.maxInt(u32),
             _,
             pub fn unwrap(opt: Optional) ?InternPool.Index {
                 return switch (opt) {
@@ -309,7 +304,7 @@ const InternPool = struct {
         while (col_index_optional.unwrap()) |col_index| {
             const col_key = ip.indexToKey(col_index).column;
             debug("columnFromName: {s} == {s}", .{ col_key.name.slice(ip), col_name });
-            if (eql(u8, col_key.name.slice(ip), col_name)) {
+            if (std.mem.eql(u8, col_key.name.slice(ip), col_name)) {
                 return .{ .index = col_index, .count = col_count };
             }
             col_count += 1;
@@ -831,7 +826,7 @@ const InternPool = struct {
     pub fn dump(ip: *InternPool, index: Index.Optional) void {
         if (!debug_mode) return;
         const buf: [512]u8 = undefined;
-        var fbs = io.fixedBufferStream(@constCast(&buf));
+        var fbs = std.io.fixedBufferStream(@constCast(&buf));
         _ = ip.bufWrite(@constCast(&fbs), index) catch null;
         const slice = fbs.getWritten();
         debug("{s}", .{slice});
@@ -1532,7 +1527,7 @@ fn getVarint(ptr1: [*]u8, result: *u64) u8 {
 
     // TODO: values up to 9 bytes
     debug("uh oh I pwanic -><- uwu ", .{});
-    panic("uh oh I pwanic -><- uwu ", .{});
+    std.debug.panic("uh oh I pwanic -><- uwu ", .{});
 }
 
 const TokenType = enum {
@@ -2170,7 +2165,7 @@ const Db = struct {
             if (record.next()) |name_col| {
                 if (name_col != SQLiteColumn.text) return Error.InvalidBinary;
                 debug("record text: {s}", .{name_col.text});
-                if (eql(u8, table_name, name_col.text)) {
+                if (std.mem.eql(u8, table_name, name_col.text)) {
                     if (record.next()) |index_col| {
                         const index_int = index_col.getInt();
                         if (index_int == null) return Error.InvalidBinary;
@@ -2434,7 +2429,7 @@ const ASTGen = struct {
         var state: State = .select_first;
         var columns: u64 = 0;
         var table: ?InternPool.Index = null;
-        var column_list_index: u32 = maxInt(u32);
+        var column_list_index: u32 = std.math.maxInt(u32);
         var processed_columns: bool = false;
         var where: InternPool.Index.Optional = InternPool.Index.Optional.none;
         while (self.index < self.token_list.len) : (self.index += 1) {
@@ -2452,7 +2447,7 @@ const ASTGen = struct {
                             state = .from;
                         },
                         .word => {
-                            if (column_list_index == maxInt(u32)) {
+                            if (column_list_index == std.math.maxInt(u32)) {
                                 column_list_index = self.index;
                             }
                         },
@@ -3408,14 +3403,14 @@ const Register = union(enum) {
                 .none => true,
                 .int => self.int == other.int,
                 .float => self.float == other.float,
-                .str => eql(u8, self.str, other.str),
-                .string => eql(u8, self.string.string.slice(self.string.len, ip), other.string.string.slice(self.string.len, ip)),
+                .str => std.mem.eql(u8, self.str, other.str),
+                .string => std.mem.eql(u8, self.string.string.slice(self.string.len, ip), other.string.string.slice(self.string.len, ip)),
                 .binary => unreachable, // TODO: implement
             };
         } else if (self.tag() == .string and other.tag() == .str) {
-            return eql(u8, self.string.string.slice(self.string.len, ip), other.str);
+            return std.mem.eql(u8, self.string.string.slice(self.string.len, ip), other.str);
         } else if (self.tag() == .str and other.tag() == .string) {
-            return eql(u8, self.str, other.string.string.slice(other.string.len, ip));
+            return std.mem.eql(u8, self.str, other.string.string.slice(other.string.len, ip));
         }
         return false;
     }
@@ -3911,7 +3906,7 @@ const TokenList = MultiArrayList(MinimizedToken);
 
 fn parseStatement(str: [:0]u8, db_memory: DbMemory) Error!void {
     var tokenizer = Tokenizer.from(str, 0);
-    var fixed_alloc = heap.FixedBufferAllocator.init(&memory_buf);
+    var fixed_alloc = std.heap.FixedBufferAllocator.init(&memory_buf);
 
     var tokens = TokenList{};
     defer tokens.deinit(fixed_alloc.allocator());
@@ -3983,6 +3978,6 @@ export fn getStatementAddr() [*]u8 {
 }
 
 // export fn free(ptr: *u8) void {
-//     const page_allocator = heap.page_allocator;
+//     const page_allocator = std.heap.page_allocator;
 //     page_allocator.free(@as([*]u8, @ptrCast(ptr)));
 // }
