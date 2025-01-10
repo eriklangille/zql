@@ -30,6 +30,17 @@ fn valFromSlice(comptime T: type, slice: []u8) T {
     return result.*;
 }
 
+const PackedU32 = packed struct {
+    a: u8,
+    b: u8,
+    c: u8,
+    d: u8,
+
+    pub fn unwrap(self: PackedU32) u32 {
+        return @bitCast(self);
+    }
+};
+
 const PackedU64 = packed struct {
     a: u32,
     b: u32,
@@ -70,24 +81,8 @@ const InternPool = struct {
         table,
         column,
         cursor,
-        condition_or,
-        condition_and,
-        condition_group,
-        condition_lte_int,
-        condition_lte_float,
-        condition_lt_int,
-        condition_lt_float,
-        condition_gt_int,
-        condition_gt_float,
-        condition_gte_int,
-        condition_gte_float,
-        condition_eq_int,
-        condition_eq_float,
-        condition_eq_string,
-        condition_eq_func,
-        condition_ne_int,
-        condition_ne_float,
-        condition_ne_string,
+        condition,
+        condition_big,
         function,
         argument_string,
         argument_int,
@@ -771,24 +766,84 @@ const InternPool = struct {
     const Expression = union(enum) {
         condition: Index.Optional,
         column: Index.Optional,
+        func: Index.Optional,
         string: NullTerminatedString,
         int: i64,
         float: f64,
+
+        const Repr = enum(u8) {
+            condition,
+            column,
+            func,
+            string,
+            int,
+            float,
+        };
+
+        pub fn is_64(self: Expression) bool {
+            return switch (self) {
+                .int => |val| val > std.math.maxInt(u32),
+                .float => true,
+                else => false,
+            };
+        }
+
+        pub fn pack_64(self: Expression) PackedU64 {
+            return switch (self) {
+                .int => |val| PackedU64.init(val),
+                .float => |val| PackedU64.init(val),
+                .string => |val| .{ .a = @intFromEnum(val), .b = 0 },
+                .condition, .column, .func => |val| .{ .a = @intFromEnum(val), .b = 0 },
+            };
+        }
+
+        pub fn pack_32(self: Expression) u32 {
+            return switch (self) {
+                .int => |val| @bitCast(@as(i32, @truncate(val))),
+                .float => unreachable, // Can only use 64 bit to pack floats
+                .string => |val| @intFromEnum(val),
+                .condition, .column, .func => |val| @intFromEnum(val),
+            };
+        }
+
+        pub fn unpack_64(repr: Repr, val: PackedU64) Expression {
+            return switch (repr) {
+                .int => .{ .int = @bitCast(val.unwrap()) },
+                .float => .{ .float = @bitCast(val.unwrap()) },
+                .string => .{ .string = @enumFromInt(val.a) },
+                .condition => .{ .condition = @enumFromInt(val.a) },
+                .column => .{ .column = @enumFromInt(val.a) },
+                .func => .{ .func = @enumFromInt(val.a) },
+            };
+        }
+
+        pub fn unpack_32(repr: Repr, val: u32) Expression {
+            return switch (repr) {
+                .int => .{ .int = val },
+                .float => unreachable,
+                .string => .{ .string = @enumFromInt(val) },
+                .condition => .{ .condition = @enumFromInt(val) },
+                .column => .{ .column = @enumFromInt(val) },
+                .func => .{ .func = @enumFromInt(val) },
+            };
+        }
+
+        pub fn tag(self: Expression) Repr {
+            return switch (self) {
+                .condition => .condition,
+                .column => .column,
+                .func => .func,
+                .string => .string,
+                .int => .int,
+                .float => .float,
+            };
+        }
     };
 
     const Condition = struct {
         equality: Condition.Equality,
-        lhs: union(enum) {
-            column: Index, // Column index
-            condition: Index.Optional, // Condition index
-            func: Index, // Function index
-        },
-        rhs: union(enum) { // TODO: rhs can have columns. For e.g., where a = b. Replace with Expression
-            condition: Index.Optional,
-            string: NullTerminatedString,
-            int: i64,
-            float: f64,
-        },
+        lhs: Expression,
+        rhs: Expression,
 
         const Equality = enum(u8) {
             @"or",
@@ -803,7 +858,15 @@ const InternPool = struct {
         };
 
         const Repr = struct {
+            tag: u32,
             lhs: u32,
+            rhs: u32,
+        };
+
+        const ReprBig = struct {
+            tag: u32,
+            lhs_0: u32,
+            lhs_1: u32,
             rhs_0: u32,
             rhs_1: u32,
         };
@@ -972,38 +1035,14 @@ const InternPool = struct {
     }
 
     fn extraSize(item: Item) u32 {
-        switch (item.tag) {
-            .condition_or,
-            .condition_and,
-            .condition_group,
-            .condition_lte_int,
-            .condition_lte_float,
-            .condition_lt_int,
-            .condition_lt_float,
-            .condition_gt_int,
-            .condition_gt_float,
-            .condition_gte_int,
-            .condition_gte_float,
-            .condition_eq_int,
-            .condition_eq_float,
-            .condition_eq_string,
-            .condition_eq_func,
-            .condition_ne_int,
-            .condition_ne_float,
-            .condition_ne_string,
-            => {
-                return @sizeOf(Condition.Repr);
-            },
-            .table => {
-                return @sizeOf(Table.Repr);
-            },
-            .column => {
-                return @sizeOf(Column.Repr);
-            },
-            .cursor => {
-                return @sizeOf(Cursor);
-            },
-        }
+        return switch (item.tag) {
+            .condition => @sizeOf(Condition.Repr),
+            .condition_big,
+            => @sizeOf(Condition.ReprBig),
+            .table => @sizeOf(Table.Repr),
+            .column => @sizeOf(Column.Repr),
+            .cursor => @sizeOf(Cursor),
+        };
     }
 
     fn itemPlaceAt(ip: *InternPool, index: u32, item: Item) void {
@@ -1047,66 +1086,36 @@ const InternPool = struct {
         switch (key) {
             .condition => {
                 const cond = key.condition;
-                const is_func = switch (cond.lhs) {
-                    .func => true,
-                    else => false,
-                };
-                const lhs: u32 = switch (cond.lhs) {
-                    .condition => |cond_opt| @intFromEnum(cond_opt),
-                    .column, .func => |col_func| @intFromEnum(col_func),
-                };
-                const rhs: PackedU64 = switch (cond.rhs) {
-                    .string => |cond_string| .{ .a = @intFromEnum(cond_string), .b = 0 },
-                    .int => |cond_int| PackedU64.init(cond_int),
-                    .float => |cond_float| PackedU64.init(cond_float),
-                    .condition => |cond_index| .{ .a = @intFromEnum(cond_index), .b = 0 },
-                };
-                const tag: Tag = if (is_func) .condition_eq_func else switch (cond.equality) {
-                    .eq => switch (cond.rhs) {
-                        .string => .condition_eq_string,
-                        .int => .condition_eq_int,
-                        .float => .condition_eq_float,
-                        .condition => unreachable,
-                    },
-                    .ne => switch (cond.rhs) {
-                        .string => .condition_ne_string,
-                        .int => .condition_eq_int,
-                        .float => .condition_eq_float,
-                        .condition => unreachable,
-                    },
-                    .lt => switch (cond.rhs) {
-                        .int => .condition_lt_int,
-                        .float => .condition_lt_float,
-                        else => unreachable,
-                    },
-                    .lte => switch (cond.rhs) {
-                        .int => .condition_lte_int,
-                        .float => .condition_lte_float,
-                        else => unreachable,
-                    },
-                    .gt => switch (cond.rhs) {
-                        .int => .condition_gt_int,
-                        .float => .condition_gt_float,
-                        else => unreachable,
-                    },
-                    .gte => switch (cond.rhs) {
-                        .int => .condition_gte_int,
-                        .float => .condition_gte_float,
-                        else => unreachable,
-                    },
-                    .@"or" => .condition_or,
-                    .@"and" => .condition_and,
-                    .group => .condition_group,
-                };
-                if (item == null) {
-                    item = .{ .tag = tag, .data = extra_len };
+                const lhs_tag = cond.lhs.tag();
+                const rhs_tag = cond.rhs.tag();
+                const tag: PackedU32 = .{ .a = @intFromEnum(cond.equality), .b = @intFromEnum(lhs_tag), .c = @intFromEnum(rhs_tag), .d = 0 };
+                if (cond.lhs.is_64() or cond.rhs.is_64()) {
+                    const lhs = cond.lhs.pack_64();
+                    const rhs = cond.rhs.pack_64();
+                    if (item == null) {
+                        item = .{ .tag = .condition_big, .data = extra_len };
+                    }
+                    _ = try ip.extraPlaceAt(alloc, item.?, Condition.ReprBig{
+                        .tag = tag.unwrap(),
+                        .lhs_0 = lhs.a,
+                        .lhs_1 = lhs.b,
+                        .rhs_0 = rhs.a,
+                        .rhs_1 = rhs.b,
+                    });
+                    ip.itemPlaceAt(index, item.?);
+                } else {
+                    const lhs = cond.lhs.pack_32();
+                    const rhs = cond.rhs.pack_32();
+                    if (item == null) {
+                        item = .{ .tag = .condition, .data = extra_len };
+                    }
+                    _ = try ip.extraPlaceAt(alloc, item.?, Condition.Repr{
+                        .tag = tag.unwrap(),
+                        .lhs = lhs,
+                        .rhs = rhs,
+                    });
+                    ip.itemPlaceAt(index, item.?);
                 }
-                _ = try ip.extraPlaceAt(alloc, item.?, Condition.Repr{
-                    .lhs = lhs,
-                    .rhs_0 = rhs.a,
-                    .rhs_1 = rhs.b,
-                });
-                ip.itemPlaceAt(index, item.?);
             },
             .column => {
                 const col = key.column;
@@ -1152,6 +1161,7 @@ const InternPool = struct {
                     .float => .argument_float,
                     .condition => .argument_condition,
                     .column => .argument_column,
+                    .func => unreachable, // TODO: implement nested functions
                 };
                 if (item == null) {
                     item = .{ .tag = tag, .data = extra_len };
@@ -1162,6 +1172,7 @@ const InternPool = struct {
                     .float => |cond_float| PackedU64.init(cond_float),
                     .condition => |cond_index| .{ .a = @intFromEnum(cond_index), .b = 0 },
                     .column => |col_index| .{ .a = @intFromEnum(col_index), .b = 0 },
+                    .func => unreachable, // TODO: implement nested functions
                 };
                 _ = try ip.extraPlaceAt(alloc, item.?, Argument.Repr{
                     .expr_0 = expr.a,
@@ -1183,58 +1194,25 @@ const InternPool = struct {
         debug("indexToKey: {d} len: {d}", .{ @intFromEnum(index), ip.items.len });
         const item = ip.items.get(@intFromEnum(index));
         switch (item.tag) {
-            .condition_or,
-            .condition_and,
-            .condition_group,
-            .condition_lte_int,
-            .condition_lte_float,
-            .condition_lt_int,
-            .condition_lt_float,
-            .condition_gt_int,
-            .condition_gt_float,
-            .condition_gte_int,
-            .condition_gte_float,
-            .condition_eq_int,
-            .condition_eq_float,
-            .condition_eq_string,
-            .condition_eq_func,
-            .condition_ne_int,
-            .condition_ne_float,
-            .condition_ne_string,
-            => {
+            .condition => {
                 const extra_data: Condition.Repr = ip.extraData(Condition.Repr, item.data);
-                const rhs: PackedU64 = .{ .a = extra_data.rhs_0, .b = extra_data.rhs_1 };
-                if (item.tag == .condition_eq_func) {
-                    return .{
-                        .condition = .{
-                            .equality = .eq,
-                            .lhs = .{ .func = @enumFromInt(extra_data.lhs) },
-                            .rhs = .{ .int = @bitCast(rhs) }, // TODO: support more than the int datatype.
-                        },
-                    };
-                }
-                const lhs_index: Index = @enumFromInt(extra_data.lhs);
-                const result: Condition = switch (item.tag) {
-                    .condition_or => .{ .equality = .@"or", .lhs = .{ .condition = lhs_index.toOptional() }, .rhs = .{ .condition = @enumFromInt(rhs.a) } },
-                    .condition_and => .{ .equality = .@"and", .lhs = .{ .condition = lhs_index.toOptional() }, .rhs = .{ .condition = @enumFromInt(rhs.a) } },
-                    .condition_group => .{ .equality = .group, .lhs = .{ .condition = lhs_index.toOptional() }, .rhs = .{ .condition = .none } },
-                    .condition_lte_int => .{ .equality = .lte, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
-                    .condition_lt_int => .{ .equality = .lt, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
-                    .condition_gte_int => .{ .equality = .gte, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
-                    .condition_gt_int => .{ .equality = .gt, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
-                    .condition_eq_int => .{ .equality = .eq, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
-                    .condition_ne_int => .{ .equality = .ne, .lhs = .{ .column = lhs_index }, .rhs = .{ .int = @bitCast(rhs) } },
-                    .condition_lte_float => .{ .equality = .lte, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
-                    .condition_lt_float => .{ .equality = .lt, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
-                    .condition_gte_float => .{ .equality = .gte, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
-                    .condition_gt_float => .{ .equality = .gt, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
-                    .condition_eq_float => .{ .equality = .eq, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
-                    .condition_ne_float => .{ .equality = .ne, .lhs = .{ .column = lhs_index }, .rhs = .{ .float = @bitCast(rhs) } },
-                    .condition_eq_string => .{ .equality = .eq, .lhs = .{ .column = lhs_index }, .rhs = .{ .string = @enumFromInt(rhs.a) } },
-                    .condition_ne_string => .{ .equality = .ne, .lhs = .{ .column = lhs_index }, .rhs = .{ .string = @enumFromInt(rhs.a) } },
-                    else => unreachable, // Only handling non-functional conditions
-                };
-                return .{ .condition = result };
+                const tag: PackedU32 = @bitCast(extra_data.tag);
+                return .{ .condition = .{
+                    .equality = @enumFromInt(tag.a),
+                    .lhs = Expression.unpack_32(@enumFromInt(tag.b), extra_data.lhs),
+                    .rhs = Expression.unpack_32(@enumFromInt(tag.c), extra_data.rhs),
+                } };
+            },
+            .condition_big => {
+                const extra_data: Condition.ReprBig = ip.extraData(Condition.ReprBig, item.data);
+                const tag: PackedU32 = @bitCast(extra_data.tag);
+                const lhs_packed: PackedU64 = .{ .a = extra_data.lhs_0, .b = extra_data.lhs_1 };
+                const rhs_packed: PackedU64 = .{ .a = extra_data.rhs_0, .b = extra_data.rhs_1 };
+                return .{ .condition = .{
+                    .equality = @enumFromInt(tag.a),
+                    .lhs = Expression.unpack_64(@enumFromInt(tag.b), lhs_packed),
+                    .rhs = Expression.unpack_64(@enumFromInt(tag.c), rhs_packed),
+                } };
             },
             .column => {
                 const extra_data = ip.extraData(Column.Repr, item.data);
@@ -2690,7 +2668,7 @@ const ASTGen = struct {
                                 } });
                                 const new_index = try self.ip.put(self.gpa, .{
                                     .condition = .{
-                                        .lhs = .{ .func = func_lhs },
+                                        .lhs = .{ .func = func_lhs.toOptional() },
                                         .equality = switch (equality.?) {
                                             .eq => .eq,
                                             else => return Error.InvalidSyntax,
@@ -2701,9 +2679,10 @@ const ASTGen = struct {
                                 expr_index = new_index.toOptional();
                                 is_like = false;
                             } else {
+                                assert(col_index != .none);
                                 const new_index = try self.ip.put(self.gpa, .{
                                     .condition = .{
-                                        .lhs = .{ .column = col_index.unwrap().? },
+                                        .lhs = .{ .column = col_index },
                                         .equality = switch (equality.?) {
                                             .eq => .eq,
                                             .ne => .ne,
@@ -2721,7 +2700,7 @@ const ASTGen = struct {
                             const value = fmt.parseInt(i64, slice, 10) catch break;
                             const new_index = try self.ip.put(self.gpa, .{
                                 .condition = .{
-                                    .lhs = .{ .column = col_index.unwrap().? },
+                                    .lhs = .{ .column = col_index },
                                     .equality = switch (equality.?) {
                                         .eq => .eq,
                                         .ne => .ne,
@@ -3065,7 +3044,7 @@ const InstGen = struct {
                         const cond = self.ip.indexToKey(cond_idx).condition;
                         switch (cond.lhs) {
                             .func => {
-                                const func = self.ip.indexToKey(cond.lhs.func).function;
+                                const func = self.ip.indexToKey(cond.lhs.func.unwrap().?).function;
                                 // TODO: support functions with 0 arguments
                                 const first_inst = self.ip.peekInst();
                                 if (func.first_argument != .none) {
@@ -3101,9 +3080,9 @@ const InstGen = struct {
                                 }
                             },
                             .column => {
-                                const col = self.ip.indexToKey(cond.lhs.column).column;
+                                const col = self.ip.indexToKey(cond.lhs.column.unwrap().?).column;
                                 if (col.is_primary_key and col.tag == .integer and seek_optimization == .none) {
-                                    primary_key_col = cond.lhs.column.toOptional();
+                                    primary_key_col = cond.lhs.column;
                                     if (eq == null or (eq == .@"and" and traversal.nextRequiredCondition(.@"and") == .none)) {
                                         switch (cond.equality) {
                                             .gt => seek_optimization = .gt,
@@ -3126,7 +3105,7 @@ const InstGen = struct {
                                     _ = try self.addInst(.{ .column = .{
                                         .cursor = cursor,
                                         .store_reg = compare_reg,
-                                        .col = cond.lhs.column,
+                                        .col = cond.lhs.column.unwrap().?,
                                     } });
                                 }
                                 reg_count = reg_count.increment();
@@ -3265,7 +3244,7 @@ const InstGen = struct {
                             else => false,
                         };
                         if (is_func) {
-                            const func = self.ip.indexToKey(cond.lhs.func).function;
+                            const func = self.ip.indexToKey(cond.lhs.func.unwrap().?).function;
                             if (func.first_argument != .none) {
                                 var arg_index_opt = func.first_argument;
                                 while (arg_index_opt.unwrap()) |arg_index| {
@@ -3481,6 +3460,7 @@ pub inline fn char_lower(char: u8) u8 {
 }
 
 // TODO: figure out why '%_' is so slow to match and speed it up
+// Create fast paths for %abc%, %abc, abc%
 fn like(str: []u8, pattern: []u8) bool {
     var si: u32 = 0;
     var pi: u32 = 0;
