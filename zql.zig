@@ -78,17 +78,19 @@ const InternPool = struct {
     }
 
     const Tag = enum(u8) {
-        table,
+        argument_column,
+        argument_expression,
+        argument_float,
+        argument_int,
+        argument_string,
         column,
         cursor,
         expression,
         expression_big,
         function,
-        argument_string,
-        argument_int,
-        argument_float,
-        argument_expression,
-        argument_column,
+        result_column,
+        result_column_wildcard,
+        table,
     };
 
     const Item = struct {
@@ -840,6 +842,21 @@ const InternPool = struct {
         }
     };
 
+    const ResultColumn = struct {
+        val: union(enum) {
+            wildcard: void,
+            table_wildcard: NullTerminatedString,
+            expr_alias: struct { expr: Index.Optional, alias: NullTerminatedString },
+        },
+        next_col: Index.Optional,
+
+        const Repr = struct {
+            next: u32,
+            expr: u32,
+            str: u32,
+        };
+    };
+
     const Expression = struct {
         equality: Expression.Equality,
         lhs: Term,
@@ -880,6 +897,7 @@ const InternPool = struct {
     const Key = union(enum) {
         table: Table,
         column: Column,
+        result_column: ResultColumn,
         expression: Expression,
         cursor: Cursor,
         function: Function,
@@ -904,61 +922,47 @@ const InternPool = struct {
         const key: Key = ip.indexToKey(index.unwrap().?);
         switch (key) {
             .expression => |expression_data| {
-                switch (expression_data.lhs) {
-                    .column => |column| {
-                        switch (expression_data.equality) {
-                            .eq => _ = try buffer.write("(EQ "),
-                            .ne => _ = try buffer.write("(NE "),
-                            .lt => _ = try buffer.write("(LT "),
-                            .lte => _ = try buffer.write("(LTE "),
-                            .gt => _ = try buffer.write("(GT "),
-                            .gte => _ = try buffer.write("(GTE "),
-                            else => unreachable, // Not a column equality
-                        }
-                        switch (expression_data.rhs) {
-                            .int => |int_value| try fmt.format(buffer.writer().any(), "COL_{d}, {d})", .{ @intFromEnum(column), int_value }),
-                            .float => |float_value| try fmt.format(buffer.writer().any(), "COL_{d}, {e})", .{ @intFromEnum(column), float_value }),
-                            .string => |str_value| try fmt.format(buffer.writer().any(), "COL_{d}, '{s}')", .{ @intFromEnum(column), str_value.slice(ip) }),
-                            else => unreachable,
-                        }
+                var group = false;
+                switch (expression_data.equality) {
+                    .eq => _ = try buffer.write("(EQ "),
+                    .ne => _ = try buffer.write("(NE "),
+                    .lt => _ = try buffer.write("(LT "),
+                    .lte => _ = try buffer.write("(LTE "),
+                    .gt => _ = try buffer.write("(GT "),
+                    .gte => _ = try buffer.write("(GTE "),
+                    .@"and" => _ = try buffer.write("(AND "),
+                    .@"or" => _ = try buffer.write("(OR "),
+                    .group => {
+                        _ = try buffer.write("(");
+                        group = true;
                     },
-                    .func => |builtin_func| {
-                        _ = try buffer.write("(EQ ");
-                        try ip.bufWrite(buffer, builtin_func.toOptional());
+                }
+                for (0..2) |i| {
+                    const term = if (i == 0) expression_data.lhs else expression_data.rhs;
+                    switch (term) {
+                        .column => |column| {
+                            try fmt.format(buffer.writer().any(), "COL_{d}", .{@intFromEnum(column)});
+                        },
+                        .func => |builtin_func| {
+                            try ip.bufWrite(buffer, builtin_func);
+                        },
+                        .expression => |expression_idx| {
+                            try ip.bufWrite(buffer, expression_idx);
+                        },
+                        .int => |int_value| try fmt.format(buffer.writer().any(), "{d}", .{int_value}),
+                        .float => |float_value| try fmt.format(buffer.writer().any(), "{e}", .{float_value}),
+                        .string => |str_value| try fmt.format(buffer.writer().any(), "'{s}'", .{str_value.slice(ip)}),
+                    }
+                    if (i == 0) {
+                        if (group) {
+                            _ = try buffer.write(")");
+                            group = false;
+                            break;
+                        }
                         _ = try buffer.write(", ");
-                        switch (expression_data.rhs) {
-                            .int => |int_value| try fmt.format(buffer.writer().any(), "{d}", .{int_value}),
-                            .float => |float_value| try fmt.format(buffer.writer().any(), "{e}", .{float_value}),
-                            .string => |str_value| try fmt.format(buffer.writer().any(), "'{s}'", .{str_value.slice(ip)}),
-                            else => unreachable,
-                        }
+                    } else {
                         _ = try buffer.write(")");
-                    },
-                    .expression => |expression_lhs| {
-                        var group: bool = false;
-                        switch (expression_data.equality) {
-                            .@"and" => _ = try buffer.write("(AND "),
-                            .@"or" => _ = try buffer.write("(OR "),
-                            .group => {
-                                _ = try buffer.write("(");
-                                group = true;
-                            },
-                            else => unreachable, // Not a expression equality
-                        }
-                        switch (expression_data.rhs) {
-                            .expression => |expression_rhs| {
-                                try ip.bufWrite(buffer, expression_lhs);
-                                if (!group) {
-                                    _ = try buffer.write(", ");
-                                    try ip.bufWrite(buffer, expression_rhs);
-                                } else {
-                                    group = false;
-                                }
-                                _ = try buffer.write(")");
-                            },
-                            else => unreachable, // Can only compare expression to another expression
-                        }
-                    },
+                    }
                 }
             },
             .function => |func_data| {
@@ -977,6 +981,7 @@ const InternPool = struct {
                     .string => |str_value| try fmt.format(buffer.writer().any(), "'{s}'", .{str_value.slice(ip)}),
                     .column => |col_value| try fmt.format(buffer.writer().any(), "COL_{d}", .{@intFromEnum(col_value)}),
                     .expression => |expr_value| try ip.bufWrite(buffer, expr_value),
+                    .func => unreachable, // TODO: nested functions
                 }
                 if (arg_data.next_argument != .none) {
                     _ = try buffer.write(", ");
@@ -1117,6 +1122,32 @@ const InternPool = struct {
                     ip.itemPlaceAt(index, item.?);
                 }
             },
+            .result_column => {
+                const col = key.result_column;
+                switch (col.val) {
+                    .wildcard => {
+                        item = .{ .tag = .result_column_wildcard, .data = @intFromEnum(col.next_col) };
+                    },
+                    .table_wildcard => |val| {
+                        _ = try ip.extraPlaceAt(alloc, item.?, ResultColumn.Repr{
+                            .next = @intFromEnum(col.next_col),
+                            .str = @intFromEnum(val),
+                            .expr = @intFromEnum(Index.Optional.none),
+                        });
+                    },
+                    .expr_alias => |val| {
+                        _ = try ip.extraPlaceAt(alloc, item.?, ResultColumn.Repr{
+                            .next = @intFromEnum(col.next_col),
+                            .str = @intFromEnum(val.alias),
+                            .expr = @intFromEnum(val.expr),
+                        });
+                    },
+                }
+                if (item == null) {
+                    item = .{ .tag = .result_column, .data = extra_len };
+                }
+                ip.itemPlaceAt(index, item.?);
+            },
             .column => {
                 const col = key.column;
                 const flags: Column.Flags = .{ .tag = @intFromEnum(col.tag), .is_primary_key = col.is_primary_key, .id = @truncate(col.id) };
@@ -1225,6 +1256,28 @@ const InternPool = struct {
                     .is_primary_key = flags.is_primary_key,
                 };
                 return .{ .column = result };
+            },
+            .result_column => {
+                const extra_data = ip.extraData(ResultColumn.Repr, item.data);
+                const expr: Index.Optional = @enumFromInt(extra_data.expr);
+                if (expr == .none) {
+                    return .{ .result_column = .{
+                        .next_col = @enumFromInt(extra_data.next),
+                        .val = .{ .table_wildcard = @enumFromInt(extra_data.str) },
+                    } };
+                }
+                return .{ .result_column = .{
+                    .next_col = @enumFromInt(extra_data.next),
+                    .val = .{
+                        .expr_alias = .{
+                            .expr = @enumFromInt(extra_data.expr),
+                            .alias = @enumFromInt(extra_data.str),
+                        },
+                    },
+                } };
+            },
+            .result_column_wildcard => {
+                return .{ .result_column = .{ .next_col = @enumFromInt(item.data), .val = .wildcard } };
             },
             .table => {
                 const extra_data = ip.extraData(Table.Repr, item.data);
@@ -1767,6 +1820,11 @@ const Tokenizer = struct {
                         self.index += 1;
                         break;
                     },
+                    '>' => {
+                        token.type = TokenType.ne;
+                        self.index += 1;
+                        break;
+                    },
                     ' ' => {
                         token.type = TokenType.lt;
                         break;
@@ -2186,6 +2244,11 @@ const ASTGen = struct {
     const State = enum {
         create,
         end,
+        expr_root,
+        expr_andor,
+        expr_equality,
+        expr_lhs,
+        expr_rhs,
         from,
         from_after,
         select_first,
@@ -2199,10 +2262,6 @@ const ASTGen = struct {
         table_name,
         table_next,
         where,
-        where_andor,
-        where_equality,
-        where_lhs,
-        where_rhs,
     };
 
     pub fn init(
@@ -2494,11 +2553,16 @@ const ASTGen = struct {
                     switch (token.tag) {
                         .word => {}, // This is the table name. // TODO enforce table name before where clause or pop back to after table name after second_select
                         .keyword_where => {
-                            where = try self.buildWhereClause(table.?);
-                            self.ip.dump(where);
+                            state = .where;
                         },
                         else => break,
                     }
+                },
+                .where => {
+                    where = try self.buildExpression(table.?);
+                    self.ip.dump(where);
+                    // TODO: support other keywords after where and check for semicolon
+                    state = .end;
                 },
                 .end => {
                     debug("AST built", .{});
@@ -2522,138 +2586,115 @@ const ASTGen = struct {
         };
     }
 
-    pub fn buildWhereClause(self: *ASTGen, table: InternPool.Index) Error!InternPool.Index.Optional {
-        var state: State = .where;
+    pub fn buildExpression(self: *ASTGen, table: InternPool.Index) Error!InternPool.Index.Optional {
+        var state: State = .expr_lhs;
         var equality: ?TokenType = null;
-        var col_index: InternPool.Index.Optional = InternPool.Index.Optional.none;
         var last_element_andor = false;
         var is_like = false;
         var term_index: InternPool.Index.Optional = .none;
+        var lhs_term: ?InternPool.Term = null;
 
         var open_roots: ArrayListUnmanaged(InternPool.Index.Optional) = .{};
         defer open_roots.deinit(self.gpa);
         try open_roots.append(self.gpa, .none);
 
-        debug("buildWhereClause", .{});
+        debug("buildExpression", .{});
         while (self.index < self.token_list.len) : (self.index += 1) {
             const token = self.token_list.get(self.index);
             switch (state) {
-                // TODO: support nested parenthesis
-                .where => {
-                    state = .where_lhs;
-                },
-                .where_lhs => switch (token.tag) {
-                    .word => {
-                        const column_name = ASTGen.getTokenSource(self.source, token);
-                        const col_optional = self.ip.columnFromName(table, column_name);
-                        if (col_optional) |col| {
-                            col_index = col.index.toOptional();
-                        } else {
-                            break;
+                .expr_lhs, .expr_rhs => {
+                    if (state == .expr_rhs) {
+                        debug("expr_rhs eq: {?}, lhs_term: {?}", .{ equality, lhs_term });
+                        if (equality == null or lhs_term == null) {
+                            debug("expr missing", .{});
+                            return Error.InvalidSyntax;
                         }
-                        state = .where_equality;
-                    },
-                    .rparen => {
-                        if (open_roots.items.len == 1) break; // Too many closing brackets. Invalid
-                        const last = open_roots.pop();
-                        if (last.unwrap()) |last_idx| {
-                            // Create new group from last open root and add it to the previous root
-                            const last_expr = self.ip.indexToKey(last_idx).expression;
-                            const new_index = switch (last_expr.equality) {
-                                .@"and", .@"or", .group => try self.ip.put(self.gpa, .{
-                                    .expression = .{
-                                        .equality = .group,
-                                        .rhs = .{ .expression = .none },
-                                        .lhs = .{ .expression = last },
-                                    },
-                                }),
-                                // If inside the brackets there is only one expression, we can ignore the brackets
-                                else => last_idx,
-                            };
-                            const new_index_opt = new_index.toOptional();
-                            const new_root_index_opt = open_roots.items[open_roots.items.len - 1];
-                            if (new_root_index_opt.unwrap()) |new_root_index| {
-                                var cur = self.ip.indexToKey(new_root_index).expression;
-                                switch (cur.equality) {
-                                    .@"and", .@"or" => {},
-                                    else => break, // Invalid syntax
-                                }
-                                if (cur.lhs.expression == .none) cur.lhs.expression = new_index_opt else cur.rhs.expression = new_index_opt;
-                                debug("rparen update index: {}", .{cur});
-                                try self.ip.update(self.gpa, new_root_index, .{ .expression = cur });
-                            } else {
-                                open_roots.items[open_roots.items.len - 1] = new_index_opt;
-                            }
-                        }
-                    },
-                    .lparen => {
-                        // if (!last_element_andor and term_index != .none) break; // open bracket only after and/or. TODO: other ignorable brackets such as (col_name)
-                        try open_roots.append(self.gpa, .none);
-                    },
-                    .keyword_and, .keyword_or => {
-                        if (last_element_andor or term_index == .none) {
-                            break;
-                        }
-                        const term_first_index = open_roots.items[open_roots.items.len - 1];
-                        const new_index = try self.ip.put(self.gpa, .{
-                            .expression = .{
-                                .rhs = .{ .expression = switch (term_first_index) {
-                                    .none => .none,
-                                    else => term_index,
-                                } },
-                                .equality = switch (token.tag) {
-                                    .keyword_and => .@"and",
-                                    .keyword_or => .@"or",
-                                    else => unreachable, // and or expressions
-                                },
-                                .lhs = .{ .expression = switch (term_first_index) {
-                                    .none => term_index,
-                                    else => term_first_index,
-                                } },
-                            },
-                        });
-                        term_index = new_index.toOptional();
-                        last_element_andor = true;
-                        open_roots.items[open_roots.items.len - 1] = term_index;
-                    },
-                    else => {
-                        if (last_element_andor) {
-                            break;
-                        }
-                        if (open_roots.items[0].unwrap()) |index| {
-                            return index.toOptional();
-                        }
-                        break;
-                    },
-                },
-                .where_equality => switch (token.tag) {
-                    .eq, .ne, .lt, .lte, .gt, .gte => {
-                        equality = token.tag;
-                        state = .where_rhs;
-                    },
-                    .keyword_like => {
-                        equality = .eq;
-                        is_like = true;
-                        state = .where_rhs;
-                    },
-                    else => break,
-                },
-                .where_rhs => {
-                    debug("where_rhs eq: {?}, col_index: {d}", .{ equality, @intFromEnum(col_index) });
-                    if (equality == null or col_index.unwrap() == null) {
-                        debug("where_rhs missing", .{});
-                        return Error.InvalidSyntax;
                     }
+                    var term: ?InternPool.Term = null;
                     switch (token.tag) {
-                        .double_quote_word, .single_quote_word => {
+                        .word, .double_quote_word => {
+                            // TODO: support function syntax. For e.g. like('%a', col)
+                            const column_name = ASTGen.getTokenSource(self.source, token);
+                            const col_optional = self.ip.columnFromName(table, column_name);
+                            if (col_optional) |col| {
+                                term = .{ .column = col.index.toOptional() };
+                            } else {
+                                break;
+                            }
+                        },
+                        .rparen => {
+                            if (open_roots.items.len == 1) break; // Too many closing brackets. Invalid
+                            const last = open_roots.pop();
+                            if (last.unwrap()) |last_idx| {
+                                // Create new group from last open root and add it to the previous root
+                                const last_expr = self.ip.indexToKey(last_idx).expression;
+                                const new_index = switch (last_expr.equality) {
+                                    .@"and", .@"or", .group => try self.ip.put(self.gpa, .{
+                                        .expression = .{
+                                            .equality = .group,
+                                            .rhs = .{ .expression = .none },
+                                            .lhs = .{ .expression = last },
+                                        },
+                                    }),
+                                    // If inside the brackets there is only one expression, we can ignore the brackets
+                                    else => last_idx,
+                                };
+                                const new_index_opt = new_index.toOptional();
+                                const new_root_index_opt = open_roots.items[open_roots.items.len - 1];
+                                if (new_root_index_opt.unwrap()) |new_root_index| {
+                                    var cur = self.ip.indexToKey(new_root_index).expression;
+                                    switch (cur.equality) {
+                                        .@"and", .@"or" => {},
+                                        else => break, // Invalid syntax
+                                    }
+                                    if (cur.lhs.expression == .none) cur.lhs.expression = new_index_opt else cur.rhs.expression = new_index_opt;
+                                    debug("rparen update index: {}", .{cur});
+                                    try self.ip.update(self.gpa, new_root_index, .{ .expression = cur });
+                                } else {
+                                    open_roots.items[open_roots.items.len - 1] = new_index_opt;
+                                }
+                            }
+                        },
+                        .lparen => {
+                            // if (!last_element_andor and term_index != .none) break; // open bracket only after and/or. TODO: other ignorable brackets such as (col_name)
+                            try open_roots.append(self.gpa, .none);
+                        },
+                        .keyword_and, .keyword_or => {
+                            if (last_element_andor or term_index == .none or equality != null) {
+                                debug("not valid place for and/or", .{});
+                                break;
+                            }
+                            const term_first_index = open_roots.items[open_roots.items.len - 1];
+                            const new_index = try self.ip.put(self.gpa, .{
+                                .expression = .{
+                                    .rhs = .{ .expression = switch (term_first_index) {
+                                        .none => .none,
+                                        else => term_index,
+                                    } },
+                                    .equality = switch (token.tag) {
+                                        .keyword_and => .@"and",
+                                        .keyword_or => .@"or",
+                                        else => unreachable, // and or expressions
+                                    },
+                                    .lhs = .{ .expression = switch (term_first_index) {
+                                        .none => term_index,
+                                        else => term_first_index,
+                                    } },
+                                },
+                            });
+                            term_index = new_index.toOptional();
+                            last_element_andor = true;
+                            open_roots.items[open_roots.items.len - 1] = term_index;
+                        },
+                        .single_quote_word => {
                             const string_literal = ASTGen.getTokenSource(self.source, token);
-                            debug("where_rhs literal: {s}", .{string_literal});
+                            debug("build_expr literal: {s}", .{string_literal});
                             const value = try InternPool.NullTerminatedString.initAddSentinel(self.gpa, string_literal[1 .. string_literal.len - 1], self.ip);
                             if (is_like) {
+                                if (lhs_term == null) return Error.InvalidSyntax;
+                                debug("build_expr like eq: {}", .{equality.?});
                                 const match_arg = try self.ip.put(self.gpa, .{ .argument = .{
-                                    .term = .{
-                                        .column = col_index,
-                                    },
+                                    .term = lhs_term.?,
                                     .next_argument = .none,
                                 } });
                                 const pattern_arg = try self.ip.put(self.gpa, .{ .argument = .{
@@ -2677,30 +2718,39 @@ const ASTGen = struct {
                                     },
                                 });
                                 term_index = new_index.toOptional();
-                                is_like = false;
+                                debug("build_expr like complete", .{});
                             } else {
-                                assert(col_index != .none);
-                                const new_index = try self.ip.put(self.gpa, .{
-                                    .expression = .{
-                                        .lhs = .{ .column = col_index },
-                                        .equality = switch (equality.?) {
-                                            .eq => .eq,
-                                            .ne => .ne,
-                                            else => return Error.InvalidSyntax,
-                                        },
-                                        .rhs = .{ .string = value },
-                                    },
-                                });
-                                term_index = new_index.toOptional();
+                                term = .{ .string = value };
                             }
-                            // TODO: put func on the LHS for like and have it equate to 1
                         },
                         .integer => {
                             const slice = ASTGen.getTokenSource(self.source, token);
                             const value = fmt.parseInt(i64, slice, 10) catch break;
+                            term = .{ .int = value };
+                        },
+                        .float => {
+                            const slice = ASTGen.getTokenSource(self.source, token);
+                            const value = fmt.parseFloat(f64, slice) catch break;
+                            term = .{ .float = value };
+                        },
+                        else => {
+                            if (last_element_andor) {
+                                break;
+                            }
+                            // Return the complete expression
+                            if (open_roots.items[0].unwrap()) |index| {
+                                return index.toOptional();
+                            }
+                            break;
+                        },
+                    }
+                    if (state == .expr_rhs and (term != null or is_like)) {
+                        if (is_like) {
+                            is_like = false;
+                        } else {
                             const new_index = try self.ip.put(self.gpa, .{
                                 .expression = .{
-                                    .lhs = .{ .column = col_index },
+                                    .lhs = lhs_term.?,
                                     .equality = switch (equality.?) {
                                         .eq => .eq,
                                         .ne => .ne,
@@ -2710,26 +2760,42 @@ const ASTGen = struct {
                                         .gte => .gte,
                                         else => return Error.InvalidSyntax,
                                     },
-                                    .rhs = .{ .int = value },
+                                    .rhs = term.?,
                                 },
                             });
+                            debug("expr rhs index: {}", .{new_index});
                             term_index = new_index.toOptional();
-                        },
-                        else => break, // TODO: support real (float)
+                        }
+                        last_element_andor = false;
+                        if (open_roots.items[open_roots.items.len - 1].unwrap()) |root| {
+                            var key = self.ip.indexToKey(root);
+                            debug("expr rhs: {}", .{key});
+                            key.expression.rhs = .{ .expression = term_index.unwrap().?.toOptional() };
+                            debug("expr rhs update: {}", .{key});
+                            try self.ip.update(self.gpa, root, key);
+                        } else {
+                            open_roots.items[open_roots.items.len - 1] = term_index;
+                        }
+                        equality = null;
+                        lhs_term = null;
+                        state = .expr_lhs;
+                    } else if (state == .expr_lhs and term != null) {
+                        lhs_term = term;
+                        state = .expr_equality;
                     }
-                    last_element_andor = false;
-                    if (open_roots.items[open_roots.items.len - 1].unwrap()) |term| {
-                        var key = self.ip.indexToKey(term);
-                        debug("where rhs: {}", .{key});
-                        key.expression.rhs = .{ .expression = term_index.unwrap().?.toOptional() };
-                        debug("where rhs update: {}", .{key});
-                        try self.ip.update(self.gpa, term, key);
-                    } else {
-                        open_roots.items[open_roots.items.len - 1] = term_index;
-                    }
-                    equality = null;
-                    col_index = InternPool.Index.Optional.none;
-                    state = .where_lhs;
+                },
+                .expr_equality => switch (token.tag) {
+                    .eq, .ne, .lt, .lte, .gt, .gte => {
+                        equality = token.tag;
+                        debug("expr_equality: {}", .{equality.?});
+                        state = .expr_rhs;
+                    },
+                    .keyword_like => {
+                        equality = .eq;
+                        is_like = true;
+                        state = .expr_rhs;
+                    },
+                    else => break,
                 },
                 else => break,
             }

@@ -109,9 +109,17 @@ describeDb(MED_DB_FILE, () => {
   compare("select * from t1 where age >= 19;");
   compare("select * from t1 where id < 4;");
   compare("select * from t1 where name like 'a%' or name = 'Louis' or name = 'Paul';");
+  compare("select name from t1 where name <> 'Paul';");
+  compare("select name from t1 where name != 'Paul';");
+
+  // Column ordering
+  compare("select age, name from t1;");
+  // compareOnly("select name, age from t1;"); // TODO: fix
+
   // And Or Tests
   compare("select * from t1 where name like '%o%' and name = 'Louis' or name = 'Paul';");
   compare("select * from t1 where id = 1 and name = 'Paul' or age = 21 and name = 'Ryan' or id = 3 and name = 'Michael' and age = 26;");
+  compare("select * from t1 where name <> 'Paul' and name <> 'Ryan' or age = 21 and name = 'Ryan' or id = 3 and name = 'Michael' and age = 26;");
   compare("select * from t1 where id > 4 or age = 21 and name = 'Ryan' or id = 3 and name = 'Michael' and age = 26;");
 
   // Brackets
