@@ -21,6 +21,8 @@ async function getFile(name) {
 }
 
 async function compareInternal(query) {
+  const sqlQuery = sql.prepare(query);
+  sqlResult = sqlQuery.all();
   await zql.exec(query);
   const expected = []
   const actual = []
@@ -31,13 +33,13 @@ async function compareInternal(query) {
     let j = 0;
     for (const key in obj) {
       const sqlItem = obj[key];
-      if (zqlResult.length <= i) break;
+      expected_item.push(sqlItem);
+      if (zqlResult.length <= i) continue;
       let zqlItem = zqlResult[i][j];
       if (typeof zqlItem == 'bigint') {
         zqlItem = Number(zqlItem);
       }
       actual_item.push(zqlItem);
-      expected_item.push(sqlItem);
       j++;
     }
     actual.push(actual_item);
@@ -77,15 +79,10 @@ async function describeDb(dbFile, callback) {
     beforeAll(async () => {
       await load(dbFile);
     });
-    beforeEach(async () => {
+    beforeEach(() => {
       // Clear any lingering results from past failures
       sqlResult = [];
       zqlResult = [];
-      const testName = expect.getState().currentTestName;
-      // testName also includes name of describe, so we need to remove that
-      const query = testName.substring(dbFile.length, testName.length);
-      const sqlQuery = sql.prepare(query);
-      sqlResult = sqlQuery.all();
     });
     callback();
   });
