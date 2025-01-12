@@ -112,9 +112,13 @@ describeDb(MED_DB_FILE, () => {
   compare("select name from t1 where name <> 'Paul';");
   compare("select name from t1 where name != 'Paul';");
 
+  // Weird syntax
+  compare("select * from t1 where age;");
+  compare("select * from t1 where name;");
+
   // Column ordering
   compare("select age, name from t1;");
-  // compareOnly("select name, age from t1;"); // TODO: fix
+  compare("select name, age from t1;");
 
   // And Or Tests
   compare("select * from t1 where name like '%o%' and name = 'Louis' or name = 'Paul';");

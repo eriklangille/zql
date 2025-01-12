@@ -845,7 +845,7 @@ const InternPool = struct {
     const ResultColumn = struct {
         val: union(enum) {
             wildcard: void,
-            table_wildcard: NullTerminatedString,
+            table_wildcard: NullTerminatedString, // TODO: change to table index
             expr_alias: struct { expr: Index.Optional, alias: NullTerminatedString },
         },
         next_col: Index.Optional,
@@ -862,10 +862,12 @@ const InternPool = struct {
         lhs: Term,
         rhs: Term,
 
+        // TODO: rename as operator and add +,-,*,/,%
         const Equality = enum(u8) {
             @"or",
             @"and",
             group,
+            unary,
             eq,
             ne,
             lt,
@@ -922,7 +924,9 @@ const InternPool = struct {
         const key: Key = ip.indexToKey(index.unwrap().?);
         switch (key) {
             .expression => |expression_data| {
+                // TODO: make into enum
                 var group = false;
+                var unary = false;
                 switch (expression_data.equality) {
                     .eq => _ = try buffer.write("(EQ "),
                     .ne => _ = try buffer.write("(NE "),
@@ -935,6 +939,9 @@ const InternPool = struct {
                     .group => {
                         _ = try buffer.write("(");
                         group = true;
+                    },
+                    .unary => {
+                        unary = true;
                     },
                 }
                 for (0..2) |i| {
@@ -957,6 +964,9 @@ const InternPool = struct {
                         if (group) {
                             _ = try buffer.write(")");
                             group = false;
+                            break;
+                        } else if (unary) {
+                            unary = false;
                             break;
                         }
                         _ = try buffer.write(", ");
@@ -1124,6 +1134,9 @@ const InternPool = struct {
             },
             .result_column => {
                 const col = key.result_column;
+                if (item == null) {
+                    item = .{ .tag = .result_column, .data = extra_len };
+                }
                 switch (col.val) {
                     .wildcard => {
                         item = .{ .tag = .result_column_wildcard, .data = @intFromEnum(col.next_col) };
@@ -1142,9 +1155,6 @@ const InternPool = struct {
                             .expr = @intFromEnum(val.expr),
                         });
                     },
-                }
-                if (item == null) {
-                    item = .{ .tag = .result_column, .data = extra_len };
                 }
                 ip.itemPlaceAt(index, item.?);
             },
@@ -1888,7 +1898,7 @@ const Tokenizer = struct {
 
 // TODO: replace with internpool key
 const SelectStmt = struct {
-    columns: u64, // Each bit represents one column in the table TODO: support tables with more than 64 columns and built-in function operations on columns
+    columns: InternPool.Index.Optional, // ResultColumns index
     table: InternPool.Index, // table index
     where: InternPool.Index.Optional, // Optional expression index
 };
@@ -2464,53 +2474,42 @@ const ASTGen = struct {
 
     fn buildSelectStatement(self: *ASTGen) Error!SelectStmt {
         var state: State = .select_first;
-        var columns: u64 = 0;
         var table: ?InternPool.Index = null;
-        var column_list_index: u32 = std.math.maxInt(u32);
+        const column_list_index: u32 = self.index;
         var processed_columns: bool = false;
-        var where: InternPool.Index.Optional = InternPool.Index.Optional.none;
+        var where: InternPool.Index.Optional = .none;
+        var result_columns: InternPool.Index.Optional = .none;
+        var tail_column: InternPool.Index.Optional = .none;
         while (self.index < self.token_list.len) : (self.index += 1) {
             const token = self.token_list.get(self.index);
             switch (state) {
                 .select_first => {
                     switch (token.tag) {
-                        .asterisk => {
-                            // All columns
-                            columns = max_64_bit;
-                            processed_columns = true;
-                            column_list_index = self.index;
-                        },
                         .keyword_from => {
                             state = .from;
                         },
-                        .word => {
-                            if (column_list_index == std.math.maxInt(u32)) {
-                                column_list_index = self.index;
-                            }
-                        },
-                        .comma => {},
-                        else => {
-                            break;
-                        },
+                        else => {},
                     }
                 },
                 .select_second => {
+                    debug("select_second", .{});
                     switch (token.tag) {
-                        .word => {
-                            const col_name = ASTGen.getTokenSource(self.source, token);
-                            if (table) |tbl| {
-                                const is_col = self.ip.columnFromName(tbl, col_name);
-                                if (is_col) |col_result| {
-                                    columns |= (@as(u64, 1) << @truncate(col_result.count));
-                                } else {
-                                    debug("Could not find column: {s}", .{col_name});
-                                    break;
-                                }
+                        .asterisk => {
+                            const last_column_opt = tail_column;
+                            tail_column = (try self.ip.put(self.gpa, .{
+                                .result_column = .{
+                                    .val = .wildcard,
+                                    .next_col = .none,
+                                },
+                            })).toOptional();
+                            if (last_column_opt.unwrap()) |last_column| {
+                                var col = self.ip.indexToKey(last_column).result_column;
+                                col.next_col = tail_column;
+                                try self.ip.update(self.gpa, last_column, .{ .result_column = col });
                             } else {
-                                break;
+                                result_columns = tail_column;
                             }
                         },
-                        .asterisk => {},
                         .comma => {},
                         .keyword_from => {
                             processed_columns = true;
@@ -2518,7 +2517,24 @@ const ASTGen = struct {
                             state = .from_after;
                         },
                         else => {
-                            break;
+                            const last_column_opt = tail_column;
+                            const expr_idx = self.buildExpression(table.?) catch return Error.InvalidSyntax;
+                            tail_column = (try self.ip.put(self.gpa, .{
+                                .result_column = .{
+                                    .val = .{ .expr_alias = .{ .expr = expr_idx, .alias = .empty } },
+                                    .next_col = .none,
+                                },
+                            })).toOptional();
+                            debug("select second: {}", .{tail_column});
+                            if (last_column_opt.unwrap()) |last_column| {
+                                var col = self.ip.indexToKey(last_column).result_column;
+                                col.next_col = tail_column;
+                                try self.ip.update(self.gpa, last_column, .{ .result_column = col });
+                            } else {
+                                result_columns = tail_column;
+                            }
+                            // Expression reads up until comma or from, so we need to re-adjust the index
+                            self.index -= 1;
                         },
                     }
                 },
@@ -2580,7 +2596,7 @@ const ASTGen = struct {
         debug("table: {}", .{table.?});
 
         return .{
-            .columns = columns,
+            .columns = result_columns,
             .table = table.?,
             .where = where,
         };
@@ -2795,7 +2811,27 @@ const ASTGen = struct {
                         is_like = true;
                         state = .expr_rhs;
                     },
-                    else => break,
+                    else => {
+                        const new_index = try self.ip.put(self.gpa, .{
+                            .expression = .{
+                                .lhs = lhs_term.?,
+                                .equality = .unary,
+                                .rhs = .{ .expression = .none },
+                            },
+                        });
+                        debug("expr unary index: {}", .{new_index});
+                        term_index = new_index.toOptional();
+                        if (open_roots.items[open_roots.items.len - 1].unwrap()) |root| {
+                            var key = self.ip.indexToKey(root);
+                            key.expression.rhs = .{ .expression = term_index.unwrap().?.toOptional() };
+                            try self.ip.update(self.gpa, root, key);
+                        } else {
+                            open_roots.items[open_roots.items.len - 1] = term_index;
+                        }
+                        // re-process token with expr_lhs state
+                        state = .expr_lhs;
+                        self.index -= 1;
+                    },
                 },
                 else => break,
             }
@@ -2836,14 +2872,12 @@ const ASTGen = struct {
 
 const TableMetadataReader = struct {
     ip: *InternPool,
-    table: InternPool.Table,
     index: InternPool.Index.Optional,
 
     pub fn from(intern_pool: *InternPool, table_index: InternPool.Index) TableMetadataReader {
         const table = intern_pool.indexToKey(table_index).table;
         return .{
             .ip = intern_pool,
-            .table = table,
             .index = table.first_column,
         };
     }
@@ -3072,6 +3106,21 @@ const InstGen = struct {
 
     const ComparisonList = MultiArrayList(Comparison);
 
+    fn addColumnInst(self: *InstGen, index: InternPool.Index, col: InternPool.Column, cursor: InternPool.Index, reg: Register.Index) Error!void {
+        if (col.is_primary_key and col.tag == .integer) {
+            _ = try self.addInst(.{ .row_id = .{
+                .read_cursor = cursor,
+                .store_reg = reg,
+            } });
+        } else {
+            _ = try self.addInst(.{ .column = .{
+                .cursor = cursor,
+                .store_reg = reg,
+                .col = index,
+            } });
+        }
+    }
+
     pub fn buildInstructions(self: *InstGen) Error!void {
         switch (self.statement) {
             Stmt.select => {
@@ -3091,9 +3140,8 @@ const InstGen = struct {
                 const loop_start = self.ip.peekInst();
 
                 var reg_count = Register.Index.first;
-                var reader = TableMetadataReader.from(self.ip, select.table);
                 const where_clause = select.where;
-                debug("Where: {?}", .{where_clause});
+                debug("Where: {}", .{where_clause});
                 const compare_reg = reg_count;
                 var comparisons: ComparisonList = .{};
                 defer comparisons.deinit(self.gpa);
@@ -3108,6 +3156,7 @@ const InstGen = struct {
                         const eq = item.eq;
                         const depth = item.depth;
                         const expr = self.ip.indexToKey(expr_idx).expression;
+                        // TODO: support columns on RHS side too
                         switch (expr.lhs) {
                             .func => {
                                 const func = self.ip.indexToKey(expr.lhs.func.unwrap().?).function;
@@ -3210,6 +3259,9 @@ const InstGen = struct {
                                             else => unreachable,
                                         }
                                     },
+                                    .unary => {
+                                        _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
+                                    },
                                     else => unreachable,
                                 }
                             },
@@ -3221,29 +3273,43 @@ const InstGen = struct {
                 }
 
                 var output_count = reg_count.increment();
-                var col_count: u32 = 0;
-                while (reader.next()) |col_result| {
-                    const col = col_result.col;
-                    const col_i = col_result.index;
-                    // TODO: support more than 64 columns
-                    if (select.columns & (@as(u64, 0x1) << @truncate(col_count)) > 0) {
-                        if (col.is_primary_key and col.tag == .integer) {
-                            // rowId reads for a integer primary key row. If this isn't explicitly noted as a primary key,
-                            // then column instruction is used instead.
-                            _ = try self.addInst(.{ .row_id = .{
-                                .read_cursor = cursor,
-                                .store_reg = output_count,
-                            } });
-                        } else {
-                            _ = try self.addInst(.{ .column = .{
-                                .cursor = cursor,
-                                .store_reg = output_count,
-                                .col = col_i,
-                            } });
-                        }
-                        output_count = output_count.increment();
+                var cur_col = select.columns;
+
+                debug("cur_col", .{});
+                while (cur_col.unwrap()) |col_idx| {
+                    const res_col = self.ip.indexToKey(col_idx).result_column;
+                    switch (res_col.val) {
+                        .wildcard => {
+                            var reader = TableMetadataReader.from(self.ip, select.table);
+                            while (reader.next()) |col_res| {
+                                const col = col_res.col;
+                                try self.addColumnInst(col_res.index, col, cursor, output_count);
+                                output_count = output_count.increment();
+                            }
+                        },
+                        .expr_alias => |val| {
+                            debug("expr_alias: {}", .{val});
+                            const expr_idx_opt = val.expr;
+                            assert(expr_idx_opt != .none);
+                            const expr = self.ip.indexToKey(expr_idx_opt.unwrap().?).expression;
+                            switch (expr.equality) {
+                                .unary => {
+                                    switch (expr.lhs) {
+                                        .column => |expr_col_idx| {
+                                            const col = self.ip.indexToKey(expr_col_idx.unwrap().?).column;
+                                            debug("inst column: {}", .{col});
+                                            try self.addColumnInst(expr_col_idx.unwrap().?, col, cursor, output_count);
+                                            output_count = output_count.increment();
+                                        },
+                                        else => unreachable, // TODO: implement
+                                    }
+                                },
+                                else => unreachable, //TODO: implement
+                            }
+                        },
+                        else => unreachable, // TODO: implement table wildcard
                     }
-                    col_count += 1;
+                    cur_col = res_col.next_col;
                 }
                 debug("columns: {b}", .{select.columns});
 
@@ -3342,6 +3408,7 @@ const InstGen = struct {
                                 switch (expr.rhs) {
                                     .string => _ = try self.addInst(.{ .string = .{ .string = expr.rhs.string, .store_reg = store_reg } }),
                                     .int => _ = try self.addInst(.{ .integer = .{ .int = expr.rhs.int, .store_reg = store_reg } }),
+                                    .expression => {},
                                     else => return Error.InvalidSyntax, // TODO: implement float
                                 }
                             }
@@ -3872,7 +3939,15 @@ const Vm = struct {
                         else => false,
                     };
 
-                    if (if_reg.tag() == .int and if_reg.int == 1) {
+                    const is_true = switch (if_reg) {
+                        .int => |val| val != 0,
+                        .float => |val| val != 0.0,
+                        .string => |val| (std.fmt.parseInt(i64, val.string.slice(val.len, self.ip), 10) catch 0) != 0,
+                        .str => |val| (std.fmt.parseInt(i64, val, 10) catch 0) != 0, // TODO: support float coersion
+                        else => false, // TODO: check if blob can be evaluated to true
+                    };
+
+                    if (is_true) {
                         if (is_if) {
                             self.pc = jump_address;
                         } else {
