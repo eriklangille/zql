@@ -112,6 +112,15 @@ describeDb(MED_DB_FILE, () => {
   compare("select name from t1 where name <> 'Paul';");
   compare("select name from t1 where name != 'Paul';");
 
+  // TODO: fix below
+  // compare("select * from t1 where id > 1 and id < 4;");
+  // compare("select * from t2 where id = t1_id;");
+
+  // Reverse normal condition order
+  compare("select * from t1 where 1 < id;");
+  compare("select * from t1 where 1 <= id;");
+  compare("select * from t1 where 19 <= age;");
+
   // Weird syntax
   compare("select * from t1 where age;");
   compare("select * from t1 where name;");

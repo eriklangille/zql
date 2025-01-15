@@ -2726,11 +2726,8 @@ const ASTGen = struct {
                                 const new_index = try self.ip.put(self.gpa, .{
                                     .expression = .{
                                         .lhs = .{ .func = func_lhs.toOptional() },
-                                        .equality = switch (equality.?) {
-                                            .eq => .eq,
-                                            else => return Error.InvalidSyntax,
-                                        },
-                                        .rhs = .{ .int = 1 }, // int assigned to 1 if true
+                                        .equality = .unary,
+                                        .rhs = .{ .expression = .none },
                                     },
                                 });
                                 term_index = new_index.toOptional();
@@ -3121,6 +3118,11 @@ const InstGen = struct {
         }
     }
 
+    // This function generates the instructions to be executed by the VM
+    // The instructions are based off SQLite: https://www.sqlite.org/opcode.html
+    // However, some behaviour is not fully supported.
+    // In addition, there's no concept of P1 - P5. Instead, all instructions have a dynamic number of 4 byte fields.
+    // There are multiple passes through the WHERE expression clause to define the column and constant values into registers
     pub fn buildInstructions(self: *InstGen) Error!void {
         switch (self.statement) {
             Stmt.select => {
@@ -3147,6 +3149,8 @@ const InstGen = struct {
                 defer comparisons.deinit(self.gpa);
                 var columns_start = self.ip.peekInst();
 
+                // Column Loop and pass through of the where expression tree
+                // Jump locations are left empty until we know all instruction addresses, since we don't know where to jump to yet.
                 if (where_clause != .none) {
                     var traversal = try ExpressionTraversal.init(self.ip, where_clause);
                     defer traversal.deinit(self.gpa);
@@ -3156,116 +3160,136 @@ const InstGen = struct {
                         const eq = item.eq;
                         const depth = item.depth;
                         const expr = self.ip.indexToKey(expr_idx).expression;
-                        // TODO: support columns on RHS side too
-                        switch (expr.lhs) {
-                            .func => {
-                                const func = self.ip.indexToKey(expr.lhs.func.unwrap().?).function;
-                                // TODO: support functions with 0 arguments
-                                const first_inst = self.ip.peekInst();
-                                if (func.first_argument != .none) {
-                                    const first_arg_register = reg_count.increment();
-                                    var arg_index = func.first_argument;
-                                    while (arg_index.unwrap()) |idx| {
-                                        const arg = self.ip.indexToKey(idx).argument;
-                                        switch (arg.term) {
-                                            .column => {
-                                                _ = try self.addInst(.{ .column = .{
-                                                    .cursor = cursor,
-                                                    .store_reg = reg_count.increment(),
-                                                    .col = arg.term.column.unwrap().?,
-                                                } });
-                                            },
-                                            else => {},
+
+                        for (0..2) |i| {
+                            const is_lhs: bool = i == 0;
+                            const term = if (is_lhs) expr.lhs else expr.rhs;
+                            switch (term) {
+                                .func => {
+                                    const func = self.ip.indexToKey(expr.lhs.func.unwrap().?).function;
+                                    // TODO: support functions with 0 arguments
+                                    const first_inst = self.ip.peekInst();
+                                    if (func.first_argument != .none) {
+                                        const first_arg_register = reg_count.increment();
+                                        var arg_index = func.first_argument;
+                                        var column_arg: bool = false;
+                                        while (arg_index.unwrap()) |idx| {
+                                            const arg = self.ip.indexToKey(idx).argument;
+                                            switch (arg.term) {
+                                                .column => {
+                                                    _ = try self.addInst(.{ .column = .{
+                                                        .cursor = cursor,
+                                                        .store_reg = reg_count.increment(),
+                                                        .col = arg.term.column.unwrap().?,
+                                                    } });
+                                                    column_arg = true;
+                                                },
+                                                .func => unreachable, // TODO: implement nested functions
+                                                else => {},
+                                            }
+                                            reg_count = reg_count.increment();
+                                            arg_index = arg.next_argument;
                                         }
-                                        reg_count = reg_count.increment();
-                                        arg_index = arg.next_argument;
+                                        if (column_arg) {
+                                            _ = try self.addInst(.{ .function = .{
+                                                .index = func.index,
+                                                .first_argument_register = first_arg_register,
+                                                .result_register = compare_reg,
+                                            } });
+                                            try comparisons.append(self.gpa, .{
+                                                .eq = eq orelse .@"or",
+                                                .jump = first_inst,
+                                                .inst = self.ip.peekInst(),
+                                                .depth = depth,
+                                            });
+                                            _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
+                                        }
                                     }
-                                    _ = try self.addInst(.{ .function = .{
-                                        .index = func.index,
-                                        .first_argument_register = first_arg_register,
-                                        .result_register = compare_reg,
-                                    } });
+                                },
+                                .column => |col_idx_opt| {
+                                    const col = self.ip.indexToKey(col_idx_opt.unwrap().?).column;
+                                    if (col.is_primary_key and col.tag == .integer and seek_optimization == .none) {
+                                        primary_key_col = term.column;
+                                        if (eq == null or (eq == .@"and" and traversal.nextRequiredExpression(.@"and") == .none)) {
+                                            if (is_lhs) {
+                                                switch (expr.equality) {
+                                                    .gt => seek_optimization = .gt,
+                                                    .gte => seek_optimization = .ge,
+                                                    else => {},
+                                                }
+                                            } else {
+                                                switch (expr.equality) {
+                                                    .lt => seek_optimization = .gt,
+                                                    .lte => seek_optimization = .ge,
+                                                    else => {},
+                                                }
+                                            }
+                                        }
+                                        if (seek_optimization != .none) {
+                                            reg_count = reg_count.increment();
+                                            continue;
+                                        }
+                                    }
+                                    const first_inst = self.ip.peekInst();
+                                    if (col.is_primary_key and col.tag == .integer) {
+                                        _ = try self.addInst(.{ .row_id = .{
+                                            .read_cursor = cursor,
+                                            .store_reg = compare_reg,
+                                        } });
+                                    } else {
+                                        _ = try self.addInst(.{ .column = .{
+                                            .cursor = cursor,
+                                            .store_reg = compare_reg,
+                                            .col = term.column.unwrap().?,
+                                        } });
+                                    }
+                                    reg_count = reg_count.increment();
                                     try comparisons.append(self.gpa, .{
                                         .eq = eq orelse .@"or",
                                         .jump = first_inst,
                                         .inst = self.ip.peekInst(),
                                         .depth = depth,
                                     });
-                                    _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
-                                }
-                            },
-                            .column => {
-                                const col = self.ip.indexToKey(expr.lhs.column.unwrap().?).column;
-                                if (col.is_primary_key and col.tag == .integer and seek_optimization == .none) {
-                                    primary_key_col = expr.lhs.column;
-                                    if (eq == null or (eq == .@"and" and traversal.nextRequiredExpression(.@"and") == .none)) {
-                                        switch (expr.equality) {
-                                            .gt => seek_optimization = .gt,
-                                            .gte => seek_optimization = .ge,
-                                            else => {},
-                                        }
+                                    switch (expr.equality) {
+                                        .eq => {
+                                            _ = try self.addInst(.{ .eq = .{
+                                                .lhs_reg = compare_reg,
+                                                .rhs_reg = reg_count,
+                                                .jump = InternPool.InstIndex.none,
+                                            } });
+                                        },
+                                        .ne => {
+                                            _ = try self.addInst(.{ .neq = .{
+                                                .lhs_reg = compare_reg,
+                                                .rhs_reg = reg_count,
+                                                .jump = InternPool.InstIndex.none,
+                                            } });
+                                        },
+                                        .gt, .gte, .lt, .lte => {
+                                            const data: InternPool.Instruction.Lt = .{
+                                                .lhs_reg = compare_reg,
+                                                .rhs_reg = reg_count,
+                                                .jump = .none,
+                                            };
+                                            switch (expr.equality) {
+                                                .gt => _ = try self.addInst(if (is_lhs) .{ .gt = data } else .{ .lt = data }),
+                                                .gte => _ = try self.addInst(if (is_lhs) .{ .gte = data } else .{ .lte = data }),
+                                                .lt => _ = try self.addInst(if (is_lhs) .{ .lt = data } else .{ .gt = data }),
+                                                .lte => _ = try self.addInst(if (is_lhs) .{ .lte = data } else .{ .gte = data }),
+                                                else => unreachable,
+                                            }
+                                        },
+                                        .unary => {
+                                            _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
+                                        },
+                                        else => unreachable,
                                     }
-                                    if (seek_optimization != .none) {
-                                        reg_count = reg_count.increment();
-                                        continue;
-                                    }
-                                }
-                                const first_inst = self.ip.peekInst();
-                                if (col.is_primary_key and col.tag == .integer) {
-                                    _ = try self.addInst(.{ .row_id = .{
-                                        .read_cursor = cursor,
-                                        .store_reg = compare_reg,
-                                    } });
-                                } else {
-                                    _ = try self.addInst(.{ .column = .{
-                                        .cursor = cursor,
-                                        .store_reg = compare_reg,
-                                        .col = expr.lhs.column.unwrap().?,
-                                    } });
-                                }
-                                reg_count = reg_count.increment();
-                                try comparisons.append(self.gpa, .{
-                                    .eq = eq orelse .@"or",
-                                    .jump = first_inst,
-                                    .inst = self.ip.peekInst(),
-                                    .depth = depth,
-                                });
-                                switch (expr.equality) {
-                                    .eq => {
-                                        _ = try self.addInst(.{ .eq = .{
-                                            .lhs_reg = compare_reg,
-                                            .rhs_reg = reg_count,
-                                            .jump = InternPool.InstIndex.none,
-                                        } });
-                                    },
-                                    .ne => {
-                                        _ = try self.addInst(.{ .neq = .{
-                                            .lhs_reg = compare_reg,
-                                            .rhs_reg = reg_count,
-                                            .jump = InternPool.InstIndex.none,
-                                        } });
-                                    },
-                                    .gt, .gte, .lt, .lte => {
-                                        const data: InternPool.Instruction.Lt = .{
-                                            .lhs_reg = compare_reg,
-                                            .rhs_reg = reg_count,
-                                            .jump = .none,
-                                        };
-                                        switch (expr.equality) {
-                                            .gt => _ = try self.addInst(.{ .gt = data }),
-                                            .gte => _ = try self.addInst(.{ .gte = data }),
-                                            .lt => _ = try self.addInst(.{ .lt = data }),
-                                            .lte => _ = try self.addInst(.{ .lte = data }),
-                                            else => unreachable,
-                                        }
-                                    },
-                                    .unary => {
-                                        _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
-                                    },
-                                    else => unreachable,
-                                }
-                            },
-                            else => unreachable,
+                                },
+                                else => {
+                                    // No-op for constants, but reg count still needs to increase and will be filled in by the constant pass
+                                    // reg_count = reg_count.increment();
+                                },
+                            }
                         }
                     } else {
                         columns_start = self.ip.peekInst();
@@ -3276,6 +3300,8 @@ const InstGen = struct {
                 var cur_col = select.columns;
 
                 debug("cur_col", .{});
+
+                // Column output pass - Load the registers with the results as defined by result_column (i.e. SELECT <result_column> FROM ...)
                 while (cur_col.unwrap()) |col_idx| {
                     const res_col = self.ip.indexToKey(col_idx).result_column;
                     switch (res_col.val) {
@@ -3323,24 +3349,26 @@ const InstGen = struct {
                 // TODO: support multiples databases, writing to tables
                 const transaction_index = try self.addInst(.{ .transaction = .{ .database_id = 0, .write = false } });
 
+                // Comparison list pass. Now that we have the location of the output columns and all comparison instructions,
+                // we can fill in the jump locations
                 const slice = comparisons.slice();
-                var i: usize = 0;
-                while (i < slice.len) : (i += 1) {
-                    const inst = slice.items(.inst)[i];
-                    const eq = slice.items(.eq)[i];
-                    const depth = slice.items(.depth)[i];
+                var sl_i: usize = 0;
+                while (sl_i < slice.len) : (sl_i += 1) {
+                    const inst = slice.items(.inst)[sl_i];
+                    const eq = slice.items(.eq)[sl_i];
+                    const depth = slice.items(.depth)[sl_i];
                     debug("comparisons: inst {}, eq {}, depth {d}", .{ inst, eq, depth });
-                    if (i == slice.len - 1) {
+                    if (sl_i == slice.len - 1) {
                         self.negate(inst);
                         self.replaceJump(inst, next_index);
                     } else {
-                        const next_eq = slice.items(.eq)[i + 1];
+                        const next_eq = slice.items(.eq)[sl_i + 1];
                         switch (eq) {
                             .@"or" => {
                                 if (next_eq == .@"and") {
                                     self.negate(inst);
                                 }
-                                var j: usize = i + 1;
+                                var j: usize = sl_i + 1;
                                 while (j < slice.len and (slice.items(.eq)[j] != .@"or" or slice.items(.depth)[j] < depth)) : (j += 1) {}
                                 if (j == slice.len) {
                                     self.replaceJump(inst, if (next_eq == .@"and") next_index else columns_start);
@@ -3352,7 +3380,7 @@ const InstGen = struct {
                                 if (next_eq == .@"and") {
                                     self.negate(inst);
                                 }
-                                var j: usize = i + 1;
+                                var j: usize = sl_i + 1;
                                 while (j < slice.len and (slice.items(.eq)[j] != .@"or" or slice.items(.depth)[j] < depth)) : (j += 1) {}
                                 if (j == slice.len) {
                                     self.replaceJump(inst, if (next_eq == .@"and") next_index else columns_start);
@@ -3364,6 +3392,11 @@ const InstGen = struct {
                         }
                     }
                 }
+
+                debug("second pass", .{});
+
+                // Second pass of the WHERE expression, this pass we can fill in the constants outside of the column loop
+                // to prevent unneccessary register loads
                 if (where_clause != .none) {
                     var traversal = try ExpressionTraversal.init(self.ip, where_clause);
                     var store_reg = compare_reg.increment();
@@ -3371,48 +3404,76 @@ const InstGen = struct {
                     while (try traversal.next(self.gpa)) |leaf| {
                         const expr_idx = leaf.index;
                         const expr = self.ip.indexToKey(expr_idx).expression;
-                        const is_func = switch (expr.lhs) {
-                            .func => true,
-                            else => false,
-                        };
-                        if (is_func) {
-                            const func = self.ip.indexToKey(expr.lhs.func.unwrap().?).function;
-                            if (func.first_argument != .none) {
-                                var arg_index_opt = func.first_argument;
-                                while (arg_index_opt.unwrap()) |arg_index| {
-                                    const arg = self.ip.indexToKey(arg_index).argument;
-                                    switch (arg.term) {
-                                        .string => _ = try self.addInst(.{ .string = .{ .string = arg.term.string, .store_reg = store_reg } }),
-                                        .int => _ = try self.addInst(.{ .integer = .{ .int = arg.term.int, .store_reg = store_reg } }),
-                                        .column => {},
-                                        else => return Error.InvalidSyntax, // TODO: implement float
+                        for (0..2) |i| {
+                            const is_lhs = i == 0;
+                            if (expr.equality == .unary and !is_lhs) break;
+                            const term = if (is_lhs) expr.lhs else expr.rhs;
+                            const other_term = if (is_lhs) expr.rhs else expr.lhs;
+                            const is_func = switch (term) {
+                                .func => true,
+                                else => false,
+                            };
+                            if (is_func) {
+                                const func = self.ip.indexToKey(term.func.unwrap().?).function;
+                                if (func.first_argument != .none) {
+                                    var arg_index_opt = func.first_argument;
+                                    while (arg_index_opt.unwrap()) |arg_index| {
+                                        const arg = self.ip.indexToKey(arg_index).argument;
+                                        switch (arg.term) {
+                                            .string => _ = try self.addInst(.{ .string = .{ .string = arg.term.string, .store_reg = store_reg } }),
+                                            .int => _ = try self.addInst(.{ .integer = .{ .int = arg.term.int, .store_reg = store_reg } }),
+                                            .column => {},
+                                            else => return Error.InvalidSyntax, // TODO: implement float
+                                        }
+                                        store_reg = store_reg.increment();
+                                        arg_index_opt = arg.next_argument;
                                     }
-                                    store_reg = store_reg.increment();
-                                    arg_index_opt = arg.next_argument;
                                 }
-                            }
-                        } else {
-                            if (seek_optimization != .none) {
-                                _ = try self.addInst(.{ .integer = .{ .int = expr.rhs.int, .store_reg = store_reg } });
-                                const seek: InternPool.Instruction.Seek = .{
-                                    .table = select.table,
-                                    .seek_key = store_reg,
-                                    .end_inst = halt_index,
-                                };
-                                _ = try self.ip.replaceInst(self.gpa, cursor_move_index, switch (expr.equality) {
-                                    .gt => .{ .seek_gt = seek },
-                                    .gte => .{ .seek_ge = seek },
-                                    else => unreachable,
-                                });
                             } else {
-                                switch (expr.rhs) {
-                                    .string => _ = try self.addInst(.{ .string = .{ .string = expr.rhs.string, .store_reg = store_reg } }),
-                                    .int => _ = try self.addInst(.{ .integer = .{ .int = expr.rhs.int, .store_reg = store_reg } }),
-                                    .expression => {},
-                                    else => return Error.InvalidSyntax, // TODO: implement float
+                                switch (term) {
+                                    .string => _ = try self.addInst(.{ .string = .{ .string = term.string, .store_reg = store_reg } }),
+                                    .int => {
+                                        const is_seek_term: bool = res: {
+                                            if (seek_optimization != .none) {
+                                                switch (other_term) {
+                                                    .column => |col_idx_opt| {
+                                                        if (col_idx_opt.unwrap()) |col_idx| {
+                                                            const col = self.ip.indexToKey(col_idx).column;
+                                                            break :res col.is_primary_key;
+                                                        }
+                                                    },
+                                                    else => {},
+                                                }
+                                            }
+                                            break :res false;
+                                        };
+                                        if (is_seek_term) {
+                                            _ = try self.addInst(.{ .integer = .{ .int = term.int, .store_reg = store_reg } });
+                                            const seek: InternPool.Instruction.Seek = .{
+                                                .table = select.table,
+                                                .seek_key = store_reg,
+                                                .end_inst = halt_index,
+                                            };
+                                            _ = try self.ip.replaceInst(self.gpa, cursor_move_index, switch (expr.equality) {
+                                                .gt => .{ .seek_gt = seek },
+                                                .gte => .{ .seek_ge = seek },
+                                                .lt => .{ .seek_gt = seek }, // TODO: use is_lhs to handle seek_lt when implemented with ordering
+                                                .lte => .{ .seek_ge = seek },
+                                                else => unreachable,
+                                            });
+                                        } else {
+                                            _ = try self.addInst(.{ .integer = .{ .int = term.int, .store_reg = store_reg } });
+                                        }
+                                    },
+                                    .expression, .func => {},
+                                    .column => {
+                                        // Skip reg increment
+                                        continue;
+                                    },
+                                    .float => return Error.InvalidSyntax,
                                 }
+                                store_reg = store_reg.increment();
                             }
-                            store_reg = store_reg.increment();
                         }
                     }
                 }
@@ -3437,6 +3498,9 @@ const Register = union(enum) {
     string: StringLen,
     str: []u8, // TODO: consider removing these, and make all bytes be interned. Or use a 32 bit index instead of a slice
     binary: []u8,
+    // TODO: We can refer to DB file bytes using a 64 bit value - 48 bits for the page number and 16 bits for the offset within the page
+    // This works because max number of pages is 2^48 and max page size is 2^16 in SQLite
+    // We then also need to have additional parsing since table values can overflow to overflow pages
 
     const StringLen = struct {
         string: InternPool.String,
