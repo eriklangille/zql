@@ -874,6 +874,13 @@ const InternPool = struct {
             lte,
             gt,
             gte,
+
+            pub fn is_andor(self: Equality) bool {
+                return switch (self) {
+                    .@"or", .@"and" => true,
+                    else => false,
+                };
+            }
         };
 
         const Repr = struct {
@@ -1679,6 +1686,7 @@ const Tokenizer = struct {
         int,
         gt,
         lt,
+        eq,
         semicolon,
         single_quote_word,
         start,
@@ -1750,9 +1758,10 @@ const Tokenizer = struct {
                         break;
                     },
                     '=' => {
-                        token.type = .eq;
-                        self.index += 1;
-                        break;
+                        state = .eq;
+                        // token.type = .eq;
+                        // self.index += 1;
+                        // break;
                     },
                     '>' => {
                         state = .gt;
@@ -1823,6 +1832,17 @@ const Tokenizer = struct {
                         break;
                     },
                     else => token.type = TokenType.invalid,
+                },
+                .eq => switch (c) {
+                    '=' => {
+                        token.type = TokenType.eq;
+                        self.index += 1;
+                        break;
+                    },
+                    else => {
+                        token.type = TokenType.eq;
+                        break;
+                    },
                 },
                 .lt => switch (c) {
                     '=' => {
@@ -2607,7 +2627,7 @@ const ASTGen = struct {
         var equality: ?TokenType = null;
         var last_element_andor = false;
         var is_like = false;
-        var term_index: InternPool.Index.Optional = .none;
+        var last_generated_expr_index: InternPool.Index.Optional = .none;
         var lhs_term: ?InternPool.Term = null;
 
         var open_roots: ArrayListUnmanaged(InternPool.Index.Optional) = .{};
@@ -2635,7 +2655,7 @@ const ASTGen = struct {
                             if (col_optional) |col| {
                                 term = .{ .column = col.index.toOptional() };
                             } else {
-                                break;
+                                return Error.InvalidSyntax; // Column doesn't exist
                             }
                         },
                         .rparen => {
@@ -2672,35 +2692,40 @@ const ASTGen = struct {
                             }
                         },
                         .lparen => {
-                            // if (!last_element_andor and term_index != .none) break; // open bracket only after and/or. TODO: other ignorable brackets such as (col_name)
+                            // if (!last_element_andor and last_generated_expr_index != .none) break; // open bracket only after and/or. TODO: other ignorable brackets such as (col_name)
                             try open_roots.append(self.gpa, .none);
                         },
                         .keyword_and, .keyword_or => {
-                            if (last_element_andor or term_index == .none or equality != null) {
+                            if (last_element_andor) {
+                                // TODO: cannot do and or if last token is equality too
                                 debug("not valid place for and/or", .{});
                                 break;
                             }
-                            const term_first_index = open_roots.items[open_roots.items.len - 1];
+                            const last_root = open_roots.items[open_roots.items.len - 1];
+                            const andor_lhs: InternPool.Term = switch (last_root) {
+                                .none => if (lhs_term) |val| val else .{ .expression = last_generated_expr_index },
+                                else => .{ .expression = last_root },
+                            };
+                            const andor_rhs: InternPool.Term = switch (last_root) {
+                                .none => .{ .expression = .none },
+                                else => if (lhs_term) |val| val else .{ .expression = last_generated_expr_index },
+                            };
                             const new_index = try self.ip.put(self.gpa, .{
                                 .expression = .{
-                                    .rhs = .{ .expression = switch (term_first_index) {
-                                        .none => .none,
-                                        else => term_index,
-                                    } },
+                                    .rhs = andor_rhs,
                                     .equality = switch (token.tag) {
                                         .keyword_and => .@"and",
                                         .keyword_or => .@"or",
                                         else => unreachable, // and or expressions
                                     },
-                                    .lhs = .{ .expression = switch (term_first_index) {
-                                        .none => term_index,
-                                        else => term_first_index,
-                                    } },
+                                    .lhs = andor_lhs,
                                 },
                             });
-                            term_index = new_index.toOptional();
+
+                            lhs_term = null;
+                            last_generated_expr_index = new_index.toOptional();
                             last_element_andor = true;
-                            open_roots.items[open_roots.items.len - 1] = term_index;
+                            open_roots.items[open_roots.items.len - 1] = last_generated_expr_index;
                         },
                         .single_quote_word => {
                             const string_literal = ASTGen.getTokenSource(self.source, token);
@@ -2730,8 +2755,9 @@ const ASTGen = struct {
                                         .rhs = .{ .expression = .none },
                                     },
                                 });
-                                term_index = new_index.toOptional();
+                                last_generated_expr_index = new_index.toOptional();
                                 debug("build_expr like complete", .{});
+                                lhs_term = null;
                             } else {
                                 term = .{ .string = value };
                             }
@@ -2748,12 +2774,14 @@ const ASTGen = struct {
                         },
                         else => {
                             if (last_element_andor) {
+                                debug("Not a valid expression", .{});
                                 break;
                             }
                             // Return the complete expression
                             if (open_roots.items[0].unwrap()) |index| {
                                 return index.toOptional();
                             }
+                            debug("No open_roots", .{});
                             break;
                         },
                     }
@@ -2777,17 +2805,17 @@ const ASTGen = struct {
                                 },
                             });
                             debug("expr rhs index: {}", .{new_index});
-                            term_index = new_index.toOptional();
+                            last_generated_expr_index = new_index.toOptional();
                         }
                         last_element_andor = false;
                         if (open_roots.items[open_roots.items.len - 1].unwrap()) |root| {
                             var key = self.ip.indexToKey(root);
                             debug("expr rhs: {}", .{key});
-                            key.expression.rhs = .{ .expression = term_index.unwrap().?.toOptional() };
+                            key.expression.rhs = .{ .expression = last_generated_expr_index.unwrap().?.toOptional() };
                             debug("expr rhs update: {}", .{key});
                             try self.ip.update(self.gpa, root, key);
                         } else {
-                            open_roots.items[open_roots.items.len - 1] = term_index;
+                            open_roots.items[open_roots.items.len - 1] = last_generated_expr_index;
                         }
                         equality = null;
                         lhs_term = null;
@@ -2808,23 +2836,34 @@ const ASTGen = struct {
                         is_like = true;
                         state = .expr_rhs;
                     },
+                    .keyword_and, .keyword_or => {
+                        // better at least have a LHS
+                        if (lhs_term == null) return Error.InvalidSyntax;
+                        // re-process as lhs
+                        state = .expr_lhs;
+                        self.index -= 1;
+                    },
                     else => {
-                        const new_index = try self.ip.put(self.gpa, .{
-                            .expression = .{
-                                .lhs = lhs_term.?,
-                                .equality = .unary,
-                                .rhs = .{ .expression = .none },
-                            },
-                        });
-                        debug("expr unary index: {}", .{new_index});
-                        term_index = new_index.toOptional();
+                        debug("Expression else: {?}, token: {}", .{ lhs_term, token });
+                        if (lhs_term == null) return Error.InvalidSyntax;
                         if (open_roots.items[open_roots.items.len - 1].unwrap()) |root| {
                             var key = self.ip.indexToKey(root);
-                            key.expression.rhs = .{ .expression = term_index.unwrap().?.toOptional() };
+                            key.expression.rhs = lhs_term.?;
                             try self.ip.update(self.gpa, root, key);
+                            last_element_andor = false;
                         } else {
-                            open_roots.items[open_roots.items.len - 1] = term_index;
+                            const new_index = try self.ip.put(self.gpa, .{
+                                .expression = .{
+                                    .lhs = lhs_term.?,
+                                    .equality = .unary,
+                                    .rhs = .{ .expression = .none },
+                                },
+                            });
+                            debug("expr unary index: {}", .{new_index});
+                            last_generated_expr_index = new_index.toOptional();
+                            open_roots.items[open_roots.items.len - 1] = last_generated_expr_index;
                         }
+                        lhs_term = null;
                         // re-process token with expr_lhs state
                         state = .expr_lhs;
                         self.index -= 1;
@@ -2939,11 +2978,24 @@ const ExpressionTraversal = struct {
                 const expr = self.ip.indexToKey(idx).expression;
                 switch (expr.equality) {
                     .@"or", .@"and", .group => {
-                        // TODO: handle or/and that are not expression
-                        try self.stack.append(alloc, .{ .eq = expr.equality, .index = idx });
-                        cur = expr.lhs.expression;
-                        if (expr.equality == .group) {
-                            self.depth += 1;
+                        switch (expr.rhs) {
+                            .expression => {
+                                try self.stack.append(alloc, .{ .eq = expr.equality, .index = idx });
+                            },
+                            else => {},
+                        }
+                        switch (expr.lhs) {
+                            .expression => |next_expr| {
+                                cur = next_expr;
+                                if (expr.equality == .group) {
+                                    self.depth += 1;
+                                }
+                            },
+                            else => {
+                                if (self.stack.items.len == 0) return .{ .eq = null, .index = idx, .depth = self.depth };
+                                const parent = self.stack.items[self.stack.items.len - 1];
+                                return .{ .eq = parent.eq, .index = idx, .depth = self.depth };
+                            },
                         }
                     },
                     else => {
@@ -2963,19 +3015,32 @@ const ExpressionTraversal = struct {
             var cur: InternPool.Index.Optional = .none;
             switch (key.rhs) {
                 .expression => |expr| cur = expr,
-                else => unreachable, // All items on the stack should have left and right expressions
+                else => unreachable, // All items on the stack should have a right expression
             }
             var prev = cur;
             while (cur.unwrap()) |idx| {
                 const expr = self.ip.indexToKey(idx).expression;
                 switch (expr.equality) {
                     .@"or", .@"and", .group => {
-                        // TODO: handle or/and that are not expression
-                        try self.stack.append(alloc, .{ .eq = expr.equality, .index = idx });
-                        prev = cur;
-                        cur = expr.lhs.expression;
-                        if (expr.equality == .group) {
-                            self.depth += 1;
+                        switch (expr.rhs) {
+                            .expression => {
+                                try self.stack.append(alloc, .{ .eq = expr.equality, .index = idx });
+                            },
+                            else => {},
+                        }
+                        switch (expr.lhs) {
+                            .expression => |next_expr| {
+                                prev = cur;
+                                cur = next_expr;
+                                if (expr.equality == .group) {
+                                    self.depth += 1;
+                                }
+                            },
+                            else => return .{
+                                .eq = expr.equality,
+                                .index = idx,
+                                .depth = self.depth,
+                            },
                         }
                     },
                     else => return .{
@@ -3078,6 +3143,7 @@ const InstGen = struct {
 
     const SeekOptimization = union(enum) {
         none,
+        used,
         lt,
         le,
         gt,
@@ -3164,6 +3230,7 @@ const InstGen = struct {
                         for (0..2) |i| {
                             const is_lhs: bool = i == 0;
                             const term = if (is_lhs) expr.lhs else expr.rhs;
+                            const other_term = if (is_lhs) expr.rhs else expr.lhs;
                             switch (term) {
                                 .func => {
                                     const func = self.ip.indexToKey(expr.lhs.func.unwrap().?).function;
@@ -3231,17 +3298,29 @@ const InstGen = struct {
                                         }
                                     }
                                     const first_inst = self.ip.peekInst();
+                                    const col_reg: Register.Index = blk: {
+                                        if (!is_lhs and other_term.tag() == .column and !expr.equality.is_andor()) {
+                                            break :blk reg_count.increment();
+                                        }
+                                        break :blk compare_reg;
+                                    };
                                     if (col.is_primary_key and col.tag == .integer) {
                                         _ = try self.addInst(.{ .row_id = .{
                                             .read_cursor = cursor,
-                                            .store_reg = compare_reg,
+                                            .store_reg = col_reg,
                                         } });
                                     } else {
                                         _ = try self.addInst(.{ .column = .{
                                             .cursor = cursor,
-                                            .store_reg = compare_reg,
+                                            .store_reg = col_reg,
                                             .col = term.column.unwrap().?,
                                         } });
+                                    }
+                                    // If the LHS and RHS are both columns, and its a binary comparison between the two columns
+                                    // we only want to add one comparison to compare the sides instead of 2.
+                                    // The comparison needs to be added after the RHS column instruction has been added.
+                                    if (is_lhs and other_term.tag() == .column and !expr.equality.is_andor()) {
+                                        continue;
                                     }
                                     reg_count = reg_count.increment();
                                     try comparisons.append(self.gpa, .{
@@ -3279,7 +3358,7 @@ const InstGen = struct {
                                                 else => unreachable,
                                             }
                                         },
-                                        .unary => {
+                                        .unary, .@"and", .@"or" => {
                                             _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
                                         },
                                         else => unreachable,
@@ -3287,7 +3366,6 @@ const InstGen = struct {
                                 },
                                 else => {
                                     // No-op for constants, but reg count still needs to increase and will be filled in by the constant pass
-                                    // reg_count = reg_count.increment();
                                 },
                             }
                         }
@@ -3434,7 +3512,7 @@ const InstGen = struct {
                                     .string => _ = try self.addInst(.{ .string = .{ .string = term.string, .store_reg = store_reg } }),
                                     .int => {
                                         const is_seek_term: bool = res: {
-                                            if (seek_optimization != .none) {
+                                            if (seek_optimization != .none and seek_optimization != .used) {
                                                 switch (other_term) {
                                                     .column => |col_idx_opt| {
                                                         if (col_idx_opt.unwrap()) |col_idx| {
@@ -3454,23 +3532,24 @@ const InstGen = struct {
                                                 .seek_key = store_reg,
                                                 .end_inst = halt_index,
                                             };
-                                            _ = try self.ip.replaceInst(self.gpa, cursor_move_index, switch (expr.equality) {
+                                            _ = try self.ip.replaceInst(self.gpa, cursor_move_index, switch (seek_optimization) {
                                                 .gt => .{ .seek_gt = seek },
-                                                .gte => .{ .seek_ge = seek },
-                                                .lt => .{ .seek_gt = seek }, // TODO: use is_lhs to handle seek_lt when implemented with ordering
-                                                .lte => .{ .seek_ge = seek },
+                                                .ge => .{ .seek_ge = seek },
                                                 else => unreachable,
                                             });
+                                            seek_optimization = .used;
                                         } else {
                                             _ = try self.addInst(.{ .integer = .{ .int = term.int, .store_reg = store_reg } });
                                         }
                                     },
                                     .expression, .func => {},
                                     .column => {
-                                        // Skip reg increment
-                                        continue;
+                                        if (is_lhs or other_term.tag() != .column) {
+                                            // Skip reg increment
+                                            continue;
+                                        }
                                     },
-                                    .float => return Error.InvalidSyntax,
+                                    .float => return Error.InvalidSyntax, // TODO: implement
                                 }
                                 store_reg = store_reg.increment();
                             }
