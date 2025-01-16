@@ -2300,8 +2300,8 @@ const ASTGen = struct {
         intern_pool: *InternPool,
         source: [:0]u8,
         db: Db,
-    ) Error!ASTGen {
-        return ASTGen{
+    ) ASTGen {
+        return .{
             .index = 0,
             .gpa = gpa,
             .token_list = token_list,
@@ -3074,7 +3074,7 @@ const InstGen = struct {
         intern_pool: *InternPool,
         db: Db,
         statement: Stmt,
-    ) Error!InstGen {
+    ) InstGen {
         return InstGen{
             .gpa = gpa,
             .ip = intern_pool,
@@ -4176,17 +4176,19 @@ fn parseStatement(str: [:0]u8, db_memory: DbMemory) Error!void {
     defer tokens.deinit(fixed_alloc.allocator());
 
     var intern_pool = InternPool.init();
+    defer intern_pool.deinit(fixed_alloc.allocator());
 
     try tokenizer.ingest(fixed_alloc.allocator(), &tokens);
 
     const db = try Db.init(db_memory);
 
     // ASTGen can allocate more tokens, so we pass the struct instead of the underlying buffer
-    var ast = try ASTGen.init(fixed_alloc.allocator(), &tokens, &intern_pool, str, db);
+    var ast = ASTGen.init(fixed_alloc.allocator(), &tokens, &intern_pool, str, db);
+
     const statement = try ast.buildStatement();
     debug("statement built!", .{});
 
-    var inst_gen = try InstGen.init(fixed_alloc.allocator(), &intern_pool, db, .{ .select = statement });
+    var inst_gen = InstGen.init(fixed_alloc.allocator(), &intern_pool, db, .{ .select = statement });
 
     debug("building instructions", .{});
     try inst_gen.buildInstructions();

@@ -1,5 +1,7 @@
 import loadZQL, { getFileFromUrl } from './zql.js';
 
+const DEFAULT_DB_FILE = './med.db';
+
 /**
  * Listens for a file input change event and resolves with the file data as a Uint8Array.
  * @returns {Promise<DatabaseFile>} A promise that resolves with the file data as a Uint8Array.
@@ -58,7 +60,7 @@ loadZQL().then(async (zql) => {
     zql.rowListeners.push(addTableRow);
     window.zql = zql;
 
-    await zql.loadFile(getFileFromUrl("./med.db"))
+    await zql.loadFile(getFileFromUrl(DEFAULT_DB_FILE))
     await zql.loadFile(listenForInputFile());
 });
 

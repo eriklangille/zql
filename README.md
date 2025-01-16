@@ -26,7 +26,6 @@ ln -s zig-out/bin/zql.wasm zql.wasm
 Then host the root directory using a basic web server. For e.g.:
 ```bash
 python3 -m http.server
-
 ```
 
 Then open the browser and navigate to `http://localhost:8000/zql.html`
@@ -34,7 +33,7 @@ Then open the browser and navigate to `http://localhost:8000/zql.html`
 ### Web browser debugging
 
 To debug the WASM build, open the browser DevTools and navigate to the `Console` tab.
-Build using `npm run debug` to get console log output. This will slow performance by a lot
+Build using `npm run debug` to get console log output. This will slow performance by a lot.
 Console log includes output of instruction generation, equivalent to the `explain` keyword.
 
 Select `Disable cache` under the `Network` tab when rebuilding the WASM file

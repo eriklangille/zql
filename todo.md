@@ -4,6 +4,7 @@
 - [ ] group by syntax
 - [ ] aggregate functions
 - [ ] alias
+- [ ] in
 - [x] like
 - [ ] limit
 - [ ] joins
@@ -12,15 +13,21 @@
 ## General
 - [x] Support interior pages
 - [x] Support index pages
+- [ ] Support overflow pages
 - [ ] Invalid Syntax error messages
 
 ## Syntax errors
 - [ ] provide invalid character range (token) and corresponding error message (invalid syntax, non-existing column/table)
-- [ ] highlight statement in `zql.html`
+- [ ] highlight statement in `web.js`
 
 ## Expressions
-- [ ] support comparison between columns
-- [ ] support comparison between constants
+- [x] support comparison between columns
+- [x] support comparison between constants
+- [x] support comparisons with column on right side
+- [ ] support arithmetic (+, -, *, /, %)
+- [ ] support is null / not null
+- [ ] support function syntax
+- [ ] support nested functions
 
 ## Optimization
 - [ ] page caching. LRU?
