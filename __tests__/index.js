@@ -111,13 +111,20 @@ describeDb(MED_DB_FILE, () => {
   compare("select * from t1 where name like 'a%' or name = 'Louis' or name = 'Paul';");
   compare("select name from t1 where name <> 'Paul';");
   compare("select name from t1 where name != 'Paul';");
+  compare(`select "name" from t1 where name != 'Paul';`);
   compare("select * from t2 where id = t1_id;");
   compare("select * from t2 where id != t1_id;");
   compare("select * from t1 where id > 1 and id < 4;");
+  compare("select * from t1 where id < 2 or id > 4;");
 
   // TODO: compare function that is correct if right records are returned, even if in different order
   // This comparison in SQLite first outputs the records with id > 2, then goes back and outputs 1 and 2
   // compare("select * from t1 where id > 2 or id < 4;");
+
+  // Alias
+  compare("select name as n, age as a from t1 where 20 < a and n != 'Paul';");
+  compare("select name as 'n ', age as a from t1 where 20 < a and 'n ' != 'Paul';");
+  compare(`select name as "n ", age as a from t1 where 20 < a and "n " != 'Paul';`);
 
   // Left side constant / Right side column comparison
   compare("select * from t1 where 1 < id;");
@@ -153,6 +160,7 @@ describeDb(MED_DB_FILE, () => {
   compare("select * from t1 where id = 1 and name = 'Paul' or age = 21 and (name = 'Ryan' or id = 3) and name = 'Michael' and age = 26;");
   compare("select * from t1 where (id = 1 and name = 'Paul') or age = 21 and (name = 'Ryan' or id = 3) and (name = 'Michael' and age = 26);");
   compare("select * from t1 where id = 1 and name = 'Paul' or age = 21 and ((name = 'Ryan' or id = 3) and name = 'Michael') and age = 26;");
+  compare("select *, name as n from t1 where (id <= 100 or id > 5000) and n like 'p%';");
 
   compare("select * from t1 where age < 18 or name like '%a%';");
   compare("select * from t1 where age <= 18 or name like '%a%';");

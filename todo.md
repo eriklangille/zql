@@ -3,7 +3,7 @@
 ## SQL Features
 - [ ] group by syntax
 - [ ] aggregate functions
-- [ ] alias
+- [x] alias
 - [ ] in
 - [x] like
 - [ ] limit

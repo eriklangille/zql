@@ -1600,6 +1600,7 @@ const TokenType = enum {
     single_quote_word,
     double_quote_word,
     word,
+    keyword_as,
     keyword_create,
     keyword_table,
     keyword_integer,
@@ -1628,6 +1629,7 @@ const TokenType = enum {
             .rparen => ")",
             .semicolon => ";",
             .keyword_and => "AND",
+            .keyword_as => "AS",
             .keyword_create => "CREATE",
             .keyword_from => "FROM",
             .keyword_integer => "INTEGER",
@@ -1659,6 +1661,7 @@ const Token = struct {
 
     pub const keywords = StaticStringMap(TokenType, eqlLenIgnoreCase).initComptime(.{
         .{ "and", TokenType.keyword_and },
+        .{ "as", TokenType.keyword_as },
         .{ "create", TokenType.keyword_create },
         .{ "from", TokenType.keyword_from },
         .{ "integer", TokenType.keyword_integer },
@@ -2283,6 +2286,7 @@ const ASTGen = struct {
         from_after,
         select_first,
         select_second,
+        select_second_alias,
         select_column,
         start,
         table,
@@ -2354,8 +2358,6 @@ const ASTGen = struct {
         var col_count: u32 = 0;
         var col_index: ?InternPool.Index = null;
         var table_index: ?InternPool.Index = null;
-
-        // TODO: errdefer dealloc elements of partially allocated table
 
         while (index < self.token_list.len) : (index += 1) {
             const token: MinimizedToken = self.token_list.get(index);
@@ -2512,7 +2514,7 @@ const ASTGen = struct {
                     }
                 },
                 .select_second => {
-                    debug("select_second", .{});
+                    debug("select_second, {}", .{token.tag});
                     switch (token.tag) {
                         .asterisk => {
                             const last_column_opt = tail_column;
@@ -2536,9 +2538,13 @@ const ASTGen = struct {
                             debug("keyword_from -> from_after", .{});
                             state = .from_after;
                         },
+                        .keyword_as => {
+                            state = .select_second_alias;
+                        },
                         else => {
                             const last_column_opt = tail_column;
-                            const expr_idx = self.buildExpression(table.?) catch return Error.InvalidSyntax;
+                            debug("before buildExpression", .{});
+                            const expr_idx = self.buildExpression(table.?, .none) catch return Error.InvalidSyntax;
                             tail_column = (try self.ip.put(self.gpa, .{
                                 .result_column = .{
                                     .val = .{ .expr_alias = .{ .expr = expr_idx, .alias = .empty } },
@@ -2556,6 +2562,34 @@ const ASTGen = struct {
                             // Expression reads up until comma or from, so we need to re-adjust the index
                             self.index -= 1;
                         },
+                    }
+                },
+                .select_second_alias => {
+                    switch (token.tag) {
+                        .word, .single_quote_word, .double_quote_word => {
+                            const update_col_idx = tail_column;
+                            if (update_col_idx.unwrap()) |idx| {
+                                var update_col = self.ip.indexToKey(idx).result_column;
+                                switch (update_col.val) {
+                                    .expr_alias => {
+                                        const string_literal = ASTGen.getTokenSource(self.source, token);
+                                        debug("alias literal: {s}", .{string_literal});
+                                        const str = try InternPool.NullTerminatedString.initAddSentinel(
+                                            self.gpa,
+                                            if (token.tag == .word) string_literal else string_literal[1 .. string_literal.len - 1],
+                                            self.ip,
+                                        );
+                                        update_col.val.expr_alias.alias = str;
+                                        try self.ip.update(self.gpa, idx, .{ .result_column = update_col });
+                                    },
+                                    .wildcard, .table_wildcard => return Error.InvalidSyntax,
+                                }
+                                state = .select_second;
+                            } else {
+                                return Error.InvalidSyntax;
+                            }
+                        },
+                        else => return Error.InvalidSyntax,
                     }
                 },
                 .from => {
@@ -2595,7 +2629,7 @@ const ASTGen = struct {
                     }
                 },
                 .where => {
-                    where = try self.buildExpression(table.?);
+                    where = try self.buildExpression(table.?, result_columns);
                     self.ip.dump(where);
                     // TODO: support other keywords after where and check for semicolon
                     state = .end;
@@ -2622,7 +2656,35 @@ const ASTGen = struct {
         };
     }
 
-    pub fn buildExpression(self: *ASTGen, table: InternPool.Index) Error!InternPool.Index.Optional {
+    fn findAliasColumn(self: *ASTGen, aliases: InternPool.Index, slice: []const u8) ?InternPool.Index {
+        var idx_opt = aliases.toOptional();
+        while (idx_opt.unwrap()) |idx| {
+            const result_col = self.ip.indexToKey(idx).result_column;
+            switch (result_col.val) {
+                .expr_alias => |val| {
+                    if (std.mem.eql(u8, val.alias.slice(self.ip), slice)) {
+                        // TODO: the expr should be returned and processed in replacement of the column.
+                        // This fn should also be renamed findAliasExpr
+                        if (val.expr == .none) return null;
+                        const expr = self.ip.indexToKey(val.expr.unwrap().?).expression;
+                        if (expr.equality != .unary) return null;
+                        switch (expr.lhs) {
+                            .column => |col_idx_opt| {
+                                return col_idx_opt.unwrap();
+                            },
+                            else => return null,
+                        }
+                    }
+                },
+                else => {},
+            }
+            idx_opt = result_col.next_col;
+        }
+        return null;
+    }
+
+    // TODO: add optional alias parameter
+    pub fn buildExpression(self: *ASTGen, table: InternPool.Index, aliases: InternPool.Index.Optional) Error!InternPool.Index.Optional {
         var state: State = .expr_lhs;
         var equality: ?TokenType = null;
         var last_element_andor = false;
@@ -2650,10 +2712,16 @@ const ASTGen = struct {
                     switch (token.tag) {
                         .word, .double_quote_word => {
                             // TODO: support function syntax. For e.g. like('%a', col)
-                            const column_name = ASTGen.getTokenSource(self.source, token);
+                            const column_token_slice = ASTGen.getTokenSource(self.source, token);
+                            const column_name = if (token.tag == .double_quote_word) column_token_slice[1 .. column_token_slice.len - 1] else column_token_slice;
                             const col_optional = self.ip.columnFromName(table, column_name);
                             if (col_optional) |col| {
                                 term = .{ .column = col.index.toOptional() };
+                            } else if (aliases.unwrap()) |alias_idx| {
+                                const col_opt = self.findAliasColumn(alias_idx, column_name);
+                                if (col_opt) |col| {
+                                    term = .{ .column = col.toOptional() };
+                                }
                             } else {
                                 return Error.InvalidSyntax; // Column doesn't exist
                             }
@@ -2758,6 +2826,13 @@ const ASTGen = struct {
                                 last_generated_expr_index = new_index.toOptional();
                                 debug("build_expr like complete", .{});
                                 lhs_term = null;
+                            } else if (aliases.unwrap()) |alias_idx| {
+                                const col_opt = self.findAliasColumn(alias_idx, string_literal[1 .. string_literal.len - 1]);
+                                if (col_opt) |col| {
+                                    term = .{ .column = col.toOptional() };
+                                } else {
+                                    term = .{ .string = value };
+                                }
                             } else {
                                 term = .{ .string = value };
                             }
