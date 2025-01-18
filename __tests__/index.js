@@ -121,6 +121,9 @@ describeDb(MED_DB_FILE, () => {
   // This comparison in SQLite first outputs the records with id > 2, then goes back and outputs 1 and 2
   // compare("select * from t1 where id > 2 or id < 4;");
 
+  // Addition
+  // compare ("select age + 1 from t1;")
+
   // Alias
   compare("select name as n, age as a from t1 where 20 < a and n != 'Paul';");
   compare("select name as 'n ', age as a from t1 where 20 < a and 'n ' != 'Paul';");
@@ -161,6 +164,8 @@ describeDb(MED_DB_FILE, () => {
   compare("select * from t1 where (id = 1 and name = 'Paul') or age = 21 and (name = 'Ryan' or id = 3) and (name = 'Michael' and age = 26);");
   compare("select * from t1 where id = 1 and name = 'Paul' or age = 21 and ((name = 'Ryan' or id = 3) and name = 'Michael') and age = 26;");
   compare("select *, name as n from t1 where (id <= 100 or id > 5000) and n like 'p%';");
+  compare("select * from t1 where (id > 1 and name = 'Ryan') or (id <= 2 and (name = 'Paul' or name != 'Michael'))");
+  compare("select * from t1 where (id > 1 and name = 'Ryan') or ((id <= 2 and age = 20) and (name = 'Paul' or name != 'Michael'));")
 
   compare("select * from t1 where age < 18 or name like '%a%';");
   compare("select * from t1 where age <= 18 or name like '%a%';");

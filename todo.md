@@ -13,6 +13,7 @@
 ## General
 - [x] Support interior pages
 - [x] Support index pages
+- [ ] Support float/real type
 - [ ] Support overflow pages
 - [ ] Invalid Syntax error messages
 

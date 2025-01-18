@@ -12,7 +12,7 @@
   <br/>
   <br/>
   <section style="display: flex; flex-direction: column;">
-    <input style="padding: 5px 10px; margin: 10px 0 0 0;" type="text" id="statementInput" placeholder="SQL Statement" value="select * from t1 where id > 1 or id < 4;"></input>
+    <input style="padding: 5px 10px; margin: 10px 0 0 0;" type="text" id="statementInput" placeholder="SQL Statement" value="select * from t1 where (id > 1 and name = 'Ryan') or (id <= 2 and (name = 'Paul' or name != 'Michael'));"></input>
   </section>
   <br/>
   <button id="query-button" style="padding: 10px 20px; background-color: #111; color: white; cursor: pointer; border-radius: 2px; display: inline-block; border-width: 0">Run Query</button>

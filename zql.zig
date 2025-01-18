@@ -118,6 +118,7 @@ const InternPool = struct {
         gte,
         lt,
         lte,
+        add,
         seek_gt,
         seek_ge,
         column,
@@ -377,6 +378,9 @@ const InternPool = struct {
                     .lt, .lte, .gt, .gte => |extra_data| {
                         ip.insertExtra(extra_index, extra_data);
                     },
+                    .add => |extra_data| {
+                        ip.insertExtra(extra_index, extra_data);
+                    },
                     .@"if", .if_not => |extra_data| {
                         ip.insertExtra(extra_index, extra_data);
                     },
@@ -483,6 +487,10 @@ const InternPool = struct {
                 const extra_data = ip.extraData(Instruction.Seek, item.data);
                 return .{ .seek_ge = extra_data };
             },
+            .add => {
+                const extra_data = ip.extraData(Instruction.Operation, item.data);
+                return .{ .add = extra_data };
+            },
             .next => {
                 const extra_data = ip.extraData(Instruction.Next, item.data);
                 return .{ .next = extra_data };
@@ -549,6 +557,7 @@ const InternPool = struct {
         gte: Instruction.Lt,
         lt: Instruction.Lt,
         lte: Instruction.Lt,
+        add: Instruction.Operation,
         seek_gt: Instruction.Seek,
         seek_ge: Instruction.Seek,
         string: Instruction.String,
@@ -577,6 +586,7 @@ const InternPool = struct {
                 .gte => .gte,
                 .lt => .lt,
                 .lte => .lte,
+                .add => .add,
                 .string => .string,
                 .integer => .integer,
             };
@@ -594,6 +604,7 @@ const InternPool = struct {
                 .function => @sizeOf(Instruction.Function),
                 .if_not, .@"if" => @sizeOf(Instruction.If),
                 .lt, .lte, .gt, .gte => @sizeOf(Instruction.Lt),
+                .add => @sizeOf(Instruction.Operation),
                 .column => @sizeOf(Instruction.Column),
                 .next => @sizeOf(Instruction.Next),
                 .transaction => @sizeOf(Instruction.Transaction),
@@ -601,6 +612,12 @@ const InternPool = struct {
                 .integer => @sizeOf(Instruction.Integer),
             };
         }
+
+        const Operation = struct {
+            lhs_reg: Register.Index,
+            rhs_reg: Register.Index,
+            result_reg: Register.Index,
+        };
 
         const Lt = struct {
             lhs_reg: Register.Index,
@@ -858,12 +875,11 @@ const InternPool = struct {
     };
 
     const Expression = struct {
-        equality: Expression.Equality,
+        operator: Expression.Operator,
         lhs: Term,
         rhs: Term,
 
-        // TODO: rename as operator and add +,-,*,/,%
-        const Equality = enum(u8) {
+        const Operator = enum(u8) {
             @"or",
             @"and",
             group,
@@ -874,8 +890,13 @@ const InternPool = struct {
             lte,
             gt,
             gte,
+            add,
+            minus,
+            multiply,
+            divide,
+            remainder,
 
-            pub fn is_andor(self: Equality) bool {
+            pub fn is_andor(self: Operator) bool {
                 return switch (self) {
                     .@"or", .@"and" => true,
                     else => false,
@@ -934,13 +955,18 @@ const InternPool = struct {
                 // TODO: make into enum
                 var group = false;
                 var unary = false;
-                switch (expression_data.equality) {
+                switch (expression_data.operator) {
                     .eq => _ = try buffer.write("(EQ "),
                     .ne => _ = try buffer.write("(NE "),
                     .lt => _ = try buffer.write("(LT "),
                     .lte => _ = try buffer.write("(LTE "),
                     .gt => _ = try buffer.write("(GT "),
                     .gte => _ = try buffer.write("(GTE "),
+                    .add => _ = try buffer.write("(+ "),
+                    .minus => _ = try buffer.write("(- "),
+                    .multiply => _ = try buffer.write("(* "),
+                    .divide => _ = try buffer.write("(/ "),
+                    .remainder => _ = try buffer.write("(% "),
                     .@"and" => _ = try buffer.write("(AND "),
                     .@"or" => _ = try buffer.write("(OR "),
                     .group => {
@@ -1110,7 +1136,7 @@ const InternPool = struct {
                 const expr = key.expression;
                 const lhs_tag = expr.lhs.tag();
                 const rhs_tag = expr.rhs.tag();
-                const tag: PackedU32 = .{ .a = @intFromEnum(expr.equality), .b = @intFromEnum(lhs_tag), .c = @intFromEnum(rhs_tag), .d = 0 };
+                const tag: PackedU32 = .{ .a = @intFromEnum(expr.operator), .b = @intFromEnum(lhs_tag), .c = @intFromEnum(rhs_tag), .d = 0 };
                 if (expr.lhs.is_64() or expr.rhs.is_64()) {
                     const lhs = expr.lhs.pack_64();
                     const rhs = expr.rhs.pack_64();
@@ -1246,7 +1272,7 @@ const InternPool = struct {
                 const extra_data: Expression.Repr = ip.extraData(Expression.Repr, item.data);
                 const tag: PackedU32 = @bitCast(extra_data.tag);
                 return .{ .expression = .{
-                    .equality = @enumFromInt(tag.a),
+                    .operator = @enumFromInt(tag.a),
                     .lhs = Term.unpack_32(@enumFromInt(tag.b), extra_data.lhs),
                     .rhs = Term.unpack_32(@enumFromInt(tag.c), extra_data.rhs),
                 } };
@@ -1257,7 +1283,7 @@ const InternPool = struct {
                 const lhs_packed: PackedU64 = .{ .a = extra_data.lhs_0, .b = extra_data.lhs_1 };
                 const rhs_packed: PackedU64 = .{ .a = extra_data.rhs_0, .b = extra_data.rhs_1 };
                 return .{ .expression = .{
-                    .equality = @enumFromInt(tag.a),
+                    .operator = @enumFromInt(tag.a),
                     .lhs = Term.unpack_64(@enumFromInt(tag.b), lhs_packed),
                     .rhs = Term.unpack_64(@enumFromInt(tag.c), rhs_packed),
                 } };
@@ -1584,6 +1610,7 @@ const TokenType = enum {
     minus,
     asterisk,
     divide,
+    percent,
     lparen,
     rparen,
     eof,
@@ -1604,6 +1631,7 @@ const TokenType = enum {
     keyword_create,
     keyword_table,
     keyword_integer,
+    keyword_in,
     keyword_primary,
     keyword_key,
     keyword_like,
@@ -1618,6 +1646,9 @@ const TokenType = enum {
     pub fn lexeme(token_type: TokenType) ?[]const u8 {
         return switch (token_type) {
             .asterisk => "*",
+            .divide => "/",
+            .plus => "+",
+            .minus => "-",
             .comma => ",",
             .eq => "=",
             .lparen => "(",
@@ -1632,6 +1663,7 @@ const TokenType = enum {
             .keyword_as => "AS",
             .keyword_create => "CREATE",
             .keyword_from => "FROM",
+            .keyword_in => "IN",
             .keyword_integer => "INTEGER",
             .keyword_key => "KEY",
             .keyword_like => "LIKE",
@@ -1664,6 +1696,7 @@ const Token = struct {
         .{ "as", TokenType.keyword_as },
         .{ "create", TokenType.keyword_create },
         .{ "from", TokenType.keyword_from },
+        .{ "in", TokenType.keyword_in },
         .{ "integer", TokenType.keyword_integer },
         .{ "key", TokenType.keyword_key },
         .{ "like", TokenType.keyword_like },
@@ -1762,9 +1795,6 @@ const Tokenizer = struct {
                     },
                     '=' => {
                         state = .eq;
-                        // token.type = .eq;
-                        // self.index += 1;
-                        // break;
                     },
                     '>' => {
                         state = .gt;
@@ -1777,6 +1807,26 @@ const Tokenizer = struct {
                     },
                     '*' => {
                         token.type = .asterisk;
+                        self.index += 1;
+                        break;
+                    },
+                    '+' => {
+                        token.type = .plus;
+                        self.index += 1;
+                        break;
+                    },
+                    '-' => {
+                        token.type = .minus;
+                        self.index += 1;
+                        break;
+                    },
+                    '/' => {
+                        token.type = .divide;
+                        self.index += 1;
+                        break;
+                    },
+                    '%' => {
+                        token.type = .percent;
                         self.index += 1;
                         break;
                     },
@@ -1829,12 +1879,10 @@ const Tokenizer = struct {
                         self.index += 1;
                         break;
                     },
-                    ' ' => {
-                        // TODO: accept tokens other than ' '
+                    else => {
                         token.type = TokenType.gt;
                         break;
                     },
-                    else => token.type = TokenType.invalid,
                 },
                 .eq => switch (c) {
                     '=' => {
@@ -1858,11 +1906,10 @@ const Tokenizer = struct {
                         self.index += 1;
                         break;
                     },
-                    ' ' => {
+                    else => {
                         token.type = TokenType.lt;
                         break;
                     },
-                    else => token.type = TokenType.invalid,
                 },
                 .double_quote_word => switch (c) {
                     'a'...'z', 'A'...'Z' => {},
@@ -2130,7 +2177,7 @@ const SQLiteColumn = union(enum) {
     }
 };
 
-pub const Error = error{ InvalidBinary, InvalidSyntax, OutOfMemory };
+pub const Error = error{ InvalidBinary, InvalidSyntax, OutOfMemory, NotImplemented };
 
 const Db = struct {
     memory: DbMemory,
@@ -2279,7 +2326,7 @@ const ASTGen = struct {
         end,
         expr_root,
         expr_andor,
-        expr_equality,
+        expr_operator,
         expr_lhs,
         expr_rhs,
         from,
@@ -2667,7 +2714,7 @@ const ASTGen = struct {
                         // This fn should also be renamed findAliasExpr
                         if (val.expr == .none) return null;
                         const expr = self.ip.indexToKey(val.expr.unwrap().?).expression;
-                        if (expr.equality != .unary) return null;
+                        if (expr.operator != .unary) return null;
                         switch (expr.lhs) {
                             .column => |col_idx_opt| {
                                 return col_idx_opt.unwrap();
@@ -2683,10 +2730,9 @@ const ASTGen = struct {
         return null;
     }
 
-    // TODO: add optional alias parameter
     pub fn buildExpression(self: *ASTGen, table: InternPool.Index, aliases: InternPool.Index.Optional) Error!InternPool.Index.Optional {
         var state: State = .expr_lhs;
-        var equality: ?TokenType = null;
+        var operator: ?TokenType = null;
         var last_element_andor = false;
         var is_like = false;
         var last_generated_expr_index: InternPool.Index.Optional = .none;
@@ -2702,8 +2748,8 @@ const ASTGen = struct {
             switch (state) {
                 .expr_lhs, .expr_rhs => {
                     if (state == .expr_rhs) {
-                        debug("expr_rhs eq: {?}, lhs_term: {?}", .{ equality, lhs_term });
-                        if (equality == null or lhs_term == null) {
+                        debug("expr_rhs eq: {?}, lhs_term: {?}", .{ operator, lhs_term });
+                        if (operator == null or lhs_term == null) {
                             debug("expr missing", .{});
                             return Error.InvalidSyntax;
                         }
@@ -2732,10 +2778,10 @@ const ASTGen = struct {
                             if (last.unwrap()) |last_idx| {
                                 // Create new group from last open root and add it to the previous root
                                 const last_expr = self.ip.indexToKey(last_idx).expression;
-                                const new_index = switch (last_expr.equality) {
+                                const new_index = switch (last_expr.operator) {
                                     .@"and", .@"or", .group => try self.ip.put(self.gpa, .{
                                         .expression = .{
-                                            .equality = .group,
+                                            .operator = .group,
                                             .rhs = .{ .expression = .none },
                                             .lhs = .{ .expression = last },
                                         },
@@ -2747,7 +2793,7 @@ const ASTGen = struct {
                                 const new_root_index_opt = open_roots.items[open_roots.items.len - 1];
                                 if (new_root_index_opt.unwrap()) |new_root_index| {
                                     var cur = self.ip.indexToKey(new_root_index).expression;
-                                    switch (cur.equality) {
+                                    switch (cur.operator) {
                                         .@"and", .@"or" => {},
                                         else => break, // Invalid syntax
                                     }
@@ -2765,7 +2811,7 @@ const ASTGen = struct {
                         },
                         .keyword_and, .keyword_or => {
                             if (last_element_andor) {
-                                // TODO: cannot do and or if last token is equality too
+                                // TODO: cannot do and or if last token is operator too
                                 debug("not valid place for and/or", .{});
                                 break;
                             }
@@ -2781,7 +2827,7 @@ const ASTGen = struct {
                             const new_index = try self.ip.put(self.gpa, .{
                                 .expression = .{
                                     .rhs = andor_rhs,
-                                    .equality = switch (token.tag) {
+                                    .operator = switch (token.tag) {
                                         .keyword_and => .@"and",
                                         .keyword_or => .@"or",
                                         else => unreachable, // and or expressions
@@ -2801,7 +2847,7 @@ const ASTGen = struct {
                             const value = try InternPool.NullTerminatedString.initAddSentinel(self.gpa, string_literal[1 .. string_literal.len - 1], self.ip);
                             if (is_like) {
                                 if (lhs_term == null) return Error.InvalidSyntax;
-                                debug("build_expr like eq: {}", .{equality.?});
+                                debug("build_expr like eq: {}", .{operator.?});
                                 const match_arg = try self.ip.put(self.gpa, .{ .argument = .{
                                     .term = lhs_term.?,
                                     .next_argument = .none,
@@ -2819,7 +2865,7 @@ const ASTGen = struct {
                                 const new_index = try self.ip.put(self.gpa, .{
                                     .expression = .{
                                         .lhs = .{ .func = func_lhs.toOptional() },
-                                        .equality = .unary,
+                                        .operator = .unary,
                                         .rhs = .{ .expression = .none },
                                     },
                                 });
@@ -2867,13 +2913,14 @@ const ASTGen = struct {
                             const new_index = try self.ip.put(self.gpa, .{
                                 .expression = .{
                                     .lhs = lhs_term.?,
-                                    .equality = switch (equality.?) {
+                                    .operator = switch (operator.?) {
                                         .eq => .eq,
                                         .ne => .ne,
                                         .lt => .lt,
                                         .gt => .gt,
                                         .lte => .lte,
                                         .gte => .gte,
+                                        .plus => .add,
                                         else => return Error.InvalidSyntax,
                                     },
                                     .rhs = term.?,
@@ -2892,22 +2939,22 @@ const ASTGen = struct {
                         } else {
                             open_roots.items[open_roots.items.len - 1] = last_generated_expr_index;
                         }
-                        equality = null;
+                        operator = null;
                         lhs_term = null;
                         state = .expr_lhs;
                     } else if (state == .expr_lhs and term != null) {
                         lhs_term = term;
-                        state = .expr_equality;
+                        state = .expr_operator;
                     }
                 },
-                .expr_equality => switch (token.tag) {
-                    .eq, .ne, .lt, .lte, .gt, .gte => {
-                        equality = token.tag;
-                        debug("expr_equality: {}", .{equality.?});
+                .expr_operator => switch (token.tag) {
+                    .eq, .ne, .lt, .lte, .gt, .gte, .plus => {
+                        operator = token.tag;
+                        debug("expr_operator: {}", .{operator.?});
                         state = .expr_rhs;
                     },
                     .keyword_like => {
-                        equality = .eq;
+                        operator = .eq;
                         is_like = true;
                         state = .expr_rhs;
                     },
@@ -2930,7 +2977,7 @@ const ASTGen = struct {
                             const new_index = try self.ip.put(self.gpa, .{
                                 .expression = .{
                                     .lhs = lhs_term.?,
-                                    .equality = .unary,
+                                    .operator = .unary,
                                     .rhs = .{ .expression = .none },
                                 },
                             });
@@ -3011,10 +3058,11 @@ const ExpressionTraversal = struct {
     ip: *InternPool,
     stack: Stack,
     first: InternPool.Index.Optional,
+    group: InternPool.Index.Optional,
     depth: u32,
 
-    const StackItem = struct { eq: InternPool.Expression.Equality, index: InternPool.Index };
-    const Leaf = struct { eq: ?InternPool.Expression.Equality, index: InternPool.Index, depth: u32 };
+    const StackItem = struct { op: InternPool.Expression.Operator, index: InternPool.Index };
+    const Leaf = struct { op: ?InternPool.Expression.Operator, index: InternPool.Index, depth: u32 };
     const Stack = ArrayListUnmanaged(StackItem);
 
     pub fn init(intern_pool: *InternPool, root: InternPool.Index.Optional) Allocator.Error!ExpressionTraversal {
@@ -3027,16 +3075,16 @@ const ExpressionTraversal = struct {
     }
 
     // TODO: can probably be deleted. Instead, when we get to an and index, all previous none or jumps can be changed to jump to that expression
-    pub fn nextRequiredExpression(self: *ExpressionTraversal, eq: ?InternPool.Expression.Equality) InternPool.Index.Optional {
-        if (eq == null) return .none;
+    pub fn nextRequiredExpression(self: *ExpressionTraversal, op: ?InternPool.Expression.Operator) InternPool.Index.Optional {
+        if (op == null) return .none;
         if (self.stack.items.len == 0) return .none;
-        debug("nextRequiredExpression: eq: {}, stack: {any}", .{ eq.?, self.stack.items });
+        debug("nextRequiredExpression: eq: {}, stack: {any}", .{ op.?, self.stack.items });
         var i: usize = self.stack.items.len - 1;
         while (i >= 0) : (i -= 1) {
             const item = self.stack.items[i];
-            switch (eq.?) {
-                .@"or" => if (item.eq == .@"and") return item.index.toOptional(),
-                .@"and" => if (item.eq == .@"or") return item.index.toOptional(),
+            switch (op.?) {
+                .@"or" => if (item.op == .@"and") return item.index.toOptional(),
+                .@"and" => if (item.op == .@"or") return item.index.toOptional(),
                 else => unreachable,
             }
             debug("nextRequiredExpression: item missed {}", .{item});
@@ -3045,45 +3093,49 @@ const ExpressionTraversal = struct {
         return .none;
     }
 
+    // TODO: if we're popping and there's a RHS (not leaf) that we haven't explored yet, we need to return that as well.
+    // So that when we're doing the condition jumping, we can determine to jump for not leaf-level ors ands
+    // When we find a blank or, we go to next jump after it even if its an and
+    // We we find a blank and, we have to try that side even if its an or
     pub fn next(self: *ExpressionTraversal, alloc: Allocator) Allocator.Error!?Leaf {
         if (self.first != .none) {
             var cur = self.first;
             self.first = .none;
             while (cur.unwrap()) |idx| {
                 const expr = self.ip.indexToKey(idx).expression;
-                switch (expr.equality) {
+                switch (expr.operator) {
                     .@"or", .@"and", .group => {
                         switch (expr.rhs) {
                             .expression => {
-                                try self.stack.append(alloc, .{ .eq = expr.equality, .index = idx });
+                                try self.stack.append(alloc, .{ .op = expr.operator, .index = idx });
                             },
                             else => {},
                         }
                         switch (expr.lhs) {
                             .expression => |next_expr| {
                                 cur = next_expr;
-                                if (expr.equality == .group) {
+                                if (expr.operator == .group) {
                                     self.depth += 1;
                                 }
                             },
                             else => {
-                                if (self.stack.items.len == 0) return .{ .eq = null, .index = idx, .depth = self.depth };
+                                if (self.stack.items.len == 0) return .{ .op = null, .index = idx, .depth = self.depth };
                                 const parent = self.stack.items[self.stack.items.len - 1];
-                                return .{ .eq = parent.eq, .index = idx, .depth = self.depth };
+                                return .{ .op = parent.op, .index = idx, .depth = self.depth };
                             },
                         }
                     },
                     else => {
-                        if (self.stack.items.len == 0) return .{ .eq = null, .index = idx, .depth = self.depth };
+                        if (self.stack.items.len == 0) return .{ .op = null, .index = idx, .depth = self.depth };
                         const parent = self.stack.items[self.stack.items.len - 1];
-                        return .{ .eq = parent.eq, .index = idx, .depth = self.depth };
+                        return .{ .op = parent.op, .index = idx, .depth = self.depth };
                     },
                 }
             }
         }
         while (self.stack.popOrNull()) |pop| {
             const key = self.ip.indexToKey(pop.index).expression;
-            if (key.equality == .group) {
+            if (key.operator == .group) {
                 self.depth -= 1;
                 continue;
             }
@@ -3092,34 +3144,34 @@ const ExpressionTraversal = struct {
                 .expression => |expr| cur = expr,
                 else => unreachable, // All items on the stack should have a right expression
             }
-            var prev = cur;
+            var prev: ?InternPool.Expression.Operator = null;
             while (cur.unwrap()) |idx| {
                 const expr = self.ip.indexToKey(idx).expression;
-                switch (expr.equality) {
+                switch (expr.operator) {
                     .@"or", .@"and", .group => {
                         switch (expr.rhs) {
                             .expression => {
-                                try self.stack.append(alloc, .{ .eq = expr.equality, .index = idx });
+                                try self.stack.append(alloc, .{ .op = expr.operator, .index = idx });
                             },
                             else => {},
                         }
                         switch (expr.lhs) {
                             .expression => |next_expr| {
-                                prev = cur;
+                                prev = expr.operator;
                                 cur = next_expr;
-                                if (expr.equality == .group) {
+                                if (expr.operator == .group) {
                                     self.depth += 1;
                                 }
                             },
                             else => return .{
-                                .eq = expr.equality,
+                                .op = expr.operator,
                                 .index = idx,
                                 .depth = self.depth,
                             },
                         }
                     },
                     else => return .{
-                        .eq = pop.eq,
+                        .op = prev orelse pop.op,
                         .index = idx,
                         .depth = self.depth,
                     },
@@ -3238,7 +3290,7 @@ const InstGen = struct {
     const Comparison = struct {
         inst: InternPool.InstIndex, // Instruction to modify
         jump: InternPool.InstIndex, // Instruction to jump to
-        eq: InternPool.Expression.Equality, // Determines next instruction jump behaviour
+        eq: InternPool.Expression.Operator, // Determines next instruction jump behaviour
         depth: u32, // Bracket depth, can only jump to instructions with a smaller depth
     };
 
@@ -3296,10 +3348,10 @@ const InstGen = struct {
                     var traversal = try ExpressionTraversal.init(self.ip, where_clause);
                     defer traversal.deinit(self.gpa);
                     // TODO: tree traversal left and right side. When the left side is the id record (ge/gt) with and, then its seek loop for ea one
-                    while (try traversal.next(self.gpa)) |item| {
-                        const expr_idx = item.index;
-                        const eq = item.eq;
-                        const depth = item.depth;
+                    while (try traversal.next(self.gpa)) |leaf| {
+                        const expr_idx = leaf.index;
+                        const eq = leaf.op;
+                        const depth = leaf.depth;
                         const expr = self.ip.indexToKey(expr_idx).expression;
 
                         for (0..2) |i| {
@@ -3354,13 +3406,13 @@ const InstGen = struct {
                                         primary_key_col = term.column;
                                         if (eq == null or (eq == .@"and" and traversal.nextRequiredExpression(.@"and") == .none)) {
                                             if (is_lhs) {
-                                                switch (expr.equality) {
+                                                switch (expr.operator) {
                                                     .gt => seek_optimization = .gt,
                                                     .gte => seek_optimization = .ge,
                                                     else => {},
                                                 }
                                             } else {
-                                                switch (expr.equality) {
+                                                switch (expr.operator) {
                                                     .lt => seek_optimization = .gt,
                                                     .lte => seek_optimization = .ge,
                                                     else => {},
@@ -3374,7 +3426,7 @@ const InstGen = struct {
                                     }
                                     const first_inst = self.ip.peekInst();
                                     const col_reg: Register.Index = blk: {
-                                        if (!is_lhs and other_term.tag() == .column and !expr.equality.is_andor()) {
+                                        if (!is_lhs and other_term.tag() == .column and !expr.operator.is_andor()) {
                                             break :blk reg_count.increment();
                                         }
                                         break :blk compare_reg;
@@ -3394,7 +3446,7 @@ const InstGen = struct {
                                     // If the LHS and RHS are both columns, and its a binary comparison between the two columns
                                     // we only want to add one comparison to compare the sides instead of 2.
                                     // The comparison needs to be added after the RHS column instruction has been added.
-                                    if (is_lhs and other_term.tag() == .column and !expr.equality.is_andor()) {
+                                    if (is_lhs and other_term.tag() == .column and !expr.operator.is_andor()) {
                                         continue;
                                     }
                                     reg_count = reg_count.increment();
@@ -3404,7 +3456,7 @@ const InstGen = struct {
                                         .inst = self.ip.peekInst(),
                                         .depth = depth,
                                     });
-                                    switch (expr.equality) {
+                                    switch (expr.operator) {
                                         .eq => {
                                             _ = try self.addInst(.{ .eq = .{
                                                 .lhs_reg = compare_reg,
@@ -3425,7 +3477,7 @@ const InstGen = struct {
                                                 .rhs_reg = reg_count,
                                                 .jump = .none,
                                             };
-                                            switch (expr.equality) {
+                                            switch (expr.operator) {
                                                 .gt => _ = try self.addInst(if (is_lhs) .{ .gt = data } else .{ .lt = data }),
                                                 .gte => _ = try self.addInst(if (is_lhs) .{ .gte = data } else .{ .lte = data }),
                                                 .lt => _ = try self.addInst(if (is_lhs) .{ .lt = data } else .{ .gt = data }),
@@ -3455,6 +3507,7 @@ const InstGen = struct {
                 debug("cur_col", .{});
 
                 // Column output pass - Load the registers with the results as defined by result_column (i.e. SELECT <result_column> FROM ...)
+                // TODO: We will need to split this into 2 passes, one for constants and one for columns
                 while (cur_col.unwrap()) |col_idx| {
                     const res_col = self.ip.indexToKey(col_idx).result_column;
                     switch (res_col.val) {
@@ -3471,7 +3524,7 @@ const InstGen = struct {
                             const expr_idx_opt = val.expr;
                             assert(expr_idx_opt != .none);
                             const expr = self.ip.indexToKey(expr_idx_opt.unwrap().?).expression;
-                            switch (expr.equality) {
+                            switch (expr.operator) {
                                 .unary => {
                                     switch (expr.lhs) {
                                         .column => |expr_col_idx| {
@@ -3483,7 +3536,14 @@ const InstGen = struct {
                                         else => unreachable, // TODO: implement
                                     }
                                 },
-                                else => unreachable, //TODO: implement
+                                else => {
+                                    var traversal = try ExpressionTraversal.init(self.ip, expr_idx_opt);
+                                    while (try traversal.next(self.gpa)) |leaf| {
+                                        // TODO: implement
+                                        _ = leaf;
+                                        unreachable;
+                                    }
+                                },
                             }
                         },
                         else => unreachable, // TODO: implement table wildcard
@@ -3511,7 +3571,7 @@ const InstGen = struct {
                     const eq = slice.items(.eq)[sl_i];
                     // Instruction depth is how many layers of brackers. Example depths: 0, (1), ((2))
                     const depth = slice.items(.depth)[sl_i];
-                    debug("comparisons: inst {}, eq {}, depth {d}", .{ inst, eq, depth });
+                    debug("comparisons: inst {}, op {}, depth {d}", .{ inst, eq, depth });
                     if (sl_i == slice.len - 1) {
                         self.negate(inst);
                         self.replaceJump(inst, next_index);
@@ -3554,7 +3614,7 @@ const InstGen = struct {
                         const expr = self.ip.indexToKey(expr_idx).expression;
                         for (0..2) |i| {
                             const is_lhs = i == 0;
-                            if (expr.equality == .unary and !is_lhs) break;
+                            if (expr.operator == .unary and !is_lhs) break;
                             const term = if (is_lhs) expr.lhs else expr.rhs;
                             const other_term = if (is_lhs) expr.rhs else expr.lhs;
                             const is_func = switch (term) {
@@ -4229,6 +4289,7 @@ const Vm = struct {
                 .goto => |goto_inst| {
                     self.pc = goto_inst;
                 },
+                .add => unreachable, // TODO: implement
                 // else => debug("instruction not implemented: {}", .{instruction.opcode}),
             }
         }
@@ -4304,6 +4365,7 @@ export fn runStatementWithFile(loaded_file_ptr: ?*u8, size: usize) void {
             Error.InvalidBinary => debug("uh oh stinky binary file", .{}),
             Error.InvalidSyntax => debug("uh oh stinky SQL syntax", .{}),
             Error.OutOfMemory => debug("uh oh allocator ran out of memory", .{}),
+            Error.NotImplemented => debug("uh oh fworgot to impwement -><-", .{}),
         }
         return;
     };
