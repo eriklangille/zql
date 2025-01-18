@@ -132,10 +132,10 @@ describeDb(MED_DB_FILE, () => {
   compare("select * from t1 where 19 <= age;");
 
   // Compare constants
-  compare("select * from t1 where 19 <= 19;");
   compare("select * from t1 where 1 != 1;");
   compare("select * from t1 where 1 == 1;");
   compare("select * from t1 where 1 > 1;");
+  compare("select * from t1 where 1 < 1;");
   compare("select * from t1 where 1 >= 1;");
   compare("select * from t1 where 1 <= 1;");
 

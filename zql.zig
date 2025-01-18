@@ -3509,39 +3509,34 @@ const InstGen = struct {
                 while (sl_i < slice.len) : (sl_i += 1) {
                     const inst = slice.items(.inst)[sl_i];
                     const eq = slice.items(.eq)[sl_i];
+                    // Instruction depth is how many layers of brackers. Example depths: 0, (1), ((2))
                     const depth = slice.items(.depth)[sl_i];
                     debug("comparisons: inst {}, eq {}, depth {d}", .{ inst, eq, depth });
                     if (sl_i == slice.len - 1) {
                         self.negate(inst);
                         self.replaceJump(inst, next_index);
                     } else {
+                        // This is the jump logic. If we do not jump, then the comparison will fall through to the next instruction.
+                        // Therefore, we need to know what the next instruction is for a jump.
+                        // If the next operator is an "and", we want to jump on false, since false and <any value> = false
+                        // If the next operator is an "or", we want to jump on true, since true or <any value> = true
                         const next_eq = slice.items(.eq)[sl_i + 1];
-                        switch (eq) {
-                            .@"or" => {
-                                if (next_eq == .@"and") {
-                                    self.negate(inst);
-                                }
-                                var j: usize = sl_i + 1;
-                                while (j < slice.len and (slice.items(.eq)[j] != .@"or" or slice.items(.depth)[j] < depth)) : (j += 1) {}
-                                if (j == slice.len) {
-                                    self.replaceJump(inst, if (next_eq == .@"and") next_index else columns_start);
-                                } else {
-                                    self.replaceJump(inst, if (next_eq == .@"and") slice.items(.jump)[j] else columns_start);
-                                }
-                            },
-                            .@"and" => {
-                                if (next_eq == .@"and") {
-                                    self.negate(inst);
-                                }
-                                var j: usize = sl_i + 1;
-                                while (j < slice.len and (slice.items(.eq)[j] != .@"or" or slice.items(.depth)[j] < depth)) : (j += 1) {}
-                                if (j == slice.len) {
-                                    self.replaceJump(inst, if (next_eq == .@"and") next_index else columns_start);
-                                } else {
-                                    self.replaceJump(inst, if (next_eq == .@"and") slice.items(.jump)[j] else columns_start);
-                                }
-                            },
+                        const jump_on_false = next_eq == .@"and";
+                        if (jump_on_false) {
+                            // The default behavior for comparison instructions is to jump on true. So to jump on false, we negate the instruction.
+                            self.negate(inst);
+                        }
+                        var j: usize = sl_i + 1;
+                        // Find the jump instruction. Check if we can skip instruction j
+                        while (j < slice.len and switch (slice.items(.eq)[j]) {
+                            .@"and" => jump_on_false or slice.items(.depth)[j] >= depth,
+                            .@"or" => !jump_on_false or slice.items(.depth)[j] < depth,
                             else => unreachable,
+                        }) : (j += 1) {}
+                        if (j == slice.len) {
+                            self.replaceJump(inst, if (jump_on_false) next_index else columns_start);
+                        } else {
+                            self.replaceJump(inst, slice.items(.jump)[j]);
                         }
                     }
                 }
