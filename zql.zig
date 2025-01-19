@@ -55,6 +55,20 @@ const PackedU64 = packed struct {
     }
 };
 
+// Inspired by intern_pool.zig in the Zig source code. This data structure contains "high-density" representation
+// of the abstract syntax tree (AST) in the items array and the VM instructions generated from the AST.
+// It also contains byte strings (string_bytes), that can be reference using the String and NullTerminatedString enums.
+// Each item in the items array takes 5 bytes - 4 bytes data and 1 byte tag. If additional data is required, it is allocated
+// to the extra data array, with the 4 byte main data being a reference to the extra data. Each extra array item is also 4 bytes.
+// The instruction array is the same as the items array, but for VM instructions instead of the AST.
+// The objective of this interface is to use the fewest bytes possible. This is accomplished in a couple ways:
+//   1. References to items in the InternPool are 4 byte integers (wrapped in an enum) instead of pointers or slices
+//   2. Any external struct (called a "Key") is mapped to an internal representation that fits the in the smallest amount of bytes.
+// A reference to that "Key" is called an "Index". The internal data can be retreived using the "indexToKey" function and a "Key" is
+// stored as the intern representation with the "put" function.
+// Items in the InternPool can updated using the "update" function, but the replacement value must take the same amount of bytes
+// as the value being replaced. A common pattern in the code is to first add an item with a null reference, and then update that item
+// once the real reference has been created later in the code.
 const InternPool = struct {
     items: MultiArrayList(Item),
     instructions: MultiArrayList(InstItem),
@@ -3330,7 +3344,7 @@ const InstGen = struct {
         inst: InternPool.InstIndex, // Instruction to modify
         jump: InternPool.InstIndex, // Instruction to jump to
         eq: InternPool.Expression.Operator, // Determines next instruction jump behaviour
-        depth: u32, // Bracket depth, can only jump to instructions with a smaller depth
+        depth: u32, // Bracket depth, required to determine if viable jump target
     };
 
     const ComparisonList = MultiArrayList(Comparison);
