@@ -45,7 +45,12 @@ async function compareInternal(query) {
     actual.push(actual_item);
     expected.push(expected_item);
   }
-  expect(actual).toStrictEqual(expected);
+  
+  // Sort both arrays for order-independent comparison
+  const sortedActual = actual.map(arr => arr.slice().sort()).sort();
+  const sortedExpected = expected.map(arr => arr.slice().sort()).sort();
+  
+  expect(sortedActual).toStrictEqual(sortedExpected);
   // clear the array
   zqlResult = [];
 }
@@ -116,10 +121,7 @@ describeDb(MED_DB_FILE, () => {
   compare("select * from t2 where id != t1_id;");
   compare("select * from t1 where id > 1 and id < 4;");
   compare("select * from t1 where id < 2 or id > 4;");
-
-  // TODO: compare function that is correct if right records are returned, even if in different order
-  // This comparison in SQLite first outputs the records with id > 2, then goes back and outputs 1 and 2
-  // compare("select * from t1 where id > 2 or id < 4;");
+  compare("select * from t1 where id > 2 or id < 4;");
 
   // Addition
   // compare ("select age + 1 from t1;")
@@ -164,6 +166,8 @@ describeDb(MED_DB_FILE, () => {
   compare("select * from t1 where (id = 1 and name = 'Paul') or age = 21 and (name = 'Ryan' or id = 3) and (name = 'Michael' and age = 26);");
   compare("select * from t1 where id = 1 and name = 'Paul' or age = 21 and ((name = 'Ryan' or id = 3) and name = 'Michael') and age = 26;");
   compare("select *, name as n from t1 where (id <= 100 or id > 5000) and n like 'p%';");
+
+  // SQLite put these out of order, but gives same result
   compare("select * from t1 where (id > 1 and name = 'Ryan') or (id <= 2 and (name = 'Paul' or name != 'Michael'))");
   compare("select * from t1 where (id > 1 and name = 'Ryan') or ((id <= 2 and age = 20) and (name = 'Paul' or name != 'Michael'));")
 
