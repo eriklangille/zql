@@ -104,6 +104,7 @@ const InternPool = struct {
         function,
         result_column,
         result_column_wildcard,
+        root,
         table,
     };
 
@@ -908,6 +909,8 @@ const InternPool = struct {
         const Operator = enum(u8) {
             @"or",
             @"and",
+            not,
+            like,
             unary,
             eq,
             ne,
@@ -924,6 +927,13 @@ const InternPool = struct {
             pub fn is_andor(self: Operator) bool {
                 return switch (self) {
                     .@"or", .@"and" => true,
+                    else => false,
+                };
+            }
+
+            pub fn is_math(self: Operator) bool {
+                return switch (self) {
+                    .add, .minus, .multiple, .divide, .remainder => true,
                     else => false,
                 };
             }
@@ -983,6 +993,8 @@ const InternPool = struct {
                 switch (expression_data.operator) {
                     .eq => _ = try buffer.write("(EQ "),
                     .ne => _ = try buffer.write("(NE "),
+                    .not => _ = try buffer.write("(NOT "),
+                    .like => _ = try buffer.write("(LIKE "),
                     .lt => _ = try buffer.write("(LT "),
                     .lte => _ = try buffer.write("(LTE "),
                     .gt => _ = try buffer.write("(GT "),
@@ -1386,6 +1398,7 @@ const InternPool = struct {
                 const result: Cursor = .{ .index = item.data };
                 return .{ .cursor = result };
             },
+            .root => unreachable, // Just the root
         }
     }
 };
@@ -1671,6 +1684,7 @@ const TokenType = enum {
     keyword_where,
     keyword_and,
     keyword_or,
+    keyword_not,
     invalid,
 
     pub fn lexeme(token_type: TokenType) ?[]const u8 {
@@ -1697,6 +1711,7 @@ const TokenType = enum {
             .keyword_integer => "INTEGER",
             .keyword_key => "KEY",
             .keyword_like => "LIKE",
+            .keyword_not => "NOT",
             .keyword_or => "OR",
             .keyword_primary => "PRIMARY",
             .keyword_select => "SELECT",
@@ -1730,6 +1745,7 @@ const Token = struct {
         .{ "integer", TokenType.keyword_integer },
         .{ "key", TokenType.keyword_key },
         .{ "like", TokenType.keyword_like },
+        .{ "not", TokenType.keyword_not },
         .{ "or", TokenType.keyword_or },
         .{ "primary", TokenType.keyword_primary },
         .{ "select", TokenType.keyword_select },
@@ -2621,7 +2637,7 @@ const ASTGen = struct {
                         else => {
                             const last_column_opt = tail_column;
                             debug("before buildExpression", .{});
-                            const expr_idx = self.buildExpression(table.?, .none) catch return Error.InvalidSyntax;
+                            const expr_idx = self.buildExpressionPrecedence(table.?, .none) catch return Error.InvalidSyntax;
                             tail_column = (try self.ip.put(self.gpa, .{
                                 .result_column = .{
                                     .val = .{ .expr_alias = .{ .expr = expr_idx, .alias = .empty } },
@@ -2706,7 +2722,7 @@ const ASTGen = struct {
                     }
                 },
                 .where => {
-                    where = try self.buildExpression(table.?, result_columns);
+                    where = try self.buildExpressionPrecedence(table.?, result_columns);
                     self.ip.dump(where);
                     // TODO: support other keywords after where and check for semicolon
                     state = .end;
@@ -2731,6 +2747,148 @@ const ASTGen = struct {
             .table = table.?,
             .where = where,
         };
+    }
+
+    const OperInfo = struct {
+        prec: i8,
+        op: InternPool.Expression.Operator,
+        assoc_left: bool = false,
+    };
+
+    // https://www.sqlite.org/lang_expr.html#operators_and_parse_affecting_attributes
+    const operTable = std.enums.directEnumArrayDefault(TokenType, OperInfo, .{ .prec = -1, .op = InternPool.Expression.Operator.@"or" }, 0, .{
+        .keyword_or = .{ .prec = 0, .op = .@"or" },
+        .keyword_and = .{ .prec = 1, .op = .@"and" },
+        .keyword_not = .{ .prec = 2, .op = .not },
+        .eq = .{ .prec = 3, .op = .eq },
+        .ne = .{ .prec = 3, .op = .ne },
+        .keyword_like = .{ .prec = 3, .op = .like },
+        .gt = .{ .prec = 4, .op = .gt },
+        .gte = .{ .prec = 4, .op = .gte },
+        .lt = .{ .prec = 4, .op = .lt },
+        .lte = .{ .prec = 4, .op = .lte },
+        .plus = .{ .prec = 7, .op = .add },
+        .minus = .{ .prec = 7, .op = .minus },
+        .asterisk = .{ .prec = 8, .op = .multiply },
+        .divide = .{ .prec = 8, .op = .divide },
+        .percent = .{ .prec = 8, .op = .remainder },
+    });
+
+    fn buildExpressionNode(self: *ASTGen, or_list: *std.ArrayListUnmanaged(TokenType), and_list: *std.ArrayListUnmanaged(InternPool.Term)) Error!void {
+        if (or_list.items.len == 0) return Error.InvalidSyntax;
+        if (and_list.items.len < 2) return Error.InvalidSyntax;
+        const token: TokenType = or_list.pop();
+        const right: InternPool.Term = and_list.pop();
+        const left: InternPool.Term = and_list.pop();
+        const op_info = operTable[@as(usize, @intCast(@intFromEnum(token)))];
+        const index = try self.ip.put(self.gpa, .{
+            .expression = .{ .operator = op_info.op, .lhs = left, .rhs = right },
+        });
+        try and_list.append(self.gpa, .{ .expression = index.toOptional() });
+    }
+
+    pub fn buildExpressionPrecedence(self: *ASTGen, table: InternPool.Index, aliases: InternPool.Index.Optional) Error!InternPool.Index.Optional {
+        var operator_list: std.ArrayListUnmanaged(TokenType) = .{};
+        defer operator_list.deinit(self.gpa);
+        var operand_list: std.ArrayListUnmanaged(InternPool.Term) = .{};
+        defer operand_list.deinit(self.gpa);
+
+        while (self.index < self.token_list.len) : (self.index += 1) {
+            const token = self.token_list.get(self.index);
+            debug("[expr] token: {}", .{token});
+
+            switch (token.tag) {
+                .word, .double_quote_word => {
+                    // TODO: support function syntax. For e.g. like('%a', col)
+                    var col_index: InternPool.Index.Optional = .none;
+                    const column_token_slice = ASTGen.getTokenSource(self.source, token);
+                    const column_name = if (token.tag == .double_quote_word) column_token_slice[1 .. column_token_slice.len - 1] else column_token_slice;
+                    const col_optional = self.ip.columnFromName(table, column_name);
+                    if (col_optional) |col| {
+                        col_index = col.index.toOptional();
+                    } else if (aliases.unwrap()) |alias_idx| {
+                        const col_opt = self.findAliasColumn(alias_idx, column_name);
+                        if (col_opt) |col| {
+                            col_index = col.toOptional();
+                        }
+                    } else {
+                        return Error.InvalidSyntax; // Column doesn't exist
+                    }
+                    try operand_list.append(self.gpa, .{ .column = col_index });
+                },
+                .single_quote_word => {
+                    const string_literal = ASTGen.getTokenSource(self.source, token);
+                    debug("build_expr literal: {s}", .{string_literal});
+                    const value = try InternPool.NullTerminatedString.initAddSentinel(self.gpa, string_literal[1 .. string_literal.len - 1], self.ip);
+                    var term: InternPool.Term = .{ .expression = .none };
+                    if (false) {} else if (aliases.unwrap()) |alias_idx| {
+                        const col_opt = self.findAliasColumn(alias_idx, string_literal[1 .. string_literal.len - 1]);
+                        if (col_opt) |col| {
+                            term = .{ .column = col.toOptional() };
+                        } else {
+                            term = .{ .string = value };
+                        }
+                    } else {
+                        term = .{ .string = value };
+                    }
+                    try operand_list.append(self.gpa, term);
+                },
+                .integer => {
+                    const slice = ASTGen.getTokenSource(self.source, token);
+                    const value: i64 = fmt.parseInt(i64, slice, 10) catch return Error.InvalidSyntax;
+                    try operand_list.append(self.gpa, .{ .int = value });
+                },
+                .eq, .ne, .lt, .lte, .gt, .gte, .plus, .minus, .asterisk, .divide, .percent, .keyword_and, .keyword_or, .keyword_like => {
+                    const cur_op = operTable[@as(usize, @intCast(@intFromEnum(token.tag)))];
+                    while (operator_list.items.len > 0) {
+                        const top_token: TokenType = operator_list.items[operator_list.items.len - 1];
+                        if (top_token == .lparen) break;
+                        const top_op = operTable[@as(usize, @intCast(@intFromEnum(top_token)))];
+                        if (top_op.prec > cur_op.prec) {
+                            try self.buildExpressionNode(&operator_list, &operand_list);
+                        } else {
+                            break;
+                        }
+                    }
+                    try operator_list.append(self.gpa, token.tag);
+                },
+                .lparen => {
+                    try operator_list.append(self.gpa, token.tag);
+                },
+                .rparen => {
+                    while (operator_list.items.len > 0 and operator_list.items[operator_list.items.len - 1] != .lparen) {
+                        try self.buildExpressionNode(&operator_list, &operand_list);
+                    }
+                    if (operator_list.items.len == 0) return Error.InvalidSyntax; // Parameter mismatch
+                    _ = operator_list.pop(); // Remove the lparen
+                },
+                .comma => break, // TODO: add logic to support lists, functions
+                else => {
+                    debug("expr unexpected token '{}', terminating expr.", .{token});
+                    break;
+                },
+            }
+        }
+
+        while (operator_list.items.len > 0) {
+            const top_token: TokenType = operator_list.items[operator_list.items.len - 1];
+            if (top_token == .lparen or top_token == .rparen) {
+                debug("mismatched brackets: {}", .{top_token});
+                return Error.InvalidSyntax;
+            } // Mismatched brackets
+            try self.buildExpressionNode(&operator_list, &operand_list);
+        }
+
+        if (operand_list.items.len != 1) return Error.InvalidSyntax; // Final term
+        const final: InternPool.Term = operand_list.pop();
+        switch (final) {
+            .expression => |expr| return expr,
+            else => {
+                return (try self.ip.put(self.gpa, .{
+                    .expression = .{ .operator = .unary, .lhs = final, .rhs = .{ .expression = .none } },
+                })).toOptional();
+            },
+        }
     }
 
     fn findAliasColumn(self: *ASTGen, aliases: InternPool.Index, slice: []const u8) ?InternPool.Index {
@@ -2848,7 +3006,8 @@ const ASTGen = struct {
                             try open_roots.append(self.gpa, .none);
                             debug("expr open", .{});
                         },
-                        .keyword_and, .keyword_or => {
+                        // TODO: add eq, ne as well
+                        .keyword_and, .keyword_or, .plus, .minus, .asterisk, .divide, .percent, .gt, .gte, .lt, .lte => {
                             if (last_element_andor) {
                                 // TODO: cannot do and or if last token is operator too
                                 debug("not valid place for and/or", .{});
@@ -2870,7 +3029,16 @@ const ASTGen = struct {
                                     .operator = switch (token.tag) {
                                         .keyword_and => .@"and",
                                         .keyword_or => .@"or",
-                                        else => unreachable, // and or expressions
+                                        .plus => .add,
+                                        .minus => .minus,
+                                        .asterisk => .multiply,
+                                        .divide => .divide,
+                                        .percent => .remainder,
+                                        .gte => .gte,
+                                        .gt => .gt,
+                                        .lt => .lt,
+                                        .lte => .lte,
+                                        else => unreachable,
                                     },
                                     .lhs = andor_lhs,
                                 },
@@ -3182,12 +3350,10 @@ const ExpressionTraversal = struct {
             const key = self.ip.indexToKey(pop.index).expression;
             var cur: InternPool.Index.Optional = .none;
             var depth = pop.depth;
-            if (key.operator.is_andor()) {
-                if (self.group == .none or self.group.unwrap().? != pop.index) {
-                    self.group = pop.index.toOptional();
-                    try self.stack.append(alloc, pop);
-                    return .{ .op = key.operator, .index = .none, .depth = depth };
-                }
+            if (self.group == .none or self.group.unwrap().? != pop.index) {
+                self.group = pop.index.toOptional();
+                try self.stack.append(alloc, pop);
+                return .{ .op = key.operator, .index = .none, .depth = depth };
             }
             switch (key.rhs) {
                 .expression, .group => |expr| cur = expr,
@@ -3402,6 +3568,7 @@ const InstGen = struct {
                     defer traversal.deinit(self.gpa);
                     // TODO: tree traversal left and right side. When the left side is the id record (ge/gt) with and, then its seek loop for ea one
                     while (try traversal.next(self.gpa)) |leaf| {
+                        debug("traversal leaf: {}", .{leaf});
                         const expr_idx_opt = leaf.index;
                         if (expr_idx_opt == .none) {
                             try comparisons.append(self.gpa, .{ .depth = leaf.depth, .eq = leaf.op.?, .jump = .none, .inst = .none });
@@ -3411,6 +3578,9 @@ const InstGen = struct {
                         const depth = leaf.depth;
                         const expr = self.ip.indexToKey(expr_idx_opt.unwrap().?).expression;
 
+                        const pre_term_reg = reg_count;
+                        const first_inst = self.ip.peekInst();
+
                         for (0..2) |i| {
                             const is_lhs: bool = i == 0;
                             const term = if (is_lhs) expr.lhs else expr.rhs;
@@ -3419,7 +3589,6 @@ const InstGen = struct {
                                 .func => {
                                     const func = self.ip.indexToKey(expr.lhs.func.unwrap().?).function;
                                     // TODO: support functions with 0 arguments
-                                    const first_inst = self.ip.peekInst();
                                     if (func.first_argument != .none) {
                                         const first_arg_register = reg_count.increment();
                                         var arg_index = func.first_argument;
@@ -3481,7 +3650,6 @@ const InstGen = struct {
                                             continue;
                                         }
                                     }
-                                    const first_inst = self.ip.peekInst();
                                     const col_reg: Register.Index = blk: {
                                         if (!is_lhs and other_term.tag() == .column and !expr.operator.is_andor()) {
                                             break :blk reg_count.increment();
@@ -3506,6 +3674,7 @@ const InstGen = struct {
                                     if (is_lhs and other_term.tag() == .column and !expr.operator.is_andor()) {
                                         continue;
                                     }
+                                    if (expr.operator == .like) continue;
                                     reg_count = reg_count.increment();
                                     try comparisons.append(self.gpa, .{
                                         .eq = eq orelse .@"or",
@@ -3542,6 +3711,7 @@ const InstGen = struct {
                                                 else => unreachable,
                                             }
                                         },
+                                        .like => {}, // no-op
                                         .unary, .@"and", .@"or" => {
                                             _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
                                         },
@@ -3552,6 +3722,20 @@ const InstGen = struct {
                                     // No-op for constants, but reg count still needs to increase and will be filled in by the constant pass
                                 },
                             }
+                        }
+                        if (expr.operator == .like) {
+                            _ = try self.addInst(.{ .function = .{
+                                .index = BuiltInFunctionIndex.like,
+                                .first_argument_register = pre_term_reg,
+                                .result_register = compare_reg,
+                            } });
+                            try comparisons.append(self.gpa, .{
+                                .eq = eq orelse .@"or",
+                                .jump = first_inst,
+                                .inst = self.ip.peekInst(),
+                                .depth = depth,
+                            });
+                            _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
                         }
                     } else {
                         columns_start = self.ip.peekInst();
@@ -3675,6 +3859,7 @@ const InstGen = struct {
                         const expr_idx = leaf.index;
                         if (expr_idx == .none) continue;
                         const expr = self.ip.indexToKey(expr_idx.unwrap().?).expression;
+                        debug("traversal leaf: {}, expr: {}", .{ leaf, expr });
                         for (0..2) |i| {
                             const is_lhs = i == 0;
                             if (expr.operator == .unary and !is_lhs) break;
