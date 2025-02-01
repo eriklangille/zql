@@ -3817,9 +3817,11 @@ const InstGen = struct {
                     debug("[label {d}] {}, {}, {}", .{ i, slice.items(.expr_index)[i], slice.items(.jump)[i], slice.items(.inst)[i] });
                 }
 
+                var traverse_next = try traverse.next(self.gpa);
                 while (li < slice.len) : (li += 1) {
-                    while (try traverse.next(self.gpa)) |leaf| {
-                        const expr_idx = slice.items(.expr_index)[li];
+                    const expr_idx = slice.items(.expr_index)[li];
+                    while (traverse_next != null and traverse_next.?.index != expr_idx) : (traverse_next = try traverse.next(self.gpa)) {}
+                    if (traverse_next) |leaf| {
                         debug("leaf: {}, expr_index: {}", .{ leaf, expr_idx });
                         if (expr_idx != leaf.index) continue;
                         const inst = slice.items(.inst)[li];
@@ -3843,8 +3845,8 @@ const InstGen = struct {
                             self.negate(inst);
                             self.replaceJump(inst, next_index);
                         } else {
-                            const next = traverse.stack.items[traverse.stack.items.len - 1];
-                            const jump_on_false = next.op == .@"and";
+                            const next_op = if (traverse.stack.items.len > 0) traverse.stack.items[traverse.stack.items.len - 1].op else (leaf.op orelse .@"or");
+                            const jump_on_false = next_op == .@"and";
                             if (jump_on_false) {
                                 // The default behavior for comparison instructions is to jump on true. So to jump on false, we negate the instruction.
                                 self.negate(inst);
@@ -3872,7 +3874,6 @@ const InstGen = struct {
                                 self.replaceJump(inst, if (jump_on_false) next_index else columns_start);
                             }
                         }
-                        break;
                     }
                 }
                 debug("unresolved len: {d}", .{unresolved.items.len});
