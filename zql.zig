@@ -3268,9 +3268,8 @@ const ExpressionTraversal = struct {
     ip: *InternPool,
     stack: Stack,
     first: InternPool.Index.Optional,
-    depth: u32,
 
-    const StackItem = struct { op: InternPool.Expression.Operator, index: InternPool.Index, depth: u32 };
+    const StackItem = struct { op: InternPool.Expression.Operator, index: InternPool.Index };
     const ResultItem = struct { op: ?InternPool.Expression.Operator, index: InternPool.Index.Optional, pop: InternPool.Index.Optional, contains_parent: bool };
     const Stack = ArrayListUnmanaged(StackItem);
 
@@ -3279,26 +3278,20 @@ const ExpressionTraversal = struct {
             .ip = intern_pool,
             .stack = .{},
             .first = root,
-            .depth = 0,
         };
     }
 
-    pub fn nextRequiredExpression(self: *ExpressionTraversal, op: ?InternPool.Expression.Operator) InternPool.Index.Optional {
-        if (op == null) return .none;
-        if (self.stack.items.len == 0) return .none;
-        debug("nextRequiredExpression: eq: {}, stack: {any}", .{ op.?, self.stack.items });
+    pub fn inStack(self: *ExpressionTraversal, op: InternPool.Expression.Operator) bool {
+        if (self.stack.items.len == 0) return false;
+
         var i: usize = self.stack.items.len - 1;
         while (i >= 0) : (i -= 1) {
             const item = self.stack.items[i];
-            switch (op.?) {
-                .@"or" => if (item.op == .@"and") return item.index.toOptional(),
-                .@"and" => if (item.op == .@"or") return item.index.toOptional(),
-                else => {},
-            }
-            debug("nextRequiredExpression: item missed {}", .{item});
-            if (i == 0) return .none;
+            if (item.op == op) return true;
+            if (i == 0) return false;
         }
-        return .none;
+
+        return false;
     }
 
     // Traverse the Expression tree in an interative, in-order DFS matter. ResultItem is:
@@ -3307,29 +3300,20 @@ const ExpressionTraversal = struct {
     pub fn next(self: *ExpressionTraversal, alloc: Allocator) Allocator.Error!?ResultItem {
         if (self.first != .none) {
             var cur = self.first;
-            var depth: u32 = 0;
             self.first = .none;
             while (cur.unwrap()) |idx| {
                 const expr = self.ip.indexToKey(idx).expression;
                 switch (expr.operator) {
                     .@"or", .@"and" => {
                         switch (expr.rhs) {
-                            .group => {
-                                try self.stack.append(alloc, .{ .op = expr.operator, .index = idx, .depth = depth + 1 });
-                            },
-                            .expression => {
-                                try self.stack.append(alloc, .{ .op = expr.operator, .index = idx, .depth = depth + 1 });
+                            .expression, .group => {
+                                try self.stack.append(alloc, .{ .op = expr.operator, .index = idx });
                             },
                             else => {},
                         }
                         switch (expr.lhs) {
-                            .expression => |next_expr| {
+                            .expression, .group => |next_expr| {
                                 cur = next_expr;
-                                depth += 1;
-                            },
-                            .group => |next_expr| {
-                                cur = next_expr;
-                                depth += 1;
                             },
                             else => {
                                 if (self.stack.items.len == 0) return .{ .op = null, .index = cur, .pop = .none, .contains_parent = false };
@@ -3349,7 +3333,6 @@ const ExpressionTraversal = struct {
         if (self.stack.popOrNull()) |pop| {
             const key = self.ip.indexToKey(pop.index).expression;
             var cur: InternPool.Index.Optional = .none;
-            var depth = pop.depth;
             switch (key.rhs) {
                 .expression, .group => |expr| cur = expr,
                 else => unreachable, // All items on the stack should have a right expression
@@ -3360,11 +3343,8 @@ const ExpressionTraversal = struct {
                 switch (expr.operator) {
                     .@"or", .@"and" => {
                         switch (expr.rhs) {
-                            .expression => {
-                                try self.stack.append(alloc, .{ .op = expr.operator, .index = idx, .depth = depth });
-                            },
-                            .group => {
-                                try self.stack.append(alloc, .{ .op = expr.operator, .index = idx, .depth = depth + 1 });
+                            .expression, .group => {
+                                try self.stack.append(alloc, .{ .op = expr.operator, .index = idx });
                             },
                             else => {},
                         }
@@ -3372,7 +3352,6 @@ const ExpressionTraversal = struct {
                             .expression, .group => |next_expr| {
                                 prev = expr.operator;
                                 cur = next_expr;
-                                depth += 1;
                             },
                             else => return .{
                                 .op = expr.operator,
@@ -3626,10 +3605,9 @@ const InstGen = struct {
                                 },
                                 .column => |col_idx_opt| {
                                     const col = self.ip.indexToKey(col_idx_opt.unwrap().?).column;
-                                    if (col.is_primary_key and col.tag == .integer and seek_optimization == .none and false) {
-                                        // TODO: Need to fix seek optimization
+                                    if (col.is_primary_key and col.tag == .integer and seek_optimization == .none) {
                                         primary_key_col = term.column;
-                                        if (eq == null or (eq == .@"and" and traversal.nextRequiredExpression(.@"and") == .none)) {
+                                        if (eq == null or (eq == .@"and" and !traversal.inStack(.@"or"))) {
                                             if (is_lhs) {
                                                 switch (expr.operator) {
                                                     .gt => seek_optimization = .gt,
@@ -3804,7 +3782,7 @@ const InstGen = struct {
                 // TODO: support multiples databases, writing to tables
                 const transaction_index = try self.addInst(.{ .transaction = .{ .database_id = 0, .write = false } });
 
-                // Comparison list pass. Now that we have the location of the output columns and all comparison instructions,
+                // Label list pass. Now that we have the location of the output columns and all label comparison instructions,
                 // we can fill in the jump locations
                 var li: usize = 0;
                 const slice = labels.slice();
