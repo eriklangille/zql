@@ -2774,7 +2774,7 @@ const ASTGen = struct {
         .percent = .{ .prec = 8, .op = .remainder },
     });
 
-    fn buildExpressionNode(self: *ASTGen, or_list: *std.ArrayListUnmanaged(TokenType), and_list: *std.ArrayListUnmanaged(InternPool.Term)) Error!void {
+    fn buildExpressionNode(self: *ASTGen, or_list: *std.ArrayListUnmanaged(TokenType), and_list: *std.ArrayListUnmanaged(InternPool.Term), is_group: bool) Error!void {
         if (or_list.items.len == 0) return Error.InvalidSyntax;
         if (and_list.items.len < 2) return Error.InvalidSyntax;
         const token: TokenType = or_list.pop();
@@ -2784,7 +2784,8 @@ const ASTGen = struct {
         const index = try self.ip.put(self.gpa, .{
             .expression = .{ .operator = op_info.op, .lhs = left, .rhs = right },
         });
-        try and_list.append(self.gpa, .{ .expression = index.toOptional() });
+        const term: InternPool.Term = if (is_group) .{ .group = index.toOptional() } else .{ .expression = index.toOptional() };
+        try and_list.append(self.gpa, term);
     }
 
     pub fn buildExpressionPrecedence(self: *ASTGen, table: InternPool.Index, aliases: InternPool.Index.Optional) Error!InternPool.Index.Optional {
@@ -2845,7 +2846,7 @@ const ASTGen = struct {
                         if (top_token == .lparen) break;
                         const top_op = operTable[@as(usize, @intCast(@intFromEnum(top_token)))];
                         if (top_op.prec > cur_op.prec) {
-                            try self.buildExpressionNode(&operator_list, &operand_list);
+                            try self.buildExpressionNode(&operator_list, &operand_list, false);
                         } else {
                             break;
                         }
@@ -2857,7 +2858,8 @@ const ASTGen = struct {
                 },
                 .rparen => {
                     while (operator_list.items.len > 0 and operator_list.items[operator_list.items.len - 1] != .lparen) {
-                        try self.buildExpressionNode(&operator_list, &operand_list);
+                        // const is_next_lparen = operator_list.items.len > 1 and operator_list.items[operator_list.items.len - 2] == .lparen;
+                        try self.buildExpressionNode(&operator_list, &operand_list, false);
                     }
                     if (operator_list.items.len == 0) return Error.InvalidSyntax; // Parameter mismatch
                     _ = operator_list.pop(); // Remove the lparen
@@ -2876,7 +2878,7 @@ const ASTGen = struct {
                 debug("mismatched brackets: {}", .{top_token});
                 return Error.InvalidSyntax;
             } // Mismatched brackets
-            try self.buildExpressionNode(&operator_list, &operand_list);
+            try self.buildExpressionNode(&operator_list, &operand_list, false);
         }
 
         if (operand_list.items.len != 1) return Error.InvalidSyntax; // Final term
@@ -3266,11 +3268,10 @@ const ExpressionTraversal = struct {
     ip: *InternPool,
     stack: Stack,
     first: InternPool.Index.Optional,
-    group: InternPool.Index.Optional,
     depth: u32,
 
     const StackItem = struct { op: InternPool.Expression.Operator, index: InternPool.Index, depth: u32 };
-    const ResultItem = struct { op: ?InternPool.Expression.Operator, index: InternPool.Index.Optional, depth: u32 };
+    const ResultItem = struct { op: ?InternPool.Expression.Operator, index: InternPool.Index.Optional, pop: InternPool.Index.Optional, contains_parent: bool };
     const Stack = ArrayListUnmanaged(StackItem);
 
     pub fn init(intern_pool: *InternPool, root: InternPool.Index.Optional) Allocator.Error!ExpressionTraversal {
@@ -3278,12 +3279,10 @@ const ExpressionTraversal = struct {
             .ip = intern_pool,
             .stack = .{},
             .first = root,
-            .group = .none,
             .depth = 0,
         };
     }
 
-    // TODO: can probably be deleted. Instead, when we get to an and index, all previous none or jumps can be changed to jump to that expression
     pub fn nextRequiredExpression(self: *ExpressionTraversal, op: ?InternPool.Expression.Operator) InternPool.Index.Optional {
         if (op == null) return .none;
         if (self.stack.items.len == 0) return .none;
@@ -3319,42 +3318,38 @@ const ExpressionTraversal = struct {
                                 try self.stack.append(alloc, .{ .op = expr.operator, .index = idx, .depth = depth + 1 });
                             },
                             .expression => {
-                                try self.stack.append(alloc, .{ .op = expr.operator, .index = idx, .depth = depth });
+                                try self.stack.append(alloc, .{ .op = expr.operator, .index = idx, .depth = depth + 1 });
                             },
                             else => {},
                         }
                         switch (expr.lhs) {
                             .expression => |next_expr| {
                                 cur = next_expr;
+                                depth += 1;
                             },
                             .group => |next_expr| {
                                 cur = next_expr;
                                 depth += 1;
                             },
                             else => {
-                                if (self.stack.items.len == 0) return .{ .op = null, .index = cur, .depth = depth };
+                                if (self.stack.items.len == 0) return .{ .op = null, .index = cur, .pop = .none, .contains_parent = false };
                                 const parent = self.stack.items[self.stack.items.len - 1];
-                                return .{ .op = parent.op, .index = cur, .depth = depth };
+                                return .{ .op = parent.op, .index = cur, .pop = .none, .contains_parent = true };
                             },
                         }
                     },
                     else => {
-                        if (self.stack.items.len == 0) return .{ .op = null, .index = cur, .depth = depth };
+                        if (self.stack.items.len == 0) return .{ .op = null, .index = cur, .pop = .none, .contains_parent = false };
                         const parent = self.stack.items[self.stack.items.len - 1];
-                        return .{ .op = parent.op, .index = cur, .depth = depth };
+                        return .{ .op = parent.op, .index = cur, .pop = .none, .contains_parent = true };
                     },
                 }
             }
         }
-        while (self.stack.popOrNull()) |pop| {
+        if (self.stack.popOrNull()) |pop| {
             const key = self.ip.indexToKey(pop.index).expression;
             var cur: InternPool.Index.Optional = .none;
             var depth = pop.depth;
-            if (self.group == .none or self.group.unwrap().? != pop.index) {
-                self.group = pop.index.toOptional();
-                try self.stack.append(alloc, pop);
-                return .{ .op = key.operator, .index = .none, .depth = depth };
-            }
             switch (key.rhs) {
                 .expression, .group => |expr| cur = expr,
                 else => unreachable, // All items on the stack should have a right expression
@@ -3377,24 +3372,30 @@ const ExpressionTraversal = struct {
                             .expression, .group => |next_expr| {
                                 prev = expr.operator;
                                 cur = next_expr;
-                                switch (expr.lhs) {
-                                    .group => depth += 1,
-                                    else => {},
-                                }
+                                depth += 1;
                             },
                             else => return .{
                                 .op = expr.operator,
                                 .index = cur,
-                                .depth = depth,
+                                .pop = pop.index.toOptional(),
+                                .contains_parent = true,
                             },
                         }
                     },
                     else => return .{
                         .op = prev orelse pop.op,
                         .index = cur,
-                        .depth = depth,
+                        .pop = pop.index.toOptional(),
+                        .contains_parent = prev != null,
                     },
                 }
+            } else {
+                return .{
+                    .op = pop.op,
+                    .index = .none,
+                    .pop = pop.index.toOptional(),
+                    .contains_parent = prev != null,
+                };
             }
         }
         return null;
@@ -3506,14 +3507,13 @@ const InstGen = struct {
         debug("------", .{});
     }
 
-    const Comparison = struct {
+    const Label = struct {
         inst: InternPool.InstIndex, // Instruction to modify
         jump: InternPool.InstIndex, // Instruction to jump to
-        eq: InternPool.Expression.Operator, // Determines next instruction jump behaviour
-        depth: u32, // Bracket depth, required to determine if viable jump target
+        expr_index: InternPool.Index.Optional, // AST node instruction generated from
     };
 
-    const ComparisonList = MultiArrayList(Comparison);
+    const LabelList = MultiArrayList(Label);
 
     fn addColumnInst(self: *InstGen, index: InternPool.Index, col: InternPool.Column, cursor: InternPool.Index, reg: Register.Index) Error!void {
         if (col.is_primary_key and col.tag == .integer) {
@@ -3557,8 +3557,8 @@ const InstGen = struct {
                 const where_clause = select.where;
                 debug("Where: {}", .{where_clause});
                 const compare_reg = reg_count;
-                var comparisons: ComparisonList = .{};
-                defer comparisons.deinit(self.gpa);
+                var labels: LabelList = .{};
+                defer labels.deinit(self.gpa);
                 var columns_start = self.ip.peekInst();
 
                 // Column Loop and pass through of the where expression tree
@@ -3571,11 +3571,10 @@ const InstGen = struct {
                         debug("traversal leaf: {}", .{leaf});
                         const expr_idx_opt = leaf.index;
                         if (expr_idx_opt == .none) {
-                            try comparisons.append(self.gpa, .{ .depth = leaf.depth, .eq = leaf.op.?, .jump = .none, .inst = .none });
+                            try labels.append(self.gpa, .{ .expr_index = .none, .jump = .none, .inst = .none });
                             continue;
                         }
                         const eq = leaf.op;
-                        const depth = leaf.depth;
                         const expr = self.ip.indexToKey(expr_idx_opt.unwrap().?).expression;
 
                         const pre_term_reg = reg_count;
@@ -3616,11 +3615,10 @@ const InstGen = struct {
                                                 .first_argument_register = first_arg_register,
                                                 .result_register = compare_reg,
                                             } });
-                                            try comparisons.append(self.gpa, .{
-                                                .eq = eq orelse .@"or",
+                                            try labels.append(self.gpa, .{
+                                                .expr_index = expr_idx_opt,
                                                 .jump = first_inst,
                                                 .inst = self.ip.peekInst(),
-                                                .depth = depth,
                                             });
                                             _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
                                         }
@@ -3628,7 +3626,8 @@ const InstGen = struct {
                                 },
                                 .column => |col_idx_opt| {
                                     const col = self.ip.indexToKey(col_idx_opt.unwrap().?).column;
-                                    if (col.is_primary_key and col.tag == .integer and seek_optimization == .none) {
+                                    if (col.is_primary_key and col.tag == .integer and seek_optimization == .none and false) {
+                                        // TODO: Need to fix seek optimization
                                         primary_key_col = term.column;
                                         if (eq == null or (eq == .@"and" and traversal.nextRequiredExpression(.@"and") == .none)) {
                                             if (is_lhs) {
@@ -3654,6 +3653,10 @@ const InstGen = struct {
                                         if (!is_lhs and other_term.tag() == .column and !expr.operator.is_andor()) {
                                             break :blk reg_count.increment();
                                         }
+                                        if (expr.operator == .like and is_lhs) {
+                                            reg_count = reg_count.increment();
+                                            break :blk reg_count.increment();
+                                        }
                                         break :blk compare_reg;
                                     };
                                     if (col.is_primary_key and col.tag == .integer) {
@@ -3674,13 +3677,12 @@ const InstGen = struct {
                                     if (is_lhs and other_term.tag() == .column and !expr.operator.is_andor()) {
                                         continue;
                                     }
-                                    if (expr.operator == .like) continue;
                                     reg_count = reg_count.increment();
-                                    try comparisons.append(self.gpa, .{
-                                        .eq = eq orelse .@"or",
+                                    if (expr.operator == .like) continue;
+                                    try labels.append(self.gpa, .{
                                         .jump = first_inst,
                                         .inst = self.ip.peekInst(),
-                                        .depth = depth,
+                                        .expr_index = expr_idx_opt,
                                     });
                                     switch (expr.operator) {
                                         .eq => {
@@ -3726,14 +3728,13 @@ const InstGen = struct {
                         if (expr.operator == .like) {
                             _ = try self.addInst(.{ .function = .{
                                 .index = BuiltInFunctionIndex.like,
-                                .first_argument_register = pre_term_reg,
+                                .first_argument_register = pre_term_reg.increment(),
                                 .result_register = compare_reg,
                             } });
-                            try comparisons.append(self.gpa, .{
-                                .eq = eq orelse .@"or",
+                            try labels.append(self.gpa, .{
                                 .jump = first_inst,
                                 .inst = self.ip.peekInst(),
-                                .depth = depth,
+                                .expr_index = expr_idx_opt,
                             });
                             _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
                         }
@@ -3805,47 +3806,77 @@ const InstGen = struct {
 
                 // Comparison list pass. Now that we have the location of the output columns and all comparison instructions,
                 // we can fill in the jump locations
-                const slice = comparisons.slice();
-                var sl_i: usize = 0;
-                while (sl_i < slice.len) : (sl_i += 1) {
-                    const inst = slice.items(.inst)[sl_i];
-                    if (inst == .none) continue;
-                    const eq = slice.items(.eq)[sl_i];
-                    // Instruction depth is how many layers of brackers. Example depths: 0, (1), ((2))
-                    const depth = slice.items(.depth)[sl_i];
-                    debug("comparisons: inst {}, op {}, depth {d}", .{ inst, eq, depth });
-                    if (sl_i == slice.len - 1) {
-                        self.negate(inst);
-                        self.replaceJump(inst, next_index);
-                    } else {
-                        // This is the jump logic. If we do not jump, then the comparison will fall through to the next instruction.
-                        // Therefore, we need to know what the next instruction is for a jump.
-                        // If the next operator is an "and", we want to jump on false, since false and <any value> = false
-                        // If the next operator is an "or", we want to jump on true, since true or <any value> = true
-                        const next_eq = slice.items(.eq)[sl_i + 1];
-                        const jump_on_false = next_eq == .@"and";
-                        if (jump_on_false) {
-                            // The default behavior for comparison instructions is to jump on true. So to jump on false, we negate the instruction.
+                var li: usize = 0;
+                const slice = labels.slice();
+                var traverse = try ExpressionTraversal.init(self.ip, where_clause);
+                defer traverse.deinit(self.gpa);
+                var unresolved: ArrayListUnmanaged(struct { li: u32, idx: InternPool.Index }) = .{};
+                defer unresolved.deinit(self.gpa);
+
+                for (0..slice.len) |i| {
+                    debug("[label {d}] {}, {}, {}", .{ i, slice.items(.expr_index)[i], slice.items(.jump)[i], slice.items(.inst)[i] });
+                }
+
+                while (li < slice.len) : (li += 1) {
+                    while (try traverse.next(self.gpa)) |leaf| {
+                        const expr_idx = slice.items(.expr_index)[li];
+                        debug("leaf: {}, expr_index: {}", .{ leaf, expr_idx });
+                        if (expr_idx != leaf.index) continue;
+                        const inst = slice.items(.inst)[li];
+
+                        // check unresolved
+                        var ui: usize = 0;
+                        while (ui < unresolved.items.len) {
+                            const item = unresolved.items[ui];
+                            if (leaf.pop == item.idx.toOptional()) {
+                                const item_inst = slice.items(.inst)[item.li];
+                                const jump = slice.items(.jump)[li];
+                                self.replaceJump(item_inst, jump);
+                                _ = unresolved.swapRemove(ui);
+                            } else {
+                                ui += 1;
+                            }
+                        }
+
+                        // add to unresolved
+                        if (li == slice.len - 1) {
                             self.negate(inst);
-                        }
-                        var j: usize = sl_i + 1;
-                        // Find the jump instruction. Check if we can skip instruction j
-                        while (j < slice.len and switch (slice.items(.eq)[j]) {
-                            .@"and" => jump_on_false or slice.items(.depth)[j] >= depth,
-                            .@"or" => !jump_on_false or slice.items(.depth)[j] < depth,
-                            else => unreachable,
-                        }) : (j += 1) {}
-                        if (j == slice.len) {
-                            self.replaceJump(inst, if (jump_on_false) next_index else columns_start);
+                            self.replaceJump(inst, next_index);
                         } else {
-                            // We have marker items in comparisons, since comparisons only cares about leaf items. The markers state
-                            // the relationship between two leaf items, but do not have an instruction to jump to. However, the comparison
-                            // after the marker is the correct jump location
-                            if (slice.items(.jump)[j] == .none) j += 1;
-                            self.replaceJump(inst, slice.items(.jump)[j]);
+                            const next = traverse.stack.items[traverse.stack.items.len - 1];
+                            const jump_on_false = next.op == .@"and";
+                            if (jump_on_false) {
+                                // The default behavior for comparison instructions is to jump on true. So to jump on false, we negate the instruction.
+                                self.negate(inst);
+                            }
+
+                            var si: i32 = @as(i32, @intCast(traverse.stack.items.len)) - 2;
+                            const next_jump: ?ExpressionTraversal.StackItem = blk: {
+                                while (si >= 0) : (si -= 1) {
+                                    const item = traverse.stack.items[@as(usize, @intCast(si))];
+                                    if (jump_on_false) {
+                                        if (item.op == .@"or") {
+                                            break :blk item;
+                                        }
+                                    } else {
+                                        if (item.op == .@"and") {
+                                            break :blk item;
+                                        }
+                                    }
+                                }
+                                break :blk null;
+                            };
+                            if (next_jump) |stack_item| {
+                                try unresolved.append(self.gpa, .{ .li = li, .idx = stack_item.index });
+                            } else {
+                                self.replaceJump(inst, if (jump_on_false) next_index else columns_start);
+                            }
                         }
+                        break;
                     }
                 }
+                debug("unresolved len: {d}", .{unresolved.items.len});
+                assert(unresolved.items.len == 0);
 
                 debug("second pass", .{});
 
@@ -3931,6 +3962,9 @@ const InstGen = struct {
                                 }
                                 store_reg = store_reg.increment();
                             }
+                        }
+                        if (expr.operator == .like) {
+                            store_reg = store_reg.increment();
                         }
                     }
                 }
