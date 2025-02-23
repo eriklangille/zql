@@ -26,24 +26,26 @@ async function compareInternal(query) {
   await zql.exec(query);
   const expected = []
   const actual = []
-  for (let i = 0; i < sqlResult.length; i++) {
+  for (let i = 0; i < Math.max(sqlResult.length, zqlResult.length); i++) {
     const actual_item = [];
     const expected_item = [];
-    const obj = sqlResult[i];
-    let j = 0;
-    for (const key in obj) {
-      const sqlItem = obj[key];
-      expected_item.push(sqlItem);
-      if (zqlResult.length <= i) continue;
+    if (i < sqlResult.length) {
+      const obj = sqlResult[i];
+      for (const key in obj) {
+        const sqlItem = obj[key];
+        expected_item.push(sqlItem);
+      }
+      expected.push(expected_item);
+    }
+    if (zqlResult.length <= i) continue;
+    for (let j = 0; j < zqlResult[i].length; j++) {
       let zqlItem = zqlResult[i][j];
       if (typeof zqlItem == 'bigint') {
         zqlItem = Number(zqlItem);
       }
       actual_item.push(zqlItem);
-      j++;
     }
     actual.push(actual_item);
-    expected.push(expected_item);
   }
   
   // Sort both arrays for order-independent comparison
@@ -125,6 +127,13 @@ describeDb(MED_DB_FILE, () => {
 
   // Addition
   // compare ("select age + 1 from t1;")
+  compare("select * from t1 where age + 1 < 21;");
+  compare("select * from t1 where age + 1 + 1 < 21;");
+  compare("select * from t1 where age + 1 + 1 + 1 + 1 < 22;");
+  compare("select * from t1 where age + age < 50;");
+
+  // TODO:
+  // compare("select * from t1 where age + age + age < 60;");
 
   // Alias
   compare("select name as n, age as a from t1 where 20 < a and n != 'Paul';");
@@ -143,6 +152,8 @@ describeDb(MED_DB_FILE, () => {
   compare("select * from t1 where 1 < 1;");
   compare("select * from t1 where 1 >= 1;");
   compare("select * from t1 where 1 <= 1;");
+  compare("select * from t1 where 1 or 0;");
+  compare("select * from t1 where 0 or 0;");
 
   // Column evaluation
   compare("select * from t1 where age;");

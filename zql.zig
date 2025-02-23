@@ -799,6 +799,7 @@ const InternPool = struct {
 
     const Term = union(enum) {
         expression: Index.Optional, // Expression
+        // DEPRECATED: group currently serves no utility and is not used. Repurpose for lists?
         group: Index.Optional, // Expression
         column: Index.Optional, // Column
         func: Index.Optional, // Function
@@ -816,14 +817,21 @@ const InternPool = struct {
             float,
         };
 
-        pub fn is_empty(self: Term) bool {
+        pub fn isEmpty(self: Term) bool {
             return switch (self) {
                 .expression, .group => |expr| expr == .none,
                 else => false,
             };
         }
 
-        pub fn is_64(self: Term) bool {
+        pub fn isConstant(self: Term) bool {
+            return switch (self) {
+                .string, .int, .float => true,
+                else => false,
+            };
+        }
+
+        pub fn is64(self: Term) bool {
             return switch (self) {
                 .int => |val| val > std.math.maxInt(u32),
                 .float => true,
@@ -831,7 +839,7 @@ const InternPool = struct {
             };
         }
 
-        pub fn pack_64(self: Term) PackedU64 {
+        pub fn pack64(self: Term) PackedU64 {
             return switch (self) {
                 .int => |val| PackedU64.init(val),
                 .float => |val| PackedU64.init(val),
@@ -840,7 +848,7 @@ const InternPool = struct {
             };
         }
 
-        pub fn pack_32(self: Term) u32 {
+        pub fn pack32(self: Term) u32 {
             return switch (self) {
                 .int => |val| @bitCast(@as(i32, @truncate(val))),
                 .float => unreachable, // Can only use 64 bit to pack floats
@@ -849,7 +857,7 @@ const InternPool = struct {
             };
         }
 
-        pub fn unpack_64(repr: Repr, val: PackedU64) Term {
+        pub fn unpack64(repr: Repr, val: PackedU64) Term {
             return switch (repr) {
                 .int => .{ .int = @bitCast(val.unwrap()) },
                 .float => .{ .float = @bitCast(val.unwrap()) },
@@ -861,7 +869,7 @@ const InternPool = struct {
             };
         }
 
-        pub fn unpack_32(repr: Repr, val: u32) Term {
+        pub fn unpack32(repr: Repr, val: u32) Term {
             return switch (repr) {
                 .int => .{ .int = val },
                 .float => unreachable,
@@ -924,20 +932,42 @@ const InternPool = struct {
             divide,
             remainder,
 
-            pub fn is_andor(self: Operator) bool {
+            pub fn isAndOr(self: Operator) bool {
                 return switch (self) {
                     .@"or", .@"and" => true,
                     else => false,
                 };
             }
 
-            pub fn is_math(self: Operator) bool {
+            pub fn isMath(self: Operator) bool {
                 return switch (self) {
-                    .add, .minus, .multiple, .divide, .remainder => true,
+                    .add, .minus, .multiply, .divide, .remainder => true,
                     else => false,
                 };
             }
         };
+
+        pub fn hasExpressionChild(self: *const Expression) bool {
+            inline for (0..2) |i| {
+                const term = if (i == 0) self.lhs else self.rhs;
+                switch (term) {
+                    .expression, .group => |val| return val != .none,
+                    else => {},
+                }
+            }
+            return false;
+        }
+
+        pub fn hasColumnChild(self: *const Expression) bool {
+            inline for (0..2) |i| {
+                const term = if (i == 0) self.lhs else self.rhs;
+                switch (term) {
+                    .column => |val| return val != .none,
+                    else => {},
+                }
+            }
+            return false;
+        }
 
         const Repr = struct {
             tag: u32,
@@ -1177,9 +1207,9 @@ const InternPool = struct {
                 const lhs_tag = expr.lhs.tag();
                 const rhs_tag = expr.rhs.tag();
                 const tag: PackedU32 = .{ .a = @intFromEnum(expr.operator), .b = @intFromEnum(lhs_tag), .c = @intFromEnum(rhs_tag), .d = 0 };
-                if (expr.lhs.is_64() or expr.rhs.is_64()) {
-                    const lhs = expr.lhs.pack_64();
-                    const rhs = expr.rhs.pack_64();
+                if (expr.lhs.is64() or expr.rhs.is64()) {
+                    const lhs = expr.lhs.pack64();
+                    const rhs = expr.rhs.pack64();
                     if (item == null) {
                         item = .{ .tag = .expression_big, .data = extra_len };
                     }
@@ -1192,8 +1222,8 @@ const InternPool = struct {
                     });
                     ip.itemPlaceAt(index, item.?);
                 } else {
-                    const lhs = expr.lhs.pack_32();
-                    const rhs = expr.rhs.pack_32();
+                    const lhs = expr.lhs.pack32();
+                    const rhs = expr.rhs.pack32();
                     if (item == null) {
                         item = .{ .tag = .expression, .data = extra_len };
                     }
@@ -1315,8 +1345,8 @@ const InternPool = struct {
                 const tag: PackedU32 = @bitCast(extra_data.tag);
                 return .{ .expression = .{
                     .operator = @enumFromInt(tag.a),
-                    .lhs = Term.unpack_32(@enumFromInt(tag.b), extra_data.lhs),
-                    .rhs = Term.unpack_32(@enumFromInt(tag.c), extra_data.rhs),
+                    .lhs = Term.unpack32(@enumFromInt(tag.b), extra_data.lhs),
+                    .rhs = Term.unpack32(@enumFromInt(tag.c), extra_data.rhs),
                 } };
             },
             .expression_big => {
@@ -1326,8 +1356,8 @@ const InternPool = struct {
                 const rhs_packed: PackedU64 = .{ .a = extra_data.rhs_0, .b = extra_data.rhs_1 };
                 return .{ .expression = .{
                     .operator = @enumFromInt(tag.a),
-                    .lhs = Term.unpack_64(@enumFromInt(tag.b), lhs_packed),
-                    .rhs = Term.unpack_64(@enumFromInt(tag.c), rhs_packed),
+                    .lhs = Term.unpack64(@enumFromInt(tag.b), lhs_packed),
+                    .rhs = Term.unpack64(@enumFromInt(tag.c), rhs_packed),
                 } };
             },
             .column => {
@@ -2980,7 +3010,7 @@ const ASTGen = struct {
                                         .@"and", .@"or" => {},
                                         else => return Error.InvalidSyntax,
                                     }
-                                    if (cur.lhs.is_empty()) {
+                                    if (cur.lhs.isEmpty()) {
                                         cur = .{
                                             .lhs = if (ignore_group) .{ .expression = last } else .{ .group = last },
                                             .rhs = cur.rhs,
@@ -3270,7 +3300,7 @@ const ExpressionTraversal = struct {
     first: InternPool.Index.Optional,
 
     const StackItem = struct { op: InternPool.Expression.Operator, index: InternPool.Index };
-    const ResultItem = struct { op: ?InternPool.Expression.Operator, index: InternPool.Index.Optional, pop: InternPool.Index.Optional, contains_parent: bool };
+    const ResultItem = struct { op: ?InternPool.Expression.Operator, index: InternPool.Index.Optional, pop: InternPool.Index.Optional };
     const Stack = ArrayListUnmanaged(StackItem);
 
     pub fn init(intern_pool: *InternPool, root: InternPool.Index.Optional) Allocator.Error!ExpressionTraversal {
@@ -3281,51 +3311,44 @@ const ExpressionTraversal = struct {
         };
     }
 
-    pub fn inStack(self: *ExpressionTraversal, op: InternPool.Expression.Operator) bool {
-        if (self.stack.items.len == 0) return false;
+    pub fn parent(self: *ExpressionTraversal) ?StackItem {
+        if (self.stack.items.len > 0) {
+            return self.stack.items[self.stack.items.len - 1];
+        }
+        return null;
+    }
 
-        var i: usize = self.stack.items.len - 1;
-        while (i >= 0) : (i -= 1) {
-            const item = self.stack.items[i];
-            if (item.op == op) return true;
-            if (i == 0) return false;
+    pub fn isValidSeekOptimization(self: *ExpressionTraversal) bool {
+        if (self.stack.items.len == 0) return true;
+
+        for (self.stack.items) |item| {
+            if (item.op != .@"and") return false;
         }
 
-        return false;
+        return true;
     }
 
     // Traverse the Expression tree in an interative, in-order DFS matter. ResultItem is:
     // Leaf - A comparison between two data types.
     // AndOr - and/or expression that connects between two leaf nodes (or other and/or expression). Outputted after the left side and before the right side
     pub fn next(self: *ExpressionTraversal, alloc: Allocator) Allocator.Error!?ResultItem {
+        debug("next stack: {}", .{self.stack});
         if (self.first != .none) {
             var cur = self.first;
             self.first = .none;
             while (cur.unwrap()) |idx| {
                 const expr = self.ip.indexToKey(idx).expression;
-                switch (expr.operator) {
-                    .@"or", .@"and" => {
-                        switch (expr.rhs) {
-                            .expression, .group => {
-                                try self.stack.append(alloc, .{ .op = expr.operator, .index = idx });
-                            },
-                            else => {},
-                        }
-                        switch (expr.lhs) {
-                            .expression, .group => |next_expr| {
-                                cur = next_expr;
-                            },
-                            else => {
-                                if (self.stack.items.len == 0) return .{ .op = null, .index = cur, .pop = .none, .contains_parent = false };
-                                const parent = self.stack.items[self.stack.items.len - 1];
-                                return .{ .op = parent.op, .index = cur, .pop = .none, .contains_parent = true };
-                            },
-                        }
+                if (expr.operator != .unary and expr.hasExpressionChild()) {
+                    try self.stack.append(alloc, .{ .op = expr.operator, .index = idx });
+                }
+                switch (expr.lhs) {
+                    .expression, .group => |next_expr| {
+                        cur = next_expr;
                     },
                     else => {
-                        if (self.stack.items.len == 0) return .{ .op = null, .index = cur, .pop = .none, .contains_parent = false };
-                        const parent = self.stack.items[self.stack.items.len - 1];
-                        return .{ .op = parent.op, .index = cur, .pop = .none, .contains_parent = true };
+                        if (self.stack.items.len == 0) return .{ .op = null, .index = cur, .pop = .none };
+                        const parent_item = self.parent().?;
+                        return .{ .op = parent_item.op, .index = cur, .pop = .none };
                     },
                 }
             }
@@ -3335,37 +3358,34 @@ const ExpressionTraversal = struct {
             var cur: InternPool.Index.Optional = .none;
             switch (key.rhs) {
                 .expression, .group => |expr| cur = expr,
-                else => unreachable, // All items on the stack should have a right expression
+                // If they have a rhs constant, then the pop becomes the current
+                else => {
+                    const parent_item: ?StackItem = self.parent();
+                    const op: ?InternPool.Expression.Operator = if (parent_item) |item| item.op else null;
+                    return .{
+                        .op = op,
+                        .index = pop.index.toOptional(),
+                        .pop = pop.index.toOptional(),
+                    };
+                },
             }
             var prev: ?InternPool.Expression.Operator = null;
             while (cur.unwrap()) |idx| {
                 const expr = self.ip.indexToKey(idx).expression;
-                switch (expr.operator) {
-                    .@"or", .@"and" => {
-                        switch (expr.rhs) {
-                            .expression, .group => {
-                                try self.stack.append(alloc, .{ .op = expr.operator, .index = idx });
-                            },
-                            else => {},
-                        }
-                        switch (expr.lhs) {
-                            .expression, .group => |next_expr| {
-                                prev = expr.operator;
-                                cur = next_expr;
-                            },
-                            else => return .{
-                                .op = expr.operator,
-                                .index = cur,
-                                .pop = pop.index.toOptional(),
-                                .contains_parent = true,
-                            },
-                        }
+                if (expr.operator != .unary and expr.hasExpressionChild()) {
+                    try self.stack.append(alloc, .{ .op = expr.operator, .index = idx });
+                }
+                switch (expr.lhs) {
+                    .expression, .group => |next_expr| {
+                        prev = expr.operator;
+                        cur = next_expr;
                     },
-                    else => return .{
-                        .op = prev orelse pop.op,
-                        .index = cur,
-                        .pop = pop.index.toOptional(),
-                        .contains_parent = prev != null,
+                    else => {
+                        return .{
+                            .op = pop.op,
+                            .index = cur,
+                            .pop = pop.index.toOptional(),
+                        };
                     },
                 }
             } else {
@@ -3373,7 +3393,6 @@ const ExpressionTraversal = struct {
                     .op = pop.op,
                     .index = .none,
                     .pop = pop.index.toOptional(),
-                    .contains_parent = prev != null,
                 };
             }
         }
@@ -3401,7 +3420,7 @@ const InstGen = struct {
         db: Db,
         statement: Stmt,
     ) InstGen {
-        return InstGen{
+        return .{
             .gpa = gpa,
             .ip = intern_pool,
             .statement = statement,
@@ -3449,6 +3468,7 @@ const InstGen = struct {
 
     fn negate(self: *InstGen, index: InternPool.InstIndex) void {
         const old_inst = self.ip.getInst(index).?;
+        debug("negate: {}", .{old_inst});
         const new_inst: InternPool.Instruction = switch (old_inst) {
             .eq => |data| .{ .neq = data },
             .neq => |data| .{ .eq = data },
@@ -3509,6 +3529,449 @@ const InstGen = struct {
         }
     }
 
+    // Label list pass. Now that we have the location of the output columns and all label comparison instructions,
+    // we can fill in the jump locations
+    fn fillLabels(
+        self: *InstGen,
+        labels: LabelList,
+        where_clause: InternPool.Index.Optional,
+        next_index: InternPool.InstIndex,
+        columns_start: InternPool.InstIndex,
+    ) Error!void {
+        var li: usize = 0;
+        const slice = labels.slice();
+        var traverse = try ExpressionTraversal.init(self.ip, where_clause);
+        defer traverse.deinit(self.gpa);
+        var unresolved: ArrayListUnmanaged(struct { li: u32, idx: InternPool.Index }) = .{};
+        defer unresolved.deinit(self.gpa);
+
+        for (0..slice.len) |i| {
+            debug("[label {d}] idx: {}, jmp: {}, inst: {}", .{ i, slice.items(.expr_index)[i], slice.items(.jump)[i], slice.items(.inst)[i] });
+        }
+
+        var traverse_next = try traverse.next(self.gpa);
+        while (li < slice.len) : (li += 1) {
+            const expr_idx = slice.items(.expr_index)[li];
+            while (traverse_next != null and traverse_next.?.index != expr_idx) : (traverse_next = try traverse.next(self.gpa)) {}
+            if (traverse_next) |leaf| {
+                debug("leaf: {}, expr_index: {}", .{ leaf, expr_idx });
+                if (expr_idx != leaf.index) continue;
+                const inst = slice.items(.inst)[li];
+
+                // check unresolved
+                var ui: usize = 0;
+                while (ui < unresolved.items.len) {
+                    const item = unresolved.items[ui];
+                    if (leaf.pop == item.idx.toOptional()) {
+                        const item_inst = slice.items(.inst)[item.li];
+                        const jump = slice.items(.jump)[li];
+                        self.replaceJump(item_inst, jump);
+                        _ = unresolved.swapRemove(ui);
+                    } else {
+                        ui += 1;
+                    }
+                }
+
+                // add to unresolved
+                if (li == slice.len - 1) {
+                    self.negate(inst);
+                    self.replaceJump(inst, next_index);
+                } else {
+                    const next_op = if (traverse.stack.items.len > 0) traverse.stack.items[traverse.stack.items.len - 1].op else (leaf.op orelse .@"or");
+                    const jump_on_false = next_op == .@"and";
+                    if (jump_on_false) {
+                        // The default behavior for comparison instructions is to jump on true. So to jump on false, we negate the instruction.
+                        self.negate(inst);
+                    }
+
+                    var si: i32 = @as(i32, @intCast(traverse.stack.items.len)) - 2;
+                    const next_jump: ?ExpressionTraversal.StackItem = blk: {
+                        while (si >= 0) : (si -= 1) {
+                            const item = traverse.stack.items[@as(usize, @intCast(si))];
+                            if (jump_on_false) {
+                                if (item.op == .@"or") {
+                                    break :blk item;
+                                }
+                            } else {
+                                if (item.op == .@"and") {
+                                    break :blk item;
+                                }
+                            }
+                        }
+                        break :blk null;
+                    };
+                    if (next_jump) |stack_item| {
+                        try unresolved.append(self.gpa, .{ .li = li, .idx = stack_item.index });
+                    } else {
+                        self.replaceJump(inst, if (jump_on_false) next_index else columns_start);
+                    }
+                }
+            }
+        }
+        debug("unresolved len: {d}", .{unresolved.items.len});
+        assert(unresolved.items.len == 0);
+    }
+
+    fn hasColumnInExpression(pre_result: []PreResult, index: InternPool.Index.Optional) bool {
+        for (pre_result) |item| {
+            if (item.index == index) {
+                return item.has_col;
+            }
+        }
+        return false;
+    }
+
+    const PreResult = struct { index: InternPool.Index.Optional, has_col: bool };
+    fn wherePreTraversal(self: *InstGen, select: *const SelectStmt) Error![]PreResult {
+        var result_list: std.ArrayListUnmanaged(PreResult) = .{};
+
+        var list: std.ArrayListUnmanaged(struct { index: InternPool.Index.Optional, visited: enum { no, left, yes } }) = .{};
+        defer list.deinit(self.gpa);
+
+        try list.append(self.gpa, .{ .index = select.where, .visited = .no });
+
+        blk: while (list.items.len != 0) {
+            const idx_visit = &list.items[list.items.len - 1];
+            const index = idx_visit.index;
+            if (index == .none) {
+                _ = list.pop();
+                continue;
+            }
+            const key = self.ip.indexToKey(index.unwrap().?).expression;
+
+            if (idx_visit.visited == .yes) {
+                _ = list.pop();
+                continue;
+            }
+
+            for (0..2) |i| {
+                const term: InternPool.Term = if (i == 0) key.lhs else key.rhs;
+                const is_lhs: bool = i == 0;
+                if (is_lhs and idx_visit.visited == .left) continue;
+                switch (term) {
+                    .expression => |expr| {
+                        if (is_lhs) {
+                            idx_visit.* = .{ .index = index, .visited = .left };
+                        } else {
+                            idx_visit.* = .{ .index = index, .visited = .yes };
+                        }
+                        // Append has to be after pointer usage to prevent using an 'expired' pointer
+                        try list.append(self.gpa, .{ .index = expr, .visited = .no });
+                        continue :blk;
+                    },
+                    .column => {
+                        for_blk: for (list.items) |item| {
+                            if (item.visited != .no or item.index == index) {
+                                for (result_list.items) |result| {
+                                    if (result.index == item.index) break :for_blk;
+                                }
+                                try result_list.append(self.gpa, .{ .index = item.index, .has_col = true });
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+            _ = list.pop();
+        }
+
+        return result_list.toOwnedSlice(self.gpa);
+    }
+
+    pub fn whereTraversal(
+        self: *InstGen,
+        comptime col_pass: bool,
+        cursor: InternPool.Index,
+        halt_index: InternPool.InstIndex, // Only on the constant pass
+        cursor_move_index: InternPool.InstIndex.Marked,
+        labels: *LabelList,
+        current_reg: Register.Index,
+        select: *const SelectStmt,
+    ) Error!struct {
+        seek_optimization: SeekOptimization,
+        columns_start: InternPool.InstIndex,
+        reg_count: Register.Index,
+    } {
+        if (select.where == .none) {
+            return .{ .seek_optimization = .none, .columns_start = self.ip.peekInst(), .reg_count = .first };
+        }
+        // TODO: share this outside of the method
+        var seek_optimization: SeekOptimization = .none;
+
+        var primary_key_col: InternPool.Index.Optional = .none;
+
+        const compare_reg = Register.Index.first;
+        var reg_count = current_reg;
+        var columns_start = self.ip.peekInst();
+
+        var traversal = try ExpressionTraversal.init(self.ip, select.where);
+        defer traversal.deinit(self.gpa);
+        // TODO: tree traversal left and right side. When the left side is the id record (ge/gt) with and, then its seek loop for ea one
+        // we also want to pay attention to the pop node, which happens between the left and right side
+        // good news: the pop is provided with the RHS value. So we compute the instruction for the RHS, then we do the pop
+        // and then we ignore the operator, since the pop covers that
+        var rhs_expr: bool = false;
+        var math_reg: Register.Index = .none;
+
+        while (try traversal.next(self.gpa)) |leaf| {
+            const expr_idx_opt = leaf.index;
+            if (expr_idx_opt == .none) {
+                continue;
+            }
+            const op = leaf.op;
+            var prev_expr: ?InternPool.Expression = null;
+            const expr = self.ip.indexToKey(expr_idx_opt.unwrap().?).expression;
+            debug("col_pass: {}, traversal leaf: {}, expr: {}", .{ col_pass, leaf, expr });
+
+            const first_inst = self.ip.peekInst();
+
+            // Expression traversal returns leafs expression with leafs. So there will always be one side that is not an expression.
+            // We need to figure out that side.
+
+            for (0..2) |i| {
+                const is_lhs: bool = i == 0;
+                const term = if (is_lhs) expr.lhs else expr.rhs;
+                const other_term = if (is_lhs) expr.rhs else expr.lhs;
+                const col_opt: ?InternPool.Column = blk: {
+                    switch (term) {
+                        .column => |col_idx_opt| {
+                            break :blk self.ip.indexToKey(col_idx_opt.unwrap().?).column;
+                        },
+                        else => {},
+                    }
+                    break :blk null;
+                };
+                switch (term) {
+                    .column => if (col_opt) |col| {
+                        if (col.is_primary_key and col.tag == .integer and seek_optimization == .none) {
+                            primary_key_col = term.column;
+                            if (op == null or (op == .@"and" and traversal.isValidSeekOptimization())) {
+                                if (is_lhs) {
+                                    switch (expr.operator) {
+                                        .gt => seek_optimization = .gt,
+                                        .gte => seek_optimization = .ge,
+                                        else => {},
+                                    }
+                                } else {
+                                    switch (expr.operator) {
+                                        .lt => seek_optimization = .gt,
+                                        .lte => seek_optimization = .ge,
+                                        else => {},
+                                    }
+                                }
+                            }
+                            if (seek_optimization != .none) {
+                                reg_count = reg_count.increment();
+                                continue;
+                            }
+                        }
+                        const col_reg: Register.Index = blk: {
+                            if (!is_lhs and other_term.tag() == .column and !expr.operator.isAndOr()) {
+                                break :blk reg_count.increment();
+                            }
+                            if (expr.operator.isMath()) {
+                                reg_count = reg_count.increment();
+                                break :blk reg_count.decrement();
+                            }
+                            if (expr.operator == .like and is_lhs) {
+                                reg_count = reg_count.increment();
+                                reg_count = reg_count.increment();
+                                break :blk reg_count.decrement();
+                            }
+                            break :blk compare_reg;
+                        };
+                        debug("column: {}, {}", .{ col, expr });
+                        if (col_pass) {
+                            if (col.is_primary_key and col.tag == .integer) {
+                                _ = try self.addInst(.{ .row_id = .{
+                                    .read_cursor = cursor,
+                                    .store_reg = col_reg,
+                                } });
+                            } else {
+                                _ = try self.addInst(.{ .column = .{
+                                    .cursor = cursor,
+                                    .store_reg = col_reg,
+                                    .col = term.column.unwrap().?,
+                                } });
+                            }
+                            if (is_lhs and expr.operator.isAndOr() and !other_term.isConstant()) {
+                                try labels.append(self.gpa, .{
+                                    .jump = first_inst,
+                                    .inst = self.ip.peekInst(),
+                                    .expr_index = expr_idx_opt,
+                                });
+                                _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
+                            }
+                        }
+                    },
+                    .string => {
+                        if (!col_pass) {
+                            _ = try self.addInst(.{ .string = .{
+                                .string = term.string,
+                                .store_reg = if (expr.operator == .like) reg_count.decrement().decrement() else reg_count,
+                            } });
+                        }
+                        reg_count = reg_count.increment();
+                    },
+                    .int => {
+                        if (!col_pass) {
+                            // TODO: this doesn't work if the int comes before the seek_column, for e.g. 1000 < id
+                            const is_seek_term: bool = res: {
+                                if (seek_optimization != .none and seek_optimization != .used) {
+                                    switch (other_term) {
+                                        .column => |col_idx_opt| {
+                                            if (col_idx_opt.unwrap()) |col_idx| {
+                                                const col = self.ip.indexToKey(col_idx).column;
+                                                break :res col.is_primary_key;
+                                            }
+                                        },
+                                        else => {},
+                                    }
+                                }
+                                break :res false;
+                            };
+                            if (is_seek_term) {
+                                _ = try self.addInst(.{ .integer = .{ .int = term.int, .store_reg = reg_count } });
+                                const seek: InternPool.Instruction.Seek = .{
+                                    .table = select.table,
+                                    .seek_key = reg_count,
+                                    .end_inst = halt_index,
+                                };
+                                _ = try self.ip.replaceInst(self.gpa, cursor_move_index, switch (seek_optimization) {
+                                    .gt => .{ .seek_gt = seek },
+                                    .ge => .{ .seek_ge = seek },
+                                    else => unreachable,
+                                });
+                                seek_optimization = .used;
+                            } else {
+                                debug("int inst: {d}", .{self.ip.peekInst()});
+                                _ = try self.addInst(.{ .integer = .{ .int = term.int, .store_reg = reg_count } });
+                            }
+                        }
+                        reg_count = reg_count.increment();
+                    },
+                    .expression => {
+                        if (!is_lhs) {
+                            rhs_expr = true;
+                            prev_expr = expr;
+                        }
+                    },
+                    else => {},
+                }
+                if (is_lhs and rhs_expr or !is_lhs and !rhs_expr) {
+                    const cur_expr = if (rhs_expr) if (prev_expr) |prev| prev else expr else expr;
+                    const cur_op = cur_expr.operator;
+                    var new_math_reg: bool = false;
+                    rhs_expr = false;
+                    debug("cur_op: {}, cur_expr: {}", .{ cur_op, cur_expr });
+                    // TODO: create a trailing variable to say if all are static than they can go in the col_pass. Currently, all are in the loop
+                    // if (!col_pass) continue;
+                    switch (cur_op) {
+                        .add, .minus, .multiply, .divide, .remainder => {
+                            const last_item_reg = reg_count.decrement();
+                            if (math_reg == .none) {
+                                math_reg = reg_count;
+                                new_math_reg = true;
+                                reg_count = reg_count.increment();
+                            }
+                            if (!col_pass) continue;
+                            switch (cur_op) {
+                                .add => {
+                                    _ = try self.addInst(.{
+                                        .add = .{
+                                            .lhs_reg = blk: {
+                                                if (new_math_reg) {
+                                                    new_math_reg = false;
+                                                    break :blk last_item_reg.decrement();
+                                                }
+                                                break :blk math_reg;
+                                            },
+                                            .rhs_reg = last_item_reg,
+                                            .result_reg = math_reg,
+                                        },
+                                    });
+                                },
+                                else => unreachable, // TODO: implement
+                            }
+                        },
+                        else => {
+                            if (col_pass) {
+                                try labels.append(self.gpa, .{
+                                    .jump = first_inst,
+                                    .inst = switch (cur_op) {
+                                        .like => self.ip.peekInst().increment(),
+                                        else => self.ip.peekInst(),
+                                    },
+                                    .expr_index = expr_idx_opt,
+                                });
+                                const cur_reg = reg_count.decrement();
+                                const check_reg = if (math_reg != .none) math_reg else compare_reg;
+                                switch (cur_op) {
+                                    .eq => {
+                                        _ = try self.addInst(.{ .eq = .{
+                                            .lhs_reg = check_reg,
+                                            .rhs_reg = cur_reg,
+                                            .jump = .none,
+                                        } });
+                                    },
+                                    .ne => {
+                                        _ = try self.addInst(.{ .neq = .{
+                                            .lhs_reg = check_reg,
+                                            .rhs_reg = cur_reg,
+                                            .jump = .none,
+                                        } });
+                                    },
+                                    .gt, .gte, .lt, .lte => {
+                                        const data: InternPool.Instruction.Lt = .{
+                                            .lhs_reg = check_reg,
+                                            .rhs_reg = cur_reg,
+                                            .jump = .none,
+                                        };
+                                        switch (cur_op) {
+                                            // TODO: handle behaviour for 1 > col
+                                            .gt => _ = try self.addInst(if (true) .{ .gt = data } else .{ .lt = data }),
+                                            .gte => _ = try self.addInst(if (true) .{ .gte = data } else .{ .lte = data }),
+                                            .lt => _ = try self.addInst(if (true) .{ .lt = data } else .{ .gt = data }),
+                                            .lte => _ = try self.addInst(if (true) .{ .lte = data } else .{ .gte = data }),
+                                            else => unreachable,
+                                        }
+                                    },
+                                    .like => {
+                                        _ = try self.addInst(.{
+                                            .function = .{
+                                                .index = BuiltInFunctionIndex.like,
+                                                // Like has 2 arguments
+                                                .first_argument_register = cur_reg.decrement().decrement(),
+                                                .result_register = compare_reg,
+                                            },
+                                        });
+                                        _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
+                                    },
+                                    .unary, .@"and", .@"or" => {
+                                        debug("unary, and, or: {}", .{expr});
+                                        _ = try self.addInst(.{ .@"if" = .{ .compare_reg = check_reg, .jump_address = .none } });
+                                    },
+                                    else => unreachable,
+                                }
+                            }
+                            if (math_reg != .none) {
+                                math_reg = .none;
+                            }
+                        },
+                    }
+                }
+            }
+        } else {
+            columns_start = self.ip.peekInst();
+        }
+        return .{
+            .seek_optimization = seek_optimization,
+            .columns_start = columns_start,
+            // reg_count is first available to use register.
+            .reg_count = reg_count,
+        };
+    }
+
     // This function generates the instructions to be executed by the VM
     // The instructions are based off SQLite: https://www.sqlite.org/opcode.html
     // However, some behaviour is not fully supported.
@@ -3519,8 +3982,6 @@ const InstGen = struct {
             Stmt.select => {
                 const select = self.statement.select;
                 const table = self.ip.indexToKey(select.table).table;
-                var seek_optimization: SeekOptimization = .none;
-                var primary_key_col: InternPool.Index.Optional = .none;
                 debug("page_index: {d}", .{table.page});
 
                 const cursor = try self.ip.put(self.gpa, .{ .cursor = .{ .index = 0 } });
@@ -3532,196 +3993,32 @@ const InstGen = struct {
                 const cursor_move_index = try self.ip.markInst(self.gpa);
                 const loop_start = self.ip.peekInst();
 
-                var reg_count = Register.Index.first;
                 const where_clause = select.where;
                 debug("Where: {}", .{where_clause});
-                const compare_reg = reg_count;
                 var labels: LabelList = .{};
                 defer labels.deinit(self.gpa);
-                var columns_start = self.ip.peekInst();
+
+                const pre_result = try self.wherePreTraversal(&select);
+
+                debug("pre_result: {any}", .{pre_result});
 
                 // Column Loop and pass through of the where expression tree
                 // Jump locations are left empty until we know all instruction addresses, since we don't know where to jump to yet.
-                if (where_clause != .none) {
-                    var traversal = try ExpressionTraversal.init(self.ip, where_clause);
-                    defer traversal.deinit(self.gpa);
-                    // TODO: tree traversal left and right side. When the left side is the id record (ge/gt) with and, then its seek loop for ea one
-                    while (try traversal.next(self.gpa)) |leaf| {
-                        debug("traversal leaf: {}", .{leaf});
-                        const expr_idx_opt = leaf.index;
-                        if (expr_idx_opt == .none) {
-                            try labels.append(self.gpa, .{ .expr_index = .none, .jump = .none, .inst = .none });
-                            continue;
-                        }
-                        const eq = leaf.op;
-                        const expr = self.ip.indexToKey(expr_idx_opt.unwrap().?).expression;
+                const where_result = try self.whereTraversal(
+                    true,
+                    cursor,
+                    .none,
+                    cursor_move_index,
+                    &labels,
+                    Register.Index.first.increment(),
+                    &select,
+                );
+                const seek_optimization = where_result.seek_optimization;
+                const columns_start = where_result.columns_start;
+                const reg_count = where_result.reg_count;
 
-                        const pre_term_reg = reg_count;
-                        const first_inst = self.ip.peekInst();
-
-                        for (0..2) |i| {
-                            const is_lhs: bool = i == 0;
-                            const term = if (is_lhs) expr.lhs else expr.rhs;
-                            const other_term = if (is_lhs) expr.rhs else expr.lhs;
-                            switch (term) {
-                                .func => {
-                                    const func = self.ip.indexToKey(expr.lhs.func.unwrap().?).function;
-                                    // TODO: support functions with 0 arguments
-                                    if (func.first_argument != .none) {
-                                        const first_arg_register = reg_count.increment();
-                                        var arg_index = func.first_argument;
-                                        var column_arg: bool = false;
-                                        while (arg_index.unwrap()) |idx| {
-                                            const arg = self.ip.indexToKey(idx).argument;
-                                            switch (arg.term) {
-                                                .column => {
-                                                    _ = try self.addInst(.{ .column = .{
-                                                        .cursor = cursor,
-                                                        .store_reg = reg_count.increment(),
-                                                        .col = arg.term.column.unwrap().?,
-                                                    } });
-                                                    column_arg = true;
-                                                },
-                                                .func => unreachable, // TODO: implement nested functions
-                                                else => {},
-                                            }
-                                            reg_count = reg_count.increment();
-                                            arg_index = arg.next_argument;
-                                        }
-                                        if (column_arg) {
-                                            _ = try self.addInst(.{ .function = .{
-                                                .index = func.index,
-                                                .first_argument_register = first_arg_register,
-                                                .result_register = compare_reg,
-                                            } });
-                                            try labels.append(self.gpa, .{
-                                                .expr_index = expr_idx_opt,
-                                                .jump = first_inst,
-                                                .inst = self.ip.peekInst(),
-                                            });
-                                            _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
-                                        }
-                                    }
-                                },
-                                .column => |col_idx_opt| {
-                                    const col = self.ip.indexToKey(col_idx_opt.unwrap().?).column;
-                                    if (col.is_primary_key and col.tag == .integer and seek_optimization == .none) {
-                                        primary_key_col = term.column;
-                                        if (eq == null or (eq == .@"and" and !traversal.inStack(.@"or"))) {
-                                            if (is_lhs) {
-                                                switch (expr.operator) {
-                                                    .gt => seek_optimization = .gt,
-                                                    .gte => seek_optimization = .ge,
-                                                    else => {},
-                                                }
-                                            } else {
-                                                switch (expr.operator) {
-                                                    .lt => seek_optimization = .gt,
-                                                    .lte => seek_optimization = .ge,
-                                                    else => {},
-                                                }
-                                            }
-                                        }
-                                        if (seek_optimization != .none) {
-                                            reg_count = reg_count.increment();
-                                            continue;
-                                        }
-                                    }
-                                    const col_reg: Register.Index = blk: {
-                                        if (!is_lhs and other_term.tag() == .column and !expr.operator.is_andor()) {
-                                            break :blk reg_count.increment();
-                                        }
-                                        if (expr.operator == .like and is_lhs) {
-                                            reg_count = reg_count.increment();
-                                            break :blk reg_count.increment();
-                                        }
-                                        break :blk compare_reg;
-                                    };
-                                    if (col.is_primary_key and col.tag == .integer) {
-                                        _ = try self.addInst(.{ .row_id = .{
-                                            .read_cursor = cursor,
-                                            .store_reg = col_reg,
-                                        } });
-                                    } else {
-                                        _ = try self.addInst(.{ .column = .{
-                                            .cursor = cursor,
-                                            .store_reg = col_reg,
-                                            .col = term.column.unwrap().?,
-                                        } });
-                                    }
-                                    // If the LHS and RHS are both columns, and its a binary comparison between the two columns
-                                    // we only want to add one comparison to compare the sides instead of 2.
-                                    // The comparison needs to be added after the RHS column instruction has been added.
-                                    if (is_lhs and other_term.tag() == .column and !expr.operator.is_andor()) {
-                                        continue;
-                                    }
-                                    reg_count = reg_count.increment();
-                                    if (expr.operator == .like) continue;
-                                    try labels.append(self.gpa, .{
-                                        .jump = first_inst,
-                                        .inst = self.ip.peekInst(),
-                                        .expr_index = expr_idx_opt,
-                                    });
-                                    switch (expr.operator) {
-                                        .eq => {
-                                            _ = try self.addInst(.{ .eq = .{
-                                                .lhs_reg = compare_reg,
-                                                .rhs_reg = reg_count,
-                                                .jump = InternPool.InstIndex.none,
-                                            } });
-                                        },
-                                        .ne => {
-                                            _ = try self.addInst(.{ .neq = .{
-                                                .lhs_reg = compare_reg,
-                                                .rhs_reg = reg_count,
-                                                .jump = InternPool.InstIndex.none,
-                                            } });
-                                        },
-                                        .gt, .gte, .lt, .lte => {
-                                            const data: InternPool.Instruction.Lt = .{
-                                                .lhs_reg = compare_reg,
-                                                .rhs_reg = reg_count,
-                                                .jump = .none,
-                                            };
-                                            switch (expr.operator) {
-                                                .gt => _ = try self.addInst(if (is_lhs) .{ .gt = data } else .{ .lt = data }),
-                                                .gte => _ = try self.addInst(if (is_lhs) .{ .gte = data } else .{ .lte = data }),
-                                                .lt => _ = try self.addInst(if (is_lhs) .{ .lt = data } else .{ .gt = data }),
-                                                .lte => _ = try self.addInst(if (is_lhs) .{ .lte = data } else .{ .gte = data }),
-                                                else => unreachable,
-                                            }
-                                        },
-                                        .like => {}, // no-op
-                                        .unary, .@"and", .@"or" => {
-                                            _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
-                                        },
-                                        else => unreachable,
-                                    }
-                                },
-                                else => {
-                                    // No-op for constants, but reg count still needs to increase and will be filled in by the constant pass
-                                },
-                            }
-                        }
-                        if (expr.operator == .like) {
-                            _ = try self.addInst(.{ .function = .{
-                                .index = BuiltInFunctionIndex.like,
-                                .first_argument_register = pre_term_reg.increment(),
-                                .result_register = compare_reg,
-                            } });
-                            try labels.append(self.gpa, .{
-                                .jump = first_inst,
-                                .inst = self.ip.peekInst(),
-                                .expr_index = expr_idx_opt,
-                            });
-                            _ = try self.addInst(.{ .@"if" = .{ .compare_reg = compare_reg, .jump_address = .none } });
-                        }
-                    } else {
-                        columns_start = self.ip.peekInst();
-                    }
-                }
-
-                var output_count = reg_count.increment();
+                const first_output = if (reg_count == .first) reg_count.increment() else reg_count;
+                var output_count = first_output;
                 var cur_col = select.columns;
 
                 debug("cur_col", .{});
@@ -3774,7 +4071,7 @@ const InstGen = struct {
 
                 debug("output count: {d}", .{output_count});
                 _ = try self.addInst(.{ .result_row = .{
-                    .start_reg = reg_count.increment(),
+                    .start_reg = first_output,
                     .end_reg = output_count,
                 } });
                 const next_index = try self.addInst(.{ .next = .{ .cursor = cursor, .success_jump = loop_start } });
@@ -3782,171 +4079,28 @@ const InstGen = struct {
                 // TODO: support multiples databases, writing to tables
                 const transaction_index = try self.addInst(.{ .transaction = .{ .database_id = 0, .write = false } });
 
-                // Label list pass. Now that we have the location of the output columns and all label comparison instructions,
-                // we can fill in the jump locations
-                var li: usize = 0;
-                const slice = labels.slice();
-                var traverse = try ExpressionTraversal.init(self.ip, where_clause);
-                defer traverse.deinit(self.gpa);
-                var unresolved: ArrayListUnmanaged(struct { li: u32, idx: InternPool.Index }) = .{};
-                defer unresolved.deinit(self.gpa);
-
-                for (0..slice.len) |i| {
-                    debug("[label {d}] {}, {}, {}", .{ i, slice.items(.expr_index)[i], slice.items(.jump)[i], slice.items(.inst)[i] });
-                }
-
-                var traverse_next = try traverse.next(self.gpa);
-                while (li < slice.len) : (li += 1) {
-                    const expr_idx = slice.items(.expr_index)[li];
-                    while (traverse_next != null and traverse_next.?.index != expr_idx) : (traverse_next = try traverse.next(self.gpa)) {}
-                    if (traverse_next) |leaf| {
-                        debug("leaf: {}, expr_index: {}", .{ leaf, expr_idx });
-                        if (expr_idx != leaf.index) continue;
-                        const inst = slice.items(.inst)[li];
-
-                        // check unresolved
-                        var ui: usize = 0;
-                        while (ui < unresolved.items.len) {
-                            const item = unresolved.items[ui];
-                            if (leaf.pop == item.idx.toOptional()) {
-                                const item_inst = slice.items(.inst)[item.li];
-                                const jump = slice.items(.jump)[li];
-                                self.replaceJump(item_inst, jump);
-                                _ = unresolved.swapRemove(ui);
-                            } else {
-                                ui += 1;
-                            }
-                        }
-
-                        // add to unresolved
-                        if (li == slice.len - 1) {
-                            self.negate(inst);
-                            self.replaceJump(inst, next_index);
-                        } else {
-                            const next_op = if (traverse.stack.items.len > 0) traverse.stack.items[traverse.stack.items.len - 1].op else (leaf.op orelse .@"or");
-                            const jump_on_false = next_op == .@"and";
-                            if (jump_on_false) {
-                                // The default behavior for comparison instructions is to jump on true. So to jump on false, we negate the instruction.
-                                self.negate(inst);
-                            }
-
-                            var si: i32 = @as(i32, @intCast(traverse.stack.items.len)) - 2;
-                            const next_jump: ?ExpressionTraversal.StackItem = blk: {
-                                while (si >= 0) : (si -= 1) {
-                                    const item = traverse.stack.items[@as(usize, @intCast(si))];
-                                    if (jump_on_false) {
-                                        if (item.op == .@"or") {
-                                            break :blk item;
-                                        }
-                                    } else {
-                                        if (item.op == .@"and") {
-                                            break :blk item;
-                                        }
-                                    }
-                                }
-                                break :blk null;
-                            };
-                            if (next_jump) |stack_item| {
-                                try unresolved.append(self.gpa, .{ .li = li, .idx = stack_item.index });
-                            } else {
-                                self.replaceJump(inst, if (jump_on_false) next_index else columns_start);
-                            }
-                        }
-                    }
-                }
-                debug("unresolved len: {d}", .{unresolved.items.len});
-                assert(unresolved.items.len == 0);
+                try self.fillLabels(labels, where_clause, next_index, columns_start);
 
                 debug("second pass", .{});
 
+                // TODO: implement fillLabels with constant comparisons
+                var labels_constants: LabelList = .{};
+                defer labels_constants.deinit(self.gpa);
+
                 // Second pass of the WHERE expression, this pass we can fill in the constants outside of the column loop
                 // to prevent unneccessary register loads
-                if (where_clause != .none) {
-                    var traversal = try ExpressionTraversal.init(self.ip, where_clause);
-                    var store_reg = compare_reg.increment();
-                    defer traversal.deinit(self.gpa);
-                    while (try traversal.next(self.gpa)) |leaf| {
-                        const expr_idx = leaf.index;
-                        if (expr_idx == .none) continue;
-                        const expr = self.ip.indexToKey(expr_idx.unwrap().?).expression;
-                        debug("traversal leaf: {}, expr: {}", .{ leaf, expr });
-                        for (0..2) |i| {
-                            const is_lhs = i == 0;
-                            if (expr.operator == .unary and !is_lhs) break;
-                            const term = if (is_lhs) expr.lhs else expr.rhs;
-                            const other_term = if (is_lhs) expr.rhs else expr.lhs;
-                            const is_func = switch (term) {
-                                .func => true,
-                                else => false,
-                            };
-                            if (is_func) {
-                                const func = self.ip.indexToKey(term.func.unwrap().?).function;
-                                if (func.first_argument != .none) {
-                                    var arg_index_opt = func.first_argument;
-                                    while (arg_index_opt.unwrap()) |arg_index| {
-                                        const arg = self.ip.indexToKey(arg_index).argument;
-                                        switch (arg.term) {
-                                            .string => _ = try self.addInst(.{ .string = .{ .string = arg.term.string, .store_reg = store_reg } }),
-                                            .int => _ = try self.addInst(.{ .integer = .{ .int = arg.term.int, .store_reg = store_reg } }),
-                                            .column => {},
-                                            else => return Error.InvalidSyntax, // TODO: implement float
-                                        }
-                                        store_reg = store_reg.increment();
-                                        arg_index_opt = arg.next_argument;
-                                    }
-                                }
-                            } else {
-                                switch (term) {
-                                    .string => _ = try self.addInst(.{ .string = .{ .string = term.string, .store_reg = store_reg } }),
-                                    .int => {
-                                        const is_seek_term: bool = res: {
-                                            if (seek_optimization != .none and seek_optimization != .used) {
-                                                switch (other_term) {
-                                                    .column => |col_idx_opt| {
-                                                        if (col_idx_opt.unwrap()) |col_idx| {
-                                                            const col = self.ip.indexToKey(col_idx).column;
-                                                            break :res col.is_primary_key;
-                                                        }
-                                                    },
-                                                    else => {},
-                                                }
-                                            }
-                                            break :res false;
-                                        };
-                                        if (is_seek_term) {
-                                            _ = try self.addInst(.{ .integer = .{ .int = term.int, .store_reg = store_reg } });
-                                            const seek: InternPool.Instruction.Seek = .{
-                                                .table = select.table,
-                                                .seek_key = store_reg,
-                                                .end_inst = halt_index,
-                                            };
-                                            _ = try self.ip.replaceInst(self.gpa, cursor_move_index, switch (seek_optimization) {
-                                                .gt => .{ .seek_gt = seek },
-                                                .ge => .{ .seek_ge = seek },
-                                                else => unreachable,
-                                            });
-                                            seek_optimization = .used;
-                                        } else {
-                                            _ = try self.addInst(.{ .integer = .{ .int = term.int, .store_reg = store_reg } });
-                                        }
-                                    },
-                                    .expression, .group, .func => {},
-                                    .column => {
-                                        if (is_lhs or other_term.tag() != .column) {
-                                            // Skip reg increment
-                                            continue;
-                                        }
-                                    },
-                                    .float => return Error.InvalidSyntax, // TODO: implement
-                                }
-                                store_reg = store_reg.increment();
-                            }
-                        }
-                        if (expr.operator == .like) {
-                            store_reg = store_reg.increment();
-                        }
-                    }
-                }
+                _ = try self.whereTraversal(
+                    false,
+                    cursor,
+                    halt_index,
+                    cursor_move_index,
+                    &labels,
+                    Register.Index.first.increment(),
+                    &select,
+                );
+
+                try self.fillLabels(labels_constants, where_clause, halt_index, loop_start);
+
                 _ = try self.addInst(.{ .goto = open_read_index });
                 self.ip.setInst(init_index, .{ .init = transaction_index });
                 if (seek_optimization == .none) {
@@ -3991,8 +4145,16 @@ const Register = union(enum) {
 
         pub fn increment(self: Index) Index {
             return switch (self) {
-                .none => @enumFromInt(0),
+                .none => .none,
                 else => @enumFromInt(@intFromEnum(self) + 1),
+            };
+        }
+
+        pub fn decrement(self: Index) Index {
+            return switch (self) {
+                .first => .first,
+                .none => .none,
+                else => @enumFromInt(@intFromEnum(self) - 1),
             };
         }
     };
@@ -4550,7 +4712,16 @@ const Vm = struct {
                 .goto => |goto_inst| {
                     self.pc = goto_inst;
                 },
-                .add => unreachable, // TODO: implement
+                .add => |add_inst| {
+                    const lhs = self.reg(add_inst.lhs_reg);
+                    const rhs = self.reg(add_inst.rhs_reg);
+                    // TODO: cover other types for addition
+                    if (lhs.tag() == .int and rhs.tag() == .int) {
+                        const result = lhs.int + rhs.int;
+                        try self.updateReg(add_inst.result_reg, .{ .int = result });
+                    }
+                    self.pc = self.pc.increment();
+                },
                 // else => debug("instruction not implemented: {}", .{instruction.opcode}),
             }
         }
