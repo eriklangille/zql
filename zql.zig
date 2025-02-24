@@ -3850,15 +3850,15 @@ const InstGen = struct {
                         }
                         reg_count = reg_count.increment();
                     },
-                    .expression => {
-                        if (!is_lhs) {
+                    .expression => |expr_index| {
+                        if (!is_lhs and expr_index != .none and !expr.operator.isAndOr()) {
                             rhs_expr = true;
                             prev_expr = expr;
                         }
                     },
                     else => {},
                 }
-                if (is_lhs and rhs_expr or !is_lhs and !rhs_expr) {
+                if (is_lhs and (rhs_expr or (term.isConstant() and expr.operator.isAndOr())) or !is_lhs and !rhs_expr) {
                     const cur_expr = if (rhs_expr) if (prev_expr) |prev| prev else expr else expr;
                     const cur_op = cur_expr.operator;
                     var new_math_reg: bool = false;
@@ -3927,12 +3927,13 @@ const InstGen = struct {
                                             .rhs_reg = cur_reg,
                                             .jump = .none,
                                         };
+                                        const col_lhs = expr.rhs.tag() != .column;
                                         switch (cur_op) {
-                                            // TODO: handle behaviour for 1 > col
-                                            .gt => _ = try self.addInst(if (true) .{ .gt = data } else .{ .lt = data }),
-                                            .gte => _ = try self.addInst(if (true) .{ .gte = data } else .{ .lte = data }),
-                                            .lt => _ = try self.addInst(if (true) .{ .lt = data } else .{ .gt = data }),
-                                            .lte => _ = try self.addInst(if (true) .{ .lte = data } else .{ .gte = data }),
+                                            // TODO: handle behaviour when both sides are not column
+                                            .gt => _ = try self.addInst(if (col_lhs) .{ .gt = data } else .{ .lt = data }),
+                                            .gte => _ = try self.addInst(if (col_lhs) .{ .gte = data } else .{ .lte = data }),
+                                            .lt => _ = try self.addInst(if (col_lhs) .{ .lt = data } else .{ .gt = data }),
+                                            .lte => _ = try self.addInst(if (col_lhs) .{ .lte = data } else .{ .gte = data }),
                                             else => unreachable,
                                         }
                                     },
@@ -3949,7 +3950,7 @@ const InstGen = struct {
                                     },
                                     .unary, .@"and", .@"or" => {
                                         debug("unary, and, or: {}", .{expr});
-                                        _ = try self.addInst(.{ .@"if" = .{ .compare_reg = check_reg, .jump_address = .none } });
+                                        _ = try self.addInst(.{ .@"if" = .{ .compare_reg = if (term.isConstant()) cur_reg else check_reg, .jump_address = .none } });
                                     },
                                     else => unreachable,
                                 }
