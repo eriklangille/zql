@@ -3720,6 +3720,7 @@ const InstGen = struct {
             }
             const op = leaf.op;
             var prev_expr: ?InternPool.Expression = null;
+            var is_seek_expr: bool = false;
             const expr = self.ip.indexToKey(expr_idx_opt.unwrap().?).expression;
             debug("col_pass: {}, traversal leaf: {}, expr: {}", .{ col_pass, leaf, expr });
 
@@ -3727,6 +3728,40 @@ const InstGen = struct {
 
             // Expression traversal returns leafs expression with leafs. So there will always be one side that is not an expression.
             // We need to figure out that side.
+            for (0..2) |i| {
+                const is_lhs: bool = i == 0;
+                const term = if (is_lhs) expr.lhs else expr.rhs;
+                const other_term = if (is_lhs) expr.rhs else expr.lhs;
+                switch (term) {
+                    .column => |col_idx| {
+                        const col = self.ip.indexToKey(col_idx.unwrap().?).column;
+                        if (col.is_primary_key and col.tag == .integer and seek_optimization == .none) {
+                            primary_key_col = term.column;
+                            // TODO: support math operations on other term
+                            if (op == null or (op == .@"and" and traversal.isValidSeekOptimization()) and other_term.tag() == .int) {
+                                if (is_lhs) {
+                                    switch (expr.operator) {
+                                        .gt => seek_optimization = .gt,
+                                        .gte => seek_optimization = .ge,
+                                        else => {},
+                                    }
+                                } else {
+                                    switch (expr.operator) {
+                                        .lt => seek_optimization = .gt,
+                                        .lte => seek_optimization = .ge,
+                                        else => {},
+                                    }
+                                }
+                            }
+                            if (seek_optimization != .none) {
+                                is_seek_expr = true;
+                                break;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
 
             for (0..2) |i| {
                 const is_lhs: bool = i == 0;
@@ -3743,31 +3778,10 @@ const InstGen = struct {
                 };
                 switch (term) {
                     .column => if (col_opt) |col| {
-                        if (col.is_primary_key and col.tag == .integer and seek_optimization == .none) {
-                            primary_key_col = term.column;
-                            if (op == null or (op == .@"and" and traversal.isValidSeekOptimization())) {
-                                if (is_lhs) {
-                                    switch (expr.operator) {
-                                        .gt => seek_optimization = .gt,
-                                        .gte => seek_optimization = .ge,
-                                        else => {},
-                                    }
-                                } else {
-                                    switch (expr.operator) {
-                                        .lt => seek_optimization = .gt,
-                                        .lte => seek_optimization = .ge,
-                                        else => {},
-                                    }
-                                }
-                            }
-                            if (seek_optimization != .none) {
-                                reg_count = reg_count.increment();
-                                continue;
-                            }
-                        }
                         const col_reg: Register.Index = blk: {
                             if (!is_lhs and other_term.tag() == .column and !expr.operator.isAndOr() and !expr.operator.isMath()) {
-                                break :blk reg_count.increment();
+                                reg_count = reg_count.increment();
+                                break :blk reg_count.decrement();
                             }
                             if (expr.operator.isMath()) {
                                 reg_count = reg_count.increment();
@@ -3815,22 +3829,7 @@ const InstGen = struct {
                     },
                     .int => {
                         if (!col_pass) {
-                            // TODO: this doesn't work if the int comes before the seek_column, for e.g. 1000 < id
-                            const is_seek_term: bool = res: {
-                                if (seek_optimization != .none and seek_optimization != .used) {
-                                    switch (other_term) {
-                                        .column => |col_idx_opt| {
-                                            if (col_idx_opt.unwrap()) |col_idx| {
-                                                const col = self.ip.indexToKey(col_idx).column;
-                                                break :res col.is_primary_key;
-                                            }
-                                        },
-                                        else => {},
-                                    }
-                                }
-                                break :res false;
-                            };
-                            if (is_seek_term) {
+                            if (is_seek_expr) {
                                 _ = try self.addInst(.{ .integer = .{ .int = term.int, .store_reg = reg_count } });
                                 const seek: InternPool.Instruction.Seek = .{
                                     .table = select.table,
@@ -3858,6 +3857,7 @@ const InstGen = struct {
                     },
                     else => {},
                 }
+                if (is_seek_expr) continue;
                 if (is_lhs and (rhs_expr or (term.isConstant() and expr.operator.isAndOr())) or !is_lhs and !rhs_expr) {
                     const cur_expr = if (rhs_expr) if (prev_expr) |prev| prev else expr else expr;
                     const cur_op = cur_expr.operator;
@@ -3905,7 +3905,11 @@ const InstGen = struct {
                                     .expr_index = expr_idx_opt,
                                 });
                                 const cur_reg = reg_count.decrement();
-                                const check_reg = if (math_reg != .none) math_reg else compare_reg;
+                                const check_reg = blk: {
+                                    if (term.isConstant() and other_term.isConstant()) break :blk cur_reg.decrement();
+                                    if (math_reg != .none) break :blk math_reg;
+                                    break :blk compare_reg;
+                                };
                                 switch (cur_op) {
                                     .eq => {
                                         _ = try self.addInst(.{ .eq = .{
