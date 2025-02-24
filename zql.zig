@@ -3766,7 +3766,7 @@ const InstGen = struct {
                             }
                         }
                         const col_reg: Register.Index = blk: {
-                            if (!is_lhs and other_term.tag() == .column and !expr.operator.isAndOr()) {
+                            if (!is_lhs and other_term.tag() == .column and !expr.operator.isAndOr() and !expr.operator.isMath()) {
                                 break :blk reg_count.increment();
                             }
                             if (expr.operator.isMath()) {
