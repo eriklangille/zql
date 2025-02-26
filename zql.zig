@@ -3579,9 +3579,7 @@ const InstGen = struct {
         while (li < slice.len) : (li += 1) {
             const expr_idx = slice.items(.expr_index)[li];
             debug("slice expr_idx: {}", .{expr_idx});
-            // TODO: see if checking state is necessary
-            // while (traverse_next != null and (traverse_next.?.index != expr_idx or (traverse_next.?.state != .none and traverse_next.?.state != .in_order))) : (traverse_next = try traverse.next(self.gpa)) {}
-            while (traverse_next != null and traverse_next.?.index != expr_idx) : (traverse_next = try traverse.next(self.gpa)) {}
+            while (traverse_next != null and (traverse_next.?.index != expr_idx or traverse_next.?.state == .post_order)) : (traverse_next = try traverse.next(self.gpa)) {}
             if (traverse_next) |leaf| {
                 debug("leaf: {}, expr_index: {}", .{ leaf, expr_idx });
                 if (expr_idx != leaf.index) continue;
@@ -3745,6 +3743,7 @@ const InstGen = struct {
         // good news: the pop is provided with the RHS value. So we compute the instruction for the RHS, then we do the pop
         // and then we ignore the operator, since the pop covers that
         var rhs_expr: bool = false;
+        var new_reg_stack_added: bool = false;
 
         while (try traversal.next(self.gpa)) |leaf| {
             const expr_idx_opt = leaf.index;
@@ -3769,12 +3768,18 @@ const InstGen = struct {
                 if (expr.operator.isComparison()) {
                     if (leaf.state == .in_order) {
                         try register_stack.append(self.gpa, reg_count);
+                        new_reg_stack_added = true;
                         reg_count = reg_count.increment();
                     } else {
                         // TODO: Validate that this doesn't panic with a weird input
                         const rhs_reg = register_stack.pop();
                         const lhs_reg = register_stack.pop();
                         if (!col_pass) continue;
+                        try labels.append(self.gpa, .{
+                            .jump = first_inst,
+                            .inst = self.ip.peekInst(),
+                            .expr_index = expr_idx_opt,
+                        });
                         switch (expr.operator) {
                             .eq => {
                                 _ = try self.addInst(.{ .eq = .{
@@ -3964,10 +3969,14 @@ const InstGen = struct {
                             if (!col_pass) continue;
                             switch (cur_op) {
                                 .add => {
-                                    const math_reg = register_stack.items[register_stack.items.len - 1];
+                                    const math_reg: Register.Index = register_stack.items[register_stack.items.len - 1];
                                     _ = try self.addInst(.{
                                         .add = .{
                                             .lhs_reg = blk: {
+                                                if (new_reg_stack_added) {
+                                                    new_reg_stack_added = false;
+                                                    break :blk math_reg.increment();
+                                                }
                                                 if (new_math_reg) {
                                                     new_math_reg = false;
                                                     break :blk last_item_reg.decrement();
