@@ -3605,7 +3605,19 @@ const InstGen = struct {
                     self.negate(inst);
                     self.replaceJump(inst, next_index);
                 } else {
-                    const next_op = if (traverse.stack.items.len > 0) traverse.stack.items[traverse.stack.items.len - 1].op else (leaf.op orelse .@"or");
+                    const next_op = blk: {
+                        if (traverse.stack.items.len > 0) {
+                            var ti: usize = traverse.stack.items.len - 1;
+                            while (ti >= 0) : (ti -= 1) {
+                                const item = traverse.stack.items[ti];
+                                if (item.state != .post_order and item.state != .middle) {
+                                    break :blk item.op;
+                                }
+                                if (ti == 0) break;
+                            }
+                        }
+                        break :blk leaf.op orelse .@"or";
+                    };
                     const jump_on_false = next_op == .@"and";
                     if (jump_on_false) {
                         // The default behavior for comparison instructions is to jump on true. So to jump on false, we negate the instruction.
@@ -3616,6 +3628,7 @@ const InstGen = struct {
                     const next_jump: ?ExpressionTraversal.StackItem = blk: {
                         while (si >= 0) : (si -= 1) {
                             const item = traverse.stack.items[@as(usize, @intCast(si))];
+                            if (item.state == .post_order or item.state == .middle) continue;
                             if (jump_on_false) {
                                 if (item.op == .@"or") {
                                     break :blk item;
@@ -3636,7 +3649,7 @@ const InstGen = struct {
                 }
             }
         }
-        debug("unresolved len: {d}", .{unresolved.items.len});
+        debug("unresolved len: {d}, items: {any}", .{ unresolved.items.len, unresolved.items });
         assert(unresolved.items.len == 0);
     }
 
