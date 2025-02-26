@@ -132,6 +132,8 @@ describeDb(MED_DB_FILE, () => {
   compare("select * from t1 where age + 1 + 1 + 1 + 1 < 22;");
   compare("select * from t1 where 1 + 2 + 3 + age < 22;");
   compare("select * from t1 where age + age < 50;");
+  compare("select * from t1 where age + 1 < 22 + 1;");
+  compare("select * from t1 where age + age < 50 + 1;");
 
   // TODO:
   // compare("select * from t1 where age + age + age < 60;");

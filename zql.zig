@@ -945,6 +945,13 @@ const InternPool = struct {
                     else => false,
                 };
             }
+
+            pub fn isComparison(self: Operator) bool {
+                return switch (self) {
+                    .eq, .ne, .lt, .lte, .gt, .gte => true,
+                    else => false,
+                };
+            }
         };
 
         pub fn hasExpressionChild(self: *const Expression) bool {
@@ -1005,7 +1012,7 @@ const InternPool = struct {
         var fbs = std.io.fixedBufferStream(@constCast(&buf));
         _ = ip.bufWrite(@constCast(&fbs), index) catch null;
         const slice = fbs.getWritten();
-        debug("{s}", .{slice});
+        debug("AST: {s}", .{slice});
     }
 
     // Since this is only used for debugging, we permit the use of recursion to make the code more readable/easier to implement
@@ -3299,8 +3306,11 @@ const ExpressionTraversal = struct {
     stack: Stack,
     first: InternPool.Index.Optional,
 
-    const StackItem = struct { op: InternPool.Expression.Operator, index: InternPool.Index };
-    const ResultItem = struct { op: ?InternPool.Expression.Operator, index: InternPool.Index.Optional, pop: InternPool.Index.Optional };
+    // State is for the special case where there are expression on both sides
+    // If state is none, it is a leaf node. Otherwise state is a dual expression node.
+    const StackState = enum { in_order, middle, post_order, none };
+    const StackItem = struct { op: InternPool.Expression.Operator, index: InternPool.Index, state: StackState };
+    const ResultItem = struct { op: ?InternPool.Expression.Operator, index: InternPool.Index.Optional, pop: InternPool.Index.Optional, state: StackState };
     const Stack = ArrayListUnmanaged(StackItem);
 
     pub fn init(intern_pool: *InternPool, root: InternPool.Index.Optional) Allocator.Error!ExpressionTraversal {
@@ -3339,16 +3349,22 @@ const ExpressionTraversal = struct {
             while (cur.unwrap()) |idx| {
                 const expr = self.ip.indexToKey(idx).expression;
                 if (expr.operator != .unary and expr.hasExpressionChild()) {
-                    try self.stack.append(alloc, .{ .op = expr.operator, .index = idx });
+                    const state: StackState = if (expr.lhs.tag() == .expression or expr.lhs.tag() == .group) .in_order else .middle;
+                    try self.stack.append(alloc, .{ .op = expr.operator, .index = idx, .state = state });
                 }
                 switch (expr.lhs) {
                     .expression, .group => |next_expr| {
                         cur = next_expr;
                     },
                     else => {
-                        if (self.stack.items.len == 0) return .{ .op = null, .index = cur, .pop = .none };
+                        if (self.stack.items.len == 0) return .{
+                            .op = null,
+                            .index = cur,
+                            .pop = .none,
+                            .state = .none,
+                        };
                         const parent_item = self.parent().?;
-                        return .{ .op = parent_item.op, .index = cur, .pop = .none };
+                        return .{ .op = parent_item.op, .index = cur, .pop = .none, .state = .none };
                     },
                 }
             }
@@ -3356,24 +3372,32 @@ const ExpressionTraversal = struct {
         if (self.stack.popOrNull()) |pop| {
             const key = self.ip.indexToKey(pop.index).expression;
             var cur: InternPool.Index.Optional = .none;
-            switch (key.rhs) {
-                .expression, .group => |expr| cur = expr,
-                // If they have a rhs constant, then the pop becomes the current
-                else => {
-                    const parent_item: ?StackItem = self.parent();
-                    const op: ?InternPool.Expression.Operator = if (parent_item) |item| item.op else null;
-                    return .{
-                        .op = op,
-                        .index = pop.index.toOptional(),
-                        .pop = pop.index.toOptional(),
-                    };
-                },
+            const rhs_expr: InternPool.Index.Optional = switch (key.rhs) {
+                .expression, .group => |expr| expr,
+                else => .none,
+            };
+            if (rhs_expr != .none and pop.state == .middle) {
+                self.stack.appendAssumeCapacity(.{ .op = pop.op, .index = pop.index, .state = .post_order });
+                cur = rhs_expr;
+            } else {
+                if (rhs_expr != .none and pop.state == .in_order) {
+                    self.stack.appendAssumeCapacity(.{ .op = pop.op, .index = pop.index, .state = .middle });
+                }
+                const parent_item: ?StackItem = self.parent();
+                const op: ?InternPool.Expression.Operator = if (parent_item) |item| item.op else null;
+                return .{
+                    .op = op,
+                    .index = pop.index.toOptional(),
+                    .pop = pop.index.toOptional(),
+                    .state = pop.state,
+                };
             }
             var prev: ?InternPool.Expression.Operator = null;
             while (cur.unwrap()) |idx| {
                 const expr = self.ip.indexToKey(idx).expression;
                 if (expr.operator != .unary and expr.hasExpressionChild()) {
-                    try self.stack.append(alloc, .{ .op = expr.operator, .index = idx });
+                    const state: StackState = if (expr.lhs.tag() == .expression or expr.lhs.tag() == .group) .in_order else .middle;
+                    try self.stack.append(alloc, .{ .op = expr.operator, .index = idx, .state = state });
                 }
                 switch (expr.lhs) {
                     .expression, .group => |next_expr| {
@@ -3385,6 +3409,7 @@ const ExpressionTraversal = struct {
                             .op = pop.op,
                             .index = cur,
                             .pop = pop.index.toOptional(),
+                            .state = .none,
                         };
                     },
                 }
@@ -3393,6 +3418,7 @@ const ExpressionTraversal = struct {
                     .op = pop.op,
                     .index = .none,
                     .pop = pop.index.toOptional(),
+                    .state = .none,
                 };
             }
         }
@@ -3552,11 +3578,15 @@ const InstGen = struct {
         var traverse_next = try traverse.next(self.gpa);
         while (li < slice.len) : (li += 1) {
             const expr_idx = slice.items(.expr_index)[li];
+            debug("slice expr_idx: {}", .{expr_idx});
+            // TODO: see if checking state is necessary
+            // while (traverse_next != null and (traverse_next.?.index != expr_idx or (traverse_next.?.state != .none and traverse_next.?.state != .in_order))) : (traverse_next = try traverse.next(self.gpa)) {}
             while (traverse_next != null and traverse_next.?.index != expr_idx) : (traverse_next = try traverse.next(self.gpa)) {}
             if (traverse_next) |leaf| {
                 debug("leaf: {}, expr_index: {}", .{ leaf, expr_idx });
                 if (expr_idx != leaf.index) continue;
                 const inst = slice.items(.inst)[li];
+                debug("leaf inst: {}", .{inst});
 
                 // check unresolved
                 var ui: usize = 0;
@@ -3706,12 +3736,15 @@ const InstGen = struct {
 
         var traversal = try ExpressionTraversal.init(self.ip, select.where);
         defer traversal.deinit(self.gpa);
+
+        var register_stack: std.ArrayListUnmanaged(Register.Index) = .{};
+        defer register_stack.deinit(self.gpa);
+
         // TODO: tree traversal left and right side. When the left side is the id record (ge/gt) with and, then its seek loop for ea one
         // we also want to pay attention to the pop node, which happens between the left and right side
         // good news: the pop is provided with the RHS value. So we compute the instruction for the RHS, then we do the pop
         // and then we ignore the operator, since the pop covers that
         var rhs_expr: bool = false;
-        var math_reg: Register.Index = .none;
 
         while (try traversal.next(self.gpa)) |leaf| {
             const expr_idx_opt = leaf.index;
@@ -3726,8 +3759,61 @@ const InstGen = struct {
 
             const first_inst = self.ip.peekInst();
 
-            // Expression traversal returns leafs expression with leafs. So there will always be one side that is not an expression.
-            // We need to figure out that side.
+            // Expression traversal can return expression result with expression term on each side
+            // It will do so in-order, and then post-order. We can use the in-order node output to signal
+            // the end of the LHS and beginning of the right. Useful for math terms.
+            // We can use the post-order node output as the time to add the comparison instruction.
+            // In this case, we want to ignore and or expression output.
+            const is_both_expr = expr.lhs.tag() == .expression and expr.rhs.tag() == .expression;
+            if (is_both_expr) {
+                if (expr.operator.isComparison()) {
+                    if (leaf.state == .in_order) {
+                        try register_stack.append(self.gpa, reg_count);
+                        reg_count = reg_count.increment();
+                    } else {
+                        // TODO: Validate that this doesn't panic with a weird input
+                        const rhs_reg = register_stack.pop();
+                        const lhs_reg = register_stack.pop();
+                        if (!col_pass) continue;
+                        switch (expr.operator) {
+                            .eq => {
+                                _ = try self.addInst(.{ .eq = .{
+                                    .lhs_reg = lhs_reg,
+                                    .rhs_reg = rhs_reg,
+                                    .jump = .none,
+                                } });
+                            },
+                            .ne => {
+                                _ = try self.addInst(.{ .neq = .{
+                                    .lhs_reg = lhs_reg,
+                                    .rhs_reg = rhs_reg,
+                                    .jump = .none,
+                                } });
+                            },
+                            .gt, .gte, .lt, .lte => {
+                                const data: InternPool.Instruction.Lt = .{
+                                    .lhs_reg = lhs_reg,
+                                    .rhs_reg = rhs_reg,
+                                    .jump = .none,
+                                };
+                                switch (expr.operator) {
+                                    .gt => _ = try self.addInst(.{ .gt = data }),
+                                    .gte => _ = try self.addInst(.{ .gte = data }),
+                                    .lt => _ = try self.addInst(.{ .lt = data }),
+                                    .lte => _ = try self.addInst(.{ .lte = data }),
+                                    else => unreachable,
+                                }
+                            },
+                            else => unreachable,
+                        }
+                    }
+                }
+                continue;
+            } else if (leaf.state == .post_order) {
+                continue;
+            }
+
+            // Check for capable seek optimization. For seek optimization, the loop will start at the set index instead of at 0.
             for (0..2) |i| {
                 const is_lhs: bool = i == 0;
                 const term = if (is_lhs) expr.lhs else expr.rhs;
@@ -3763,6 +3849,7 @@ const InstGen = struct {
                 }
             }
 
+            // Add instructions
             for (0..2) |i| {
                 const is_lhs: bool = i == 0;
                 const term = if (is_lhs) expr.lhs else expr.rhs;
@@ -3869,14 +3956,15 @@ const InstGen = struct {
                     switch (cur_op) {
                         .add, .minus, .multiply, .divide, .remainder => {
                             const last_item_reg = reg_count.decrement();
-                            if (math_reg == .none) {
-                                math_reg = reg_count;
+                            if (register_stack.items.len == 0) {
+                                try register_stack.append(self.gpa, reg_count);
                                 new_math_reg = true;
                                 reg_count = reg_count.increment();
                             }
                             if (!col_pass) continue;
                             switch (cur_op) {
                                 .add => {
+                                    const math_reg = register_stack.items[register_stack.items.len - 1];
                                     _ = try self.addInst(.{
                                         .add = .{
                                             .lhs_reg = blk: {
@@ -3907,7 +3995,7 @@ const InstGen = struct {
                                 const cur_reg = reg_count.decrement();
                                 const check_reg = blk: {
                                     if (term.isConstant() and other_term.isConstant()) break :blk cur_reg.decrement();
-                                    if (math_reg != .none) break :blk math_reg;
+                                    if (register_stack.items.len > 0) break :blk register_stack.pop();
                                     break :blk compare_reg;
                                 };
                                 switch (cur_op) {
@@ -3958,9 +4046,6 @@ const InstGen = struct {
                                     },
                                     else => unreachable,
                                 }
-                            }
-                            if (math_reg != .none) {
-                                math_reg = .none;
                             }
                         },
                     }
