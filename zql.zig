@@ -134,6 +134,10 @@ const InternPool = struct {
         lt,
         lte,
         add,
+        subtract,
+        multiply,
+        divide,
+        remainder,
         seek_gt,
         seek_ge,
         column,
@@ -393,7 +397,7 @@ const InternPool = struct {
                     .lt, .lte, .gt, .gte => |extra_data| {
                         ip.insertExtra(extra_index, extra_data);
                     },
-                    .add => |extra_data| {
+                    .add, .subtract, .multiply, .divide, .remainder => |extra_data| {
                         ip.insertExtra(extra_index, extra_data);
                     },
                     .@"if", .if_not => |extra_data| {
@@ -506,6 +510,22 @@ const InternPool = struct {
                 const extra_data = ip.extraData(Instruction.Operation, item.data);
                 return .{ .add = extra_data };
             },
+            .subtract => {
+                const extra_data = ip.extraData(Instruction.Operation, item.data);
+                return .{ .subtract = extra_data };
+            },
+            .multiply => {
+                const extra_data = ip.extraData(Instruction.Operation, item.data);
+                return .{ .multiply = extra_data };
+            },
+            .divide => {
+                const extra_data = ip.extraData(Instruction.Operation, item.data);
+                return .{ .divide = extra_data };
+            },
+            .remainder => {
+                const extra_data = ip.extraData(Instruction.Operation, item.data);
+                return .{ .remainder = extra_data };
+            },
             .next => {
                 const extra_data = ip.extraData(Instruction.Next, item.data);
                 return .{ .next = extra_data };
@@ -573,6 +593,10 @@ const InternPool = struct {
         lt: Instruction.Lt,
         lte: Instruction.Lt,
         add: Instruction.Operation,
+        subtract: Instruction.Operation,
+        multiply: Instruction.Operation,
+        divide: Instruction.Operation,
+        remainder: Instruction.Operation,
         seek_gt: Instruction.Seek,
         seek_ge: Instruction.Seek,
         string: Instruction.String,
@@ -602,6 +626,10 @@ const InternPool = struct {
                 .lt => .lt,
                 .lte => .lte,
                 .add => .add,
+                .subtract => .subtract,
+                .multiply => .multiply,
+                .divide => .divide,
+                .remainder => .remainder,
                 .string => .string,
                 .integer => .integer,
             };
@@ -619,7 +647,7 @@ const InternPool = struct {
                 .function => @sizeOf(Instruction.Function),
                 .if_not, .@"if" => @sizeOf(Instruction.If),
                 .lt, .lte, .gt, .gte => @sizeOf(Instruction.Lt),
-                .add => @sizeOf(Instruction.Operation),
+                .add, .subtract, .multiply, .divide, .remainder => @sizeOf(Instruction.Operation),
                 .column => @sizeOf(Instruction.Column),
                 .next => @sizeOf(Instruction.Next),
                 .transaction => @sizeOf(Instruction.Transaction),
@@ -3983,27 +4011,44 @@ const InstGen = struct {
                                 reg_count = reg_count.increment();
                             }
                             if (!col_pass) continue;
+                            const math_reg: Register.Index = register_stack.items[register_stack.items.len - 1];
+                            const lhs_reg = blk: {
+                                if (new_reg_stack_added) {
+                                    new_reg_stack_added = false;
+                                    break :blk math_reg.increment();
+                                }
+                                if (new_math_reg) {
+                                    new_math_reg = false;
+                                    break :blk last_item_reg.decrement();
+                                }
+                                break :blk math_reg;
+                            };
                             switch (cur_op) {
-                                .add => {
-                                    const math_reg: Register.Index = register_stack.items[register_stack.items.len - 1];
-                                    _ = try self.addInst(.{
-                                        .add = .{
-                                            .lhs_reg = blk: {
-                                                if (new_reg_stack_added) {
-                                                    new_reg_stack_added = false;
-                                                    break :blk math_reg.increment();
-                                                }
-                                                if (new_math_reg) {
-                                                    new_math_reg = false;
-                                                    break :blk last_item_reg.decrement();
-                                                }
-                                                break :blk math_reg;
-                                            },
-                                            .rhs_reg = last_item_reg,
-                                            .result_reg = math_reg,
-                                        },
-                                    });
-                                },
+                                .add => _ = try self.addInst(.{ .add = .{
+                                    .lhs_reg = lhs_reg,
+                                    .rhs_reg = last_item_reg,
+                                    .result_reg = math_reg,
+                                } }),
+                                .minus => _ = try self.addInst(.{ .subtract = .{
+                                    .lhs_reg = lhs_reg,
+                                    .rhs_reg = last_item_reg,
+                                    .result_reg = math_reg,
+                                } }),
+                                .multiply => _ = try self.addInst(.{ .multiply = .{
+                                    .lhs_reg = lhs_reg,
+                                    .rhs_reg = last_item_reg,
+                                    .result_reg = math_reg,
+                                } }),
+                                .divide => _ = try self.addInst(.{ .divide = .{
+                                    .lhs_reg = lhs_reg,
+                                    .rhs_reg = last_item_reg,
+                                    .result_reg = math_reg,
+                                } }),
+                                .remainder => _ = try self.addInst(.{ .remainder = .{
+                                    .lhs_reg = lhs_reg,
+                                    .rhs_reg = last_item_reg,
+                                    .result_reg = math_reg,
+                                } }),
                                 else => unreachable, // TODO: implement
                             }
                         },
@@ -4828,13 +4873,60 @@ const Vm = struct {
                 .goto => |goto_inst| {
                     self.pc = goto_inst;
                 },
-                .add => |add_inst| {
-                    const lhs = self.reg(add_inst.lhs_reg);
-                    const rhs = self.reg(add_inst.rhs_reg);
+                .add => |inst| {
+                    const lhs = self.reg(inst.lhs_reg);
+                    const rhs = self.reg(inst.rhs_reg);
                     // TODO: cover other types for addition
                     if (lhs.tag() == .int and rhs.tag() == .int) {
-                        const result = lhs.int + rhs.int;
-                        try self.updateReg(add_inst.result_reg, .{ .int = result });
+                        const result: i64 = lhs.int + rhs.int;
+                        try self.updateReg(inst.result_reg, .{ .int = result });
+                    }
+                    self.pc = self.pc.increment();
+                },
+                .subtract => |inst| {
+                    const lhs = self.reg(inst.lhs_reg);
+                    const rhs = self.reg(inst.rhs_reg);
+                    // TODO: cover other types
+                    if (lhs.tag() == .int and rhs.tag() == .int) {
+                        const result: i64 = lhs.int - rhs.int;
+                        try self.updateReg(inst.result_reg, .{ .int = result });
+                    }
+                    self.pc = self.pc.increment();
+                },
+                .multiply => |inst| {
+                    const lhs = self.reg(inst.lhs_reg);
+                    const rhs = self.reg(inst.rhs_reg);
+                    // TODO: cover other types
+                    if (lhs.tag() == .int and rhs.tag() == .int) {
+                        const result: i64 = lhs.int * rhs.int;
+                        try self.updateReg(inst.result_reg, .{ .int = result });
+                    }
+                    self.pc = self.pc.increment();
+                },
+                .divide => |inst| {
+                    const lhs = self.reg(inst.lhs_reg);
+                    const rhs = self.reg(inst.rhs_reg);
+                    // TODO: cover other types
+                    if (lhs.tag() == .int and rhs.tag() == .int) {
+                        if (rhs.int == 0) {
+                            try self.updateReg(inst.result_reg, .none);
+                        }
+                        const result: i64 = @divTrunc(lhs.int, rhs.int);
+                        try self.updateReg(inst.result_reg, .{ .int = result });
+                    }
+                    self.pc = self.pc.increment();
+                },
+                .remainder => |inst| {
+                    const lhs = self.reg(inst.lhs_reg);
+                    const rhs = self.reg(inst.rhs_reg);
+                    // TODO: cover other types
+                    if (lhs.tag() == .int and rhs.tag() == .int) {
+                        if (rhs.int == 0) {
+                            try self.updateReg(inst.result_reg, .none);
+                        }
+                        const den = if (rhs.int < 0) -rhs.int else rhs.int;
+                        const result: i64 = @rem(lhs.int, den);
+                        try self.updateReg(inst.result_reg, .{ .int = result });
                     }
                     self.pc = self.pc.increment();
                 },

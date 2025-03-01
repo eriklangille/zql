@@ -136,9 +136,19 @@ describeDb(MED_DB_FILE, () => {
   compare("select * from t1 where age + age < 50 + 1;");
   compare("select * from t1 where age + 1 > age;");
   compare("select * from t1 where age + 2 > age + 1;");
+  compare("select * from t1 where age + age + age < 60;");
 
-  // TODO:
-  // compare("select * from t1 where age + age + age < 60;");
+  // Subtract
+  compare("select * from t1 where age - 2 < age");
+
+  // Multiply
+  compare("select * from t1 where age * 2 > age");
+
+  // Divide
+  compare("select * from t1 where age / 2 >= 12;");
+
+  // Remainder
+  compare("select * from t1 where id % 2 == 0;");
 
   // Alias
   compare("select name as n, age as a from t1 where 20 < a and n != 'Paul';");
