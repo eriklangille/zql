@@ -3719,6 +3719,9 @@ const InstGen = struct {
         return result_list.toOwnedSlice(self.gpa);
     }
 
+    // This method traverses the where clause and generates instructions for it.
+    // There are 2 passes - 1 to fill in the values in the column loop, and another to populate the constants
+    // In the future there could be multiple loops to fill
     pub fn whereTraversal(
         self: *InstGen,
         comptime col_pass: bool,
@@ -4014,12 +4017,15 @@ const InstGen = struct {
                                     },
                                     .expr_index = expr_idx_opt,
                                 });
-                                const cur_reg = reg_count.decrement();
+                                var cur_reg = reg_count.decrement();
                                 const check_reg = blk: {
                                     if (term.isConstant() and other_term.isConstant()) break :blk cur_reg.decrement();
                                     if (register_stack.items.len > 0) break :blk register_stack.pop();
                                     break :blk compare_reg;
                                 };
+                                if (check_reg != compare_reg and expr.rhs.tag() == .column) {
+                                    cur_reg = compare_reg;
+                                }
                                 switch (cur_op) {
                                     .eq => {
                                         _ = try self.addInst(.{ .eq = .{
@@ -4041,7 +4047,7 @@ const InstGen = struct {
                                             .rhs_reg = cur_reg,
                                             .jump = .none,
                                         };
-                                        const col_lhs = expr.rhs.tag() != .column;
+                                        const col_lhs = expr.rhs.tag() != .column or expr.lhs.tag() == .expression;
                                         switch (cur_op) {
                                             // TODO: handle behaviour when both sides are not column
                                             .gt => _ = try self.addInst(if (col_lhs) .{ .gt = data } else .{ .lt = data }),
@@ -4110,9 +4116,7 @@ const InstGen = struct {
                 var labels: LabelList = .{};
                 defer labels.deinit(self.gpa);
 
-                const pre_result = try self.wherePreTraversal(&select);
-
-                debug("pre_result: {any}", .{pre_result});
+                // const pre_result = try self.wherePreTraversal(&select);
 
                 // Column Loop and pass through of the where expression tree
                 // Jump locations are left empty until we know all instruction addresses, since we don't know where to jump to yet.
