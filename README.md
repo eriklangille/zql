@@ -2,9 +2,16 @@
 
 Query SQLite databases from your web browser.
 
-SQLite basic `Select` command functionality written in Zig that compiles to the web browser via web assembly.
+SQLite basic `Select` command functionality written in Zig that compiles to the web browser via web assembly. Read todo.md for objectives.
+
+Highlights:
+- Parse the SQLite file format for most common files (missing support for index page types and overflow pages)
+- Rewrite of the SQLite VM
+- Supports select ... from ... where ..., with math, like, and comparison operations
+- Better performance vs WASM SQLite for basic select queries
 
 ## How to build
+Currently targetting zig version 0.13.
 
 The release version:
 ```bash
